@@ -1,0 +1,502 @@
+package com.tianlin.aiarena
+
+import android.content.Context
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Typography
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.ReadOnlyComposable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.edit
+import androidx.core.view.WindowCompat
+
+/**
+ * 皮肤（视觉风格）。每套皮肤同时决定配色、圆角、描边、阴影模型和字号基准，
+ * 因此不同皮肤之间是"换了一套设计"，而不只是换了主色。
+ */
+enum class ArenaSkin(
+    val displayName: String,
+    val tagline: String,
+) {
+    CLEAR("清朗", "明亮通透，默认风格"),
+    INK("墨韵", "宣纸朱砂，中式沉稳"),
+    NIGHT("夜航", "深色护眼，适合夜间"),
+    ELDER("长辈", "大字粗描边，高对比"),
+    SUNRISE("暖阳", "暖橙圆润，亲和轻快"),
+    ;
+
+    companion object {
+        val default = CLEAR
+
+        /** 反序列化持久化的皮肤名；无法识别时回退默认值，不抛异常。 */
+        fun fromName(value: String?): ArenaSkin =
+            entries.firstOrNull { it.name == value } ?: default
+    }
+}
+
+@Immutable
+data class ArenaPalette(
+    val isDark: Boolean,
+    val page: Color,
+    val surface: Color,
+    val surfaceAlt: Color,
+    val ink: Color,
+    val muted: Color,
+    val accent: Color,
+    val accentSoft: Color,
+    val onAccent: Color,
+    val border: Color,
+    val borderStrong: Color,
+    val success: Color,
+    val successSoft: Color,
+    val warning: Color,
+    val warningSoft: Color,
+    val debate: Color,
+    val debateSoft: Color,
+    val error: Color,
+    val errorSoft: Color,
+    val heroStart: Color,
+    val heroEnd: Color,
+    val onHero: Color,
+    val onHeroMuted: Color,
+    val summarySurface: Color,
+    val summaryBorder: Color,
+    val navSurface: Color,
+) {
+    val heroBrush: Brush get() = Brush.linearGradient(listOf(heroStart, heroEnd))
+}
+
+@Immutable
+data class ArenaMetrics(
+    val cardCorner: Dp,
+    val controlCorner: Dp,
+    val chipCorner: Dp,
+    val borderWidth: Dp,
+    val cardElevation: Dp,
+    val heroElevation: Dp,
+    val gutter: Dp,
+    val gap: Dp,
+    val minTouch: Dp,
+    val primaryButtonHeight: Dp,
+    val typeScale: Float,
+    val heroGradient: Boolean,
+    val headingFamily: FontFamily,
+)
+
+val LocalArenaPalette = staticCompositionLocalOf { ArenaSkin.CLEAR.palette }
+val LocalArenaMetrics = staticCompositionLocalOf { ArenaSkin.CLEAR.metrics }
+
+/** 皮肤令牌的统一读取入口：`ArenaStyle.colors` / `ArenaStyle.metrics`。 */
+object ArenaStyle {
+    val colors: ArenaPalette
+        @Composable @ReadOnlyComposable get() = LocalArenaPalette.current
+
+    val metrics: ArenaMetrics
+        @Composable @ReadOnlyComposable get() = LocalArenaMetrics.current
+}
+
+private val ClearPalette = ArenaPalette(
+    isDark = false,
+    page = Color(0xFFF2F6FA),
+    surface = Color(0xFFFFFFFF),
+    surfaceAlt = Color(0xFFEDF3F7),
+    ink = Color(0xFF0F1E29),
+    muted = Color(0xFF556B7A),
+    accent = Color(0xFF0E7490),
+    accentSoft = Color(0xFFDFF0F4),
+    onAccent = Color(0xFFFFFFFF),
+    border = Color(0xFFDCE6EC),
+    borderStrong = Color(0xFFB9CBD6),
+    success = Color(0xFF1C7A52),
+    successSoft = Color(0xFFE3F4EC),
+    warning = Color(0xFF9A5B18),
+    warningSoft = Color(0xFFFFF2E2),
+    debate = Color(0xFF6A4E92),
+    debateSoft = Color(0xFFEFE9F7),
+    error = Color(0xFFB3261E),
+    errorSoft = Color(0xFFFBE9E7),
+    heroStart = Color(0xFF0B6076),
+    heroEnd = Color(0xFF1B93A8),
+    onHero = Color(0xFFFFFFFF),
+    onHeroMuted = Color(0xCCFFFFFF),
+    summarySurface = Color(0xFFFFFCF3),
+    summaryBorder = Color(0xFFE8DDB8),
+    navSurface = Color(0xFFFBFDFE),
+)
+
+private val InkPalette = ArenaPalette(
+    isDark = false,
+    page = Color(0xFFF4EFE4),
+    surface = Color(0xFFFCFAF4),
+    surfaceAlt = Color(0xFFEDE6D8),
+    ink = Color(0xFF1B1915),
+    muted = Color(0xFF6B6253),
+    accent = Color(0xFF9E3B2C),
+    accentSoft = Color(0xFFF6E5E0),
+    onAccent = Color(0xFFFFFBF5),
+    border = Color(0xFFD9CFBB),
+    borderStrong = Color(0xFF9A8C72),
+    success = Color(0xFF3D6B48),
+    successSoft = Color(0xFFE6EEE3),
+    warning = Color(0xFF8A6320),
+    warningSoft = Color(0xFFF7ECD6),
+    debate = Color(0xFF3F5A63),
+    debateSoft = Color(0xFFE4EBEC),
+    error = Color(0xFF9E3B2C),
+    errorSoft = Color(0xFFF6E2DD),
+    heroStart = Color(0xFF2C2A24),
+    heroEnd = Color(0xFF544C3C),
+    onHero = Color(0xFFF6F0E2),
+    onHeroMuted = Color(0xCCF6F0E2),
+    summarySurface = Color(0xFFFBF3E2),
+    summaryBorder = Color(0xFFD9C7A2),
+    navSurface = Color(0xFFF9F5EB),
+)
+
+private val NightPalette = ArenaPalette(
+    isDark = true,
+    page = Color(0xFF0D1117),
+    surface = Color(0xFF161C24),
+    surfaceAlt = Color(0xFF1E2732),
+    ink = Color(0xFFE7EEF5),
+    muted = Color(0xFF97A5B5),
+    accent = Color(0xFF56B0E4),
+    accentSoft = Color(0xFF17303F),
+    onAccent = Color(0xFF06131C),
+    border = Color(0xFF2A3441),
+    borderStrong = Color(0xFF3D4B5C),
+    success = Color(0xFF4FC08A),
+    successSoft = Color(0xFF14312A),
+    warning = Color(0xFFE0A458),
+    warningSoft = Color(0xFF362B1B),
+    debate = Color(0xFFAE94DE),
+    debateSoft = Color(0xFF2A2440),
+    error = Color(0xFFEF7A72),
+    errorSoft = Color(0xFF3A1F1E),
+    heroStart = Color(0xFF13293D),
+    heroEnd = Color(0xFF1F4A6B),
+    onHero = Color(0xFFEAF3FA),
+    onHeroMuted = Color(0xCCEAF3FA),
+    summarySurface = Color(0xFF20261C),
+    summaryBorder = Color(0xFF4A5235),
+    navSurface = Color(0xFF121821),
+)
+
+private val ElderPalette = ArenaPalette(
+    isDark = false,
+    page = Color(0xFFFFFFFF),
+    surface = Color(0xFFFFFFFF),
+    surfaceAlt = Color(0xFFEFF3F8),
+    ink = Color(0xFF000000),
+    muted = Color(0xFF35414D),
+    accent = Color(0xFF0B4FA8),
+    accentSoft = Color(0xFFDCE8F9),
+    onAccent = Color(0xFFFFFFFF),
+    border = Color(0xFF2A3440),
+    borderStrong = Color(0xFF000000),
+    success = Color(0xFF14653C),
+    successSoft = Color(0xFFDCF0E5),
+    warning = Color(0xFF8A4B00),
+    warningSoft = Color(0xFFFDEBD6),
+    debate = Color(0xFF553287),
+    debateSoft = Color(0xFFE9DFF7),
+    error = Color(0xFFA1160F),
+    errorSoft = Color(0xFFFBE2E0),
+    heroStart = Color(0xFF083B7E),
+    heroEnd = Color(0xFF0B4FA8),
+    onHero = Color(0xFFFFFFFF),
+    onHeroMuted = Color(0xFFE4EDFA),
+    summarySurface = Color(0xFFFFFBEE),
+    summaryBorder = Color(0xFF8A6A1C),
+    navSurface = Color(0xFFFFFFFF),
+)
+
+private val SunrisePalette = ArenaPalette(
+    isDark = false,
+    page = Color(0xFFFFF7F1),
+    surface = Color(0xFFFFFFFF),
+    surfaceAlt = Color(0xFFFDEDE2),
+    ink = Color(0xFF2C1D14),
+    muted = Color(0xFF7C6455),
+    accent = Color(0xFFC2410C),
+    accentSoft = Color(0xFFFDE7D8),
+    onAccent = Color(0xFFFFFFFF),
+    border = Color(0xFFF0DDD0),
+    borderStrong = Color(0xFFD8B79E),
+    success = Color(0xFF2F7A4F),
+    successSoft = Color(0xFFE3F3E9),
+    warning = Color(0xFF9A5B18),
+    warningSoft = Color(0xFFFDF0DC),
+    debate = Color(0xFF8A4FA3),
+    debateSoft = Color(0xFFF6E8F8),
+    error = Color(0xFFB3261E),
+    errorSoft = Color(0xFFFCE7E4),
+    heroStart = Color(0xFFEA6A15),
+    heroEnd = Color(0xFFF7A44A),
+    onHero = Color(0xFFFFFFFF),
+    onHeroMuted = Color(0xE6FFFFFF),
+    summarySurface = Color(0xFFFFF9EC),
+    summaryBorder = Color(0xFFEBD3A6),
+    navSurface = Color(0xFFFFFCF9),
+)
+
+val ArenaSkin.palette: ArenaPalette
+    get() = when (this) {
+        ArenaSkin.CLEAR -> ClearPalette
+        ArenaSkin.INK -> InkPalette
+        ArenaSkin.NIGHT -> NightPalette
+        ArenaSkin.ELDER -> ElderPalette
+        ArenaSkin.SUNRISE -> SunrisePalette
+    }
+
+val ArenaSkin.metrics: ArenaMetrics
+    get() = when (this) {
+        ArenaSkin.CLEAR -> ArenaMetrics(
+            cardCorner = 18.dp,
+            controlCorner = 16.dp,
+            chipCorner = 999.dp,
+            borderWidth = 1.dp,
+            cardElevation = 1.dp,
+            heroElevation = 0.dp,
+            gutter = 16.dp,
+            gap = 12.dp,
+            minTouch = 48.dp,
+            primaryButtonHeight = 56.dp,
+            typeScale = 1.0f,
+            heroGradient = true,
+            headingFamily = FontFamily.SansSerif,
+        )
+        ArenaSkin.INK -> ArenaMetrics(
+            cardCorner = 6.dp,
+            controlCorner = 6.dp,
+            chipCorner = 4.dp,
+            borderWidth = 1.dp,
+            cardElevation = 0.dp,
+            heroElevation = 0.dp,
+            gutter = 18.dp,
+            gap = 12.dp,
+            minTouch = 48.dp,
+            primaryButtonHeight = 56.dp,
+            typeScale = 1.02f,
+            heroGradient = true,
+            headingFamily = FontFamily.Serif,
+        )
+        ArenaSkin.NIGHT -> ArenaMetrics(
+            cardCorner = 18.dp,
+            controlCorner = 16.dp,
+            chipCorner = 999.dp,
+            borderWidth = 1.dp,
+            cardElevation = 0.dp,
+            heroElevation = 0.dp,
+            gutter = 16.dp,
+            gap = 12.dp,
+            minTouch = 48.dp,
+            primaryButtonHeight = 56.dp,
+            typeScale = 1.0f,
+            heroGradient = true,
+            headingFamily = FontFamily.SansSerif,
+        )
+        ArenaSkin.ELDER -> ArenaMetrics(
+            cardCorner = 14.dp,
+            controlCorner = 12.dp,
+            chipCorner = 10.dp,
+            borderWidth = 2.dp,
+            cardElevation = 0.dp,
+            heroElevation = 0.dp,
+            gutter = 16.dp,
+            gap = 14.dp,
+            minTouch = 60.dp,
+            primaryButtonHeight = 68.dp,
+            typeScale = 1.18f,
+            heroGradient = false,
+            headingFamily = FontFamily.SansSerif,
+        )
+        ArenaSkin.SUNRISE -> ArenaMetrics(
+            cardCorner = 22.dp,
+            controlCorner = 20.dp,
+            chipCorner = 999.dp,
+            borderWidth = 1.dp,
+            cardElevation = 2.dp,
+            heroElevation = 0.dp,
+            gutter = 16.dp,
+            gap = 12.dp,
+            minTouch = 50.dp,
+            primaryButtonHeight = 58.dp,
+            typeScale = 1.04f,
+            heroGradient = true,
+            headingFamily = FontFamily.SansSerif,
+        )
+    }
+
+private fun arenaTypography(metrics: ArenaMetrics): Typography {
+    val s = metrics.typeScale
+    val heading = metrics.headingFamily
+    fun sp(value: Float) = (value * s).sp
+    return Typography(
+        headlineMedium = TextStyle(
+            fontFamily = heading,
+            fontWeight = FontWeight.Bold,
+            fontSize = sp(26f),
+            lineHeight = sp(33f),
+        ),
+        titleLarge = TextStyle(
+            fontFamily = heading,
+            fontWeight = FontWeight.Bold,
+            fontSize = sp(22f),
+            lineHeight = sp(28f),
+        ),
+        titleMedium = TextStyle(
+            fontFamily = heading,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = sp(17f),
+            lineHeight = sp(24f),
+        ),
+        titleSmall = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = sp(15f),
+            lineHeight = sp(21f),
+        ),
+        bodyLarge = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.Normal,
+            fontSize = sp(16f),
+            lineHeight = sp(25f),
+        ),
+        bodyMedium = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.Normal,
+            fontSize = sp(14f),
+            lineHeight = sp(21f),
+        ),
+        bodySmall = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.Normal,
+            fontSize = sp(12.5f),
+            lineHeight = sp(18f),
+        ),
+        labelLarge = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = sp(15f),
+            lineHeight = sp(20f),
+        ),
+        labelMedium = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = sp(13f),
+            lineHeight = sp(17f),
+        ),
+        labelSmall = TextStyle(
+            fontFamily = FontFamily.SansSerif,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = sp(11.5f),
+            lineHeight = sp(15f),
+        ),
+    )
+}
+
+private fun ArenaPalette.toColorScheme() = if (isDark) {
+    darkColorScheme(
+        primary = accent,
+        onPrimary = onAccent,
+        primaryContainer = accentSoft,
+        onPrimaryContainer = accent,
+        secondary = debate,
+        background = page,
+        onBackground = ink,
+        surface = surface,
+        onSurface = ink,
+        surfaceVariant = surfaceAlt,
+        onSurfaceVariant = muted,
+        outline = border,
+        error = error,
+        onError = Color.White,
+    )
+} else {
+    lightColorScheme(
+        primary = accent,
+        onPrimary = onAccent,
+        primaryContainer = accentSoft,
+        onPrimaryContainer = accent,
+        secondary = debate,
+        background = page,
+        onBackground = ink,
+        surface = surface,
+        onSurface = ink,
+        surfaceVariant = surfaceAlt,
+        onSurfaceVariant = muted,
+        outline = border,
+        error = error,
+        onError = Color.White,
+    )
+}
+
+@Composable
+fun ArenaTheme(
+    skin: ArenaSkin = ArenaSkin.default,
+    content: @Composable () -> Unit,
+) {
+    val palette = skin.palette
+    val metrics = skin.metrics
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = view.context.findActivityWindow() ?: return@SideEffect
+            WindowCompat.getInsetsController(window, view).apply {
+                isAppearanceLightStatusBars = !palette.isDark
+                isAppearanceLightNavigationBars = !palette.isDark
+            }
+        }
+    }
+    CompositionLocalProvider(
+        LocalArenaPalette provides palette,
+        LocalArenaMetrics provides metrics,
+    ) {
+        MaterialTheme(
+            colorScheme = palette.toColorScheme(),
+            typography = arenaTypography(metrics),
+            content = content,
+        )
+    }
+}
+
+private fun Context.findActivityWindow(): android.view.Window? {
+    var current: Context? = this
+    while (current is android.content.ContextWrapper) {
+        if (current is android.app.Activity) return current.window
+        current = current.baseContext
+    }
+    return null
+}
+
+/** 皮肤选择的本地持久化。与登录态无关，卸载前一直保留。 */
+class ArenaSkinPreferences(context: Context) {
+    private val preferences = context.applicationContext.getSharedPreferences(
+        "arena_appearance",
+        Context.MODE_PRIVATE,
+    )
+
+    fun loadSkin(): ArenaSkin = ArenaSkin.fromName(preferences.getString(KEY_SKIN, null))
+
+    fun saveSkin(skin: ArenaSkin) {
+        preferences.edit { putString(KEY_SKIN, skin.name) }
+    }
+
+    private companion object {
+        const val KEY_SKIN = "skin"
+    }
+}

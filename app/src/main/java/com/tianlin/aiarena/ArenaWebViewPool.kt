@@ -46,11 +46,23 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val explicitLoginProbeCounts = mutableMapOf<ArenaService, Int>()
     private var uiSelectedService: ArenaService? = null
     private var automationService: ArenaService? = null
+    /**
+     * 每次进入自动化都会递增。看门狗和各级回调靠它判断"我还是当前这一次吗"，
+     * 避免迟到的回调结束掉后来的自动化。
+     */
+    private var automationToken = 0L
+    private var automationWatchdog: Runnable? = null
+    private var automationOnTimeout: (() -> Unit)? = null
     private var backgroundProbeInProgress = false
     private var destroyed = false
     private var textZoomPercent = 100
     private var preloadGeneration = 0L
     private var desiredServices: Set<ArenaService> = emptySet()
+    /**
+     * 本轮正在收发的成员。它们的 WebView 不能因为用户改了成员选择就被销毁——
+     * 销毁会让已经生成一半的回答直接丢失，而且清掉登录确认后连"重发"都会失败。
+     */
+    private var protectedServices: Set<ArenaService> = emptySet()
     @SuppressLint("MissingOnRenderProcessGone")
     private val destroyedWebViewClient = object : WebViewClient() {
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean = true
@@ -97,6 +109,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     fun show(service: ArenaService?) {
+        if (destroyed) return
+        // Compose 的 AndroidView.update 每次重组都会重跑，show() 因此被高频调用。
+        // 没有真正切换时直接返回；否则每次重组都排一个 600ms 的登录探针，
+        // 探针写回 statuses 又触发重组，形成自激循环。
+        if (service == uiSelectedService && automationService == null) return
         uiSelectedService = service
         if (automationService != null) return
         applyVisibility(service, hiddenAutomation = false)
@@ -105,6 +122,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun applyVisibility(service: ArenaService?, hiddenAutomation: Boolean) {
+        if (destroyed) return
         container.visibility = if (service == null) View.GONE else View.VISIBLE
         container.alpha = if (hiddenAutomation) 0.01f else 1f
         container.isClickable = service != null && !hiddenAutomation
@@ -112,7 +130,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ArenaService.entries.forEach { candidate ->
             val webView = webViews[candidate]
             if (candidate == service) {
-                ensureWebView(candidate).visibility = View.VISIBLE
+                ensureWebView(candidate)?.visibility = View.VISIBLE
             } else {
                 webView?.visibility = View.GONE
             }
@@ -120,12 +138,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     fun open(service: ArenaService) {
+        if (destroyed) return
         ensureWebView(service)
         show(service)
     }
 
     fun reload(service: ArenaService) {
-        ensureWebView(service).reload()
+        ensureWebView(service)?.reload()
     }
 
     fun canGoBack(service: ArenaService): Boolean = webViews[service]?.canGoBack() == true
@@ -137,8 +156,25 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         return true
     }
 
+    /** 由控制器在开轮/收轮时告知，哪些成员的 WebView 现在不能回收。 */
+    override fun setProtectedServices(services: Set<ArenaService>) {
+        protectedServices = services
+    }
+
     fun probeAll() {
+        if (destroyed) return
         webViews.keys.toList().forEach(::probe)
+    }
+
+    /** App 退到后台时挂起全部 WebView，避免 3-4 个聊天页在后台继续跑定时器和动画。 */
+    fun pauseAll() {
+        if (destroyed) return
+        webViews.values.forEach { webView -> webView.onPause() }
+    }
+
+    fun resumeAll() {
+        if (destroyed) return
+        webViews.values.forEach { webView -> webView.onResume() }
     }
 
     override fun sendPrompt(
@@ -197,20 +233,65 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
     }
 
+    override fun cancelAutomation() {
+        if (destroyed || automationService == null) return
+        // 让所有在途回调因 token 失配而失效，并把界面可见性立刻复位。
+        finishAutomation()
+    }
+
     private fun activateForAutomation(
         service: ArenaService,
         onTimeout: () -> Unit,
+        waited: Long = 0L,
         block: (WebView) -> Unit,
     ) {
-        if (backgroundProbeInProgress) {
-            handler.postDelayed({ activateForAutomation(service, onTimeout, block) }, 200)
+        if (destroyed) {
+            onTimeout()
+            return
+        }
+        // 后台探针或上一次自动化还没结束时排队等待，而不是直接覆盖 automationService。
+        // 覆盖会让先前那条链在结束时把后来这条的可见性和键盘状态一并复位。
+        if (backgroundProbeInProgress || automationService != null) {
+            if (waited >= AUTOMATION_QUEUE_TIMEOUT_MS) {
+                onTimeout()
+                return
+            }
+            handler.postDelayed(
+                {
+                    activateForAutomation(
+                        service = service,
+                        onTimeout = onTimeout,
+                        waited = waited + AUTOMATION_QUEUE_INTERVAL_MS,
+                        block = block,
+                    )
+                },
+                AUTOMATION_QUEUE_INTERVAL_MS,
+            )
+            return
+        }
+        val webView = ensureWebView(service)
+        if (webView == null) {
+            onTimeout()
             return
         }
         automationService = service
-        val webView = ensureWebView(service)
+        val token = ++automationToken
+        automationOnTimeout = onTimeout
+        // 兜底看门狗：WebView 渲染进程被杀时，已投递的 evaluateJavascript 回调会被
+        // Chromium 静默丢弃，既不抛异常也不回调。没有这个超时，automationService
+        // 会永远非空，之后所有发送和网页显示全部死锁，只能杀掉进程。
+        val watchdog = Runnable {
+            if (token != automationToken) return@Runnable
+            val pending = automationOnTimeout
+            finishAutomation()
+            pending?.invoke()
+        }
+        automationWatchdog = watchdog
+        handler.postDelayed(watchdog, AUTOMATION_HARD_TIMEOUT_MS)
         applyVisibility(service, hiddenAutomation = true)
         webView.onResume()
         handler.postDelayed({
+            if (token != automationToken) return@postDelayed
             waitForPromptInput(webView, service, attempt = 0, onTimeout = onTimeout, onReady = block)
         }, 650)
     }
@@ -222,8 +303,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         onTimeout: () -> Unit,
         onReady: (WebView) -> Unit,
     ) {
-        val selector = promptInputSelector(service)
-        webView.evaluateJavascript("!!document.querySelector(${JSONObject.quote(selector)})") { raw ->
+        val selectors = ArenaJs.quoteArray(promptInputSelectors(service))
+        val probe = "(function() { ${selectorHelperScript()} return !!arenaFirstMatch($selectors); })();"
+        webView.evaluateJavascript(probe) { raw ->
             if (raw == "true") {
                 onReady(webView)
             } else if (attempt + 1 < AUTOMATION_READY_ATTEMPTS) {
@@ -237,8 +319,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun finishAutomation() {
-        automationService?.let { service -> webViews[service]?.let(::hideAutomationKeyboard) }
+        automationWatchdog?.let(handler::removeCallbacks)
+        automationWatchdog = null
+        automationOnTimeout = null
+        automationToken += 1
+        val service = automationService ?: return
+        webViews[service]?.let(::hideAutomationKeyboard)
         automationService = null
+        if (destroyed) return
         applyVisibility(uiSelectedService, hiddenAutomation = false)
         trimUndesiredWebViews()
         handler.post { drainBackgroundProbes() }
@@ -273,7 +361,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             finishSend(SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
         }
         handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
-        webView.evaluateJavascript(sendScript(service, JSONObject.quote(fullPrompt), requestId)) { raw ->
+        webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
             if (scriptCallbackConsumed) return@evaluateJavascript
             scriptCallbackConsumed = true
             handler.removeCallbacks(scriptCallbackTimeout)
@@ -373,7 +461,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private fun trimUndesiredWebViews() {
         webViews.keys
             .filter { service ->
-                service !in desiredServices && service != uiSelectedService && service != automationService
+                service !in desiredServices &&
+                    service !in protectedServices &&
+                    service != uiSelectedService &&
+                    service != automationService
             }
             .toList()
             .forEach(::disposeWebView)
@@ -395,8 +486,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     // The anonymous client below does implement onRenderProcessGone; lint cannot follow this factory shape.
     @SuppressLint("SetJavaScriptEnabled", "MissingOnRenderProcessGone")
-    private fun ensureWebView(service: ArenaService): WebView {
+    private fun ensureWebView(service: ArenaService): WebView? {
         webViews[service]?.let { return it }
+        // destroy() 之后仍可能有迟到的 JS 回调走到这里；再建一个 WebView
+        // 会把已经销毁的 Activity 一起泄漏掉。
+        if (destroyed) return null
 
         statuses[service] = ServiceStatus(ConnectionState.LOADING, "正在打开网页")
         val webView = WebView(activity).apply {
@@ -496,8 +590,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         url = view.url.orEmpty(),
                     )
                     webViews.remove(service)
+                    confirmedSignedIn.remove(service)
                     container.removeView(view)
                     view.destroy()
+                    // 这个 WebView 上所有在途的 JS 回调都不会再回来。
+                    // 立刻结束自动化并让调用方失败，不必等 45 秒看门狗。
+                    if (automationService == service) {
+                        val pending = automationOnTimeout
+                        backgroundProbeInProgress = false
+                        finishAutomation()
+                        pending?.invoke()
+                    }
                     return true
                 }
             }
@@ -563,7 +666,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             onComplete()
             return
         }
+        // 与自动化链同理：探针的 JS 回调也会随渲染进程一起消失。
+        // 没有兜底的话 backgroundProbeInProgress 会永久为 true，后续自动化全部排队饿死。
+        var consumed = false
+        val timeout = Runnable {
+            if (consumed) return@Runnable
+            consumed = true
+            onComplete()
+        }
+        handler.postDelayed(timeout, LOGIN_PROBE_TIMEOUT_MS)
         webView.evaluateJavascript(loginProbeScript(service)) { rawResult ->
+            if (consumed) return@evaluateJavascript
+            consumed = true
+            handler.removeCallbacks(timeout)
             if (destroyed || webViews[service] !== webView) {
                 onComplete()
                 return@evaluateJavascript
@@ -635,7 +750,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "textarea",
             )
         }
-        val selectorJson = selectors.joinToString(",") { JSONObject.quote(it) }
+        val selectorJson = selectors.joinToString(",") { ArenaJs.quote(it) }
         return """
             (function() {
               const selectors = [$selectorJson];
@@ -665,13 +780,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun verifySendScript(service: ArenaService, requestId: String): String {
-        val inputSelector = promptInputSelector(service)
+        val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
+        val selectorHelper = selectorHelperScript()
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         return """
             (function() {
               $stateBootstrap
-              const input = document.querySelector(${JSONObject.quote(inputSelector)});
+              $selectorHelper
+              const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               const clicked = !!(window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]);
               return ($conversationAdvanced) || (inputText.trim().length === 0 && clicked);
@@ -680,18 +797,20 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun clickSendScript(service: ArenaService, requestId: String): String {
-        val inputSelector = promptInputSelector(service)
-        val sendSelector = sendButtonSelector(service)
+        val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
+        val sendSelectors = ArenaJs.quoteArray(sendButtonSelectors(service))
+        val selectorHelper = selectorHelperScript()
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         return """
             (function() {
               $stateBootstrap
+              $selectorHelper
               if ($conversationAdvanced) return 'already_sent';
-              const input = document.querySelector(${JSONObject.quote(inputSelector)});
+              const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
-              const send = document.querySelector(${JSONObject.quote(sendSelector)});
+              const send = arenaFirstMatch($sendSelectors);
               if (!send || send.disabled || send.getAttribute('aria-disabled') === 'true') return 'not_ready';
               window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
               window.__aiArenaSendClicks[requestId] = Date.now();
@@ -702,93 +821,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun sendScript(service: ArenaService, quotedPrompt: String, requestId: String): String {
-        val inputSelectors = promptInputSelector(service)
-        val sendSelectors = sendButtonSelector(service)
+        val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
+        val sendSelectors = ArenaJs.quoteArray(sendButtonSelectors(service))
+        val selectorHelper = selectorHelperScript()
         val firstClickDelayMs = if (service == ArenaService.DOUBAO) 850 else 400
         val retryClickDelayMs = if (service == ArenaService.DOUBAO) 2_400 else 1_400
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         val qwenFetchHook = if (service == ArenaService.QWEN) {
-            """
-                window.__aiArenaQwenResponses = window.__aiArenaQwenResponses || {};
-                window.__aiArenaQwenCaptureChunk = function(chunk, explicitRequestId, forceDone) {
-                  const captureRequestId = explicitRequestId || window.__aiArenaQwenPendingRequestId;
-                  if (!captureRequestId || !chunk) return;
-                  let record = window.__aiArenaQwenResponses[captureRequestId];
-                  if (!record && !chunk.includes('data:')) return;
-                  if (!record) {
-                    record = { done: false, answer: '', error: '', rawBuffer: '', startedAt: Date.now() };
-                    window.__aiArenaQwenResponses[captureRequestId] = record;
-                  }
-                  record.rawBuffer = (record.rawBuffer + chunk).slice(-2000000);
-                  let latest = record.answer || '';
-                  for (const line of record.rawBuffer.split(/\r?\n/)) {
-                    if (!line.startsWith('data:')) continue;
-                    try {
-                      const payload = JSON.parse(line.slice(5));
-                      const messages = payload && payload.data && payload.data.messages || [];
-                      for (const message of messages) {
-                        if (typeof message.content === 'string' && message.content.trim()) {
-                          latest = message.content;
-                        }
-                      }
-                    } catch (_) {}
-                  }
-                  record.answer = latest;
-                  if (forceDone || record.rawBuffer.includes('event:complete')) {
-                    record.done = true;
-                    record.rawLength = record.rawBuffer.length;
-                    record.rawBuffer = '';
-                    if (window.__aiArenaQwenPendingRequestId === captureRequestId) {
-                      window.__aiArenaQwenPendingRequestId = null;
-                    }
-                    try {
-                      sessionStorage.setItem(
-                        '__ai_arena_qwen_response_' + captureRequestId,
-                        JSON.stringify({ done: true, answer: latest, error: record.error || '' })
-                      );
-                    } catch (_) {}
-                  }
-                };
-                const decoderPrototype = window.TextDecoder && window.TextDecoder.prototype;
-                if (decoderPrototype && !decoderPrototype.decode.__aiArenaQwenWrapped) {
-                  const originalDecode = decoderPrototype.decode;
-                  const wrappedDecode = function() {
-                    const decoded = originalDecode.apply(this, arguments);
-                    try { window.__aiArenaQwenCaptureChunk(decoded, null, false); } catch (_) {}
-                    return decoded;
-                  };
-                  wrappedDecode.__aiArenaQwenWrapped = true;
-                  decoderPrototype.decode = wrappedDecode;
-                }
-                if (!window.fetch.__aiArenaQwenWrapped) {
-                  const originalFetch = window.fetch;
-                  const wrappedFetch = async function() {
-                    const args = arguments;
-                    const response = await originalFetch.apply(this, args);
-                    try {
-                      const url = String((args[0] && args[0].url) || args[0] || response.url || '');
-                      const pendingRequestId = window.__aiArenaQwenPendingRequestId;
-                      if (pendingRequestId && url.includes('/api/v2/chat')) {
-                        response.clone().text().then(function(raw) {
-                          window.__aiArenaQwenCaptureChunk(raw, pendingRequestId, true);
-                        }).catch(function(error) {
-                          const record = window.__aiArenaQwenResponses[pendingRequestId] || {
-                            done: false, answer: '', error: '', rawBuffer: '', startedAt: Date.now()
-                          };
-                          window.__aiArenaQwenResponses[pendingRequestId] = record;
-                          record.error = String(error && error.message || error);
-                          record.done = true;
-                        });
-                      }
-                    } catch (_) {}
-                    return response;
-                  };
-                  wrappedFetch.__aiArenaQwenWrapped = true;
-                  window.fetch = wrappedFetch;
-                }
-                window.__aiArenaQwenPendingRequestId = requestId;
-            """.trimIndent()
+            qwenCaptureScript()
         } else {
             ""
         }
@@ -819,9 +860,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               try {
                 const text = $quotedPrompt;
                 $stateBootstrap
+                $selectorHelper
                 $qwenFetchHook
                 $zhipuMessageDispatch
-                const input = document.querySelector(${JSONObject.quote(inputSelectors)});
+                const input = arenaFirstMatch($inputSelectors);
                 if (!input) return 'no_input';
                 $focusInput
                 let needsSyntheticInput = true;
@@ -892,7 +934,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 const attemptSend = function() {
                   if ($conversationAdvanced) return;
                   if (!currentInputText().trim()) return;
-                  const send = document.querySelector(${JSONObject.quote(sendSelectors)});
+                  const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
                   if (send && !send.disabled && send.getAttribute('aria-disabled') !== 'true') {
                     window.__aiArenaSendClicks[requestId] = Date.now();
@@ -912,14 +954,25 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
     }
 
-    private fun promptInputSelector(service: ArenaService): String = when (service) {
-        ArenaService.DEEPSEEK -> "#chat-input, textarea[placeholder], [contenteditable='true']"
-        ArenaService.DOUBAO -> ".tiptap.ProseMirror[contenteditable='true'], [contenteditable='true'], textarea"
-        ArenaService.KIMI -> ".chat-input-editor, [role='textbox'], [contenteditable='true'], textarea"
-        ArenaService.QWEN -> "[role='textbox'], [contenteditable='true'], [contenteditable], textarea"
-        ArenaService.YUANBAO -> "[contenteditable='true'], textarea, #chat-input"
-        ArenaService.ZHIPU -> "[contenteditable='true'], [role='textbox'], textarea"
+    /**
+     * 输入框候选，**按优先级从精确到兜底排列**。
+     *
+     * 不能直接把它们逗号拼成一个选择器交给 querySelector：CSS 选择器列表返回的是
+     * "文档中第一个匹配任一选择器的元素"，而不是"第一个能匹配上的选择器"。页面里
+     * 只要在真正输入框之前存在任何一个 [contenteditable='true']（隐藏占位、搜索框、
+     * 富文本编辑器的量算节点），提示词就会被写进错误的元素。
+     */
+    private fun promptInputSelectors(service: ArenaService): List<String> = when (service) {
+        ArenaService.DEEPSEEK -> listOf("#chat-input", "textarea[placeholder]", "[contenteditable='true']")
+        ArenaService.DOUBAO -> listOf(".tiptap.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea")
+        ArenaService.KIMI -> listOf(".chat-input-editor", "[role='textbox']", "[contenteditable='true']", "textarea")
+        ArenaService.QWEN -> listOf("[role='textbox']", "[contenteditable='true']", "[contenteditable]", "textarea")
+        ArenaService.YUANBAO -> listOf("[contenteditable='true']", "textarea", "#chat-input")
+        ArenaService.ZHIPU -> listOf("[contenteditable='true']", "[role='textbox']", "textarea")
     }
+
+    private fun promptInputSelector(service: ArenaService): String =
+        promptInputSelectors(service).joinToString(", ")
 
     companion object {
         private val ZHIPU_DOCUMENT_START_CAPTURE = """
@@ -1028,19 +1081,170 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             })();
         """.trimIndent()
 
-        internal fun sendButtonSelector(service: ArenaService): String = when (service) {
-            ArenaService.DEEPSEEK -> "[role='button'].ds-button--primary.ds-button--circle, button.ds-button--primary.ds-button--circle, [data-testid='send-button'], button[aria-label*='Send'], button[aria-label*='发送']"
-            ArenaService.DOUBAO -> "#input-engine-container button[class*='bg-dbx-fill-highlight'], button[class*='send-msg-btn'], button[class*='g-send-msg'], button[class*='send'], button[class*='send-btn'], button[aria-label*='发送']"
-            ArenaService.KIMI -> "button[class*='send'], button[aria-label*='发送'], button[type='submit']"
-            ArenaService.QWEN -> "button[aria-label='发送消息'], button[aria-label*='发送'], button[aria-label*='Send'], button[class*='send'], button[class*='submit']"
-            ArenaService.YUANBAO -> "button[aria-label*='发送'], button[aria-label*='Send'], button[aria-label='提交'], button[class*='send'], button[class*='submit']"
-            ArenaService.ZHIPU -> ".button-right-inner, .send-button-right, button[aria-label*='发送'], button[aria-label*='Send'], button[type='submit'], button[class*='send']"
+        /** 发送按钮候选，同样按优先级排列，理由见 [promptInputSelectors]。 */
+        internal fun sendButtonSelectors(service: ArenaService): List<String> = when (service) {
+            ArenaService.DEEPSEEK -> listOf(
+                "[role='button'].ds-button--primary.ds-button--circle",
+                "button.ds-button--primary.ds-button--circle",
+                "[data-testid='send-button']",
+                "button[aria-label*='Send']",
+                "button[aria-label*='发送']",
+            )
+            ArenaService.DOUBAO -> listOf(
+                "#input-engine-container button[class*='bg-dbx-fill-highlight']",
+                "button[class*='send-msg-btn']",
+                "button[class*='g-send-msg']",
+                "button[class*='send']",
+                "button[class*='send-btn']",
+                "button[aria-label*='发送']",
+            )
+            ArenaService.KIMI -> listOf(
+                "button[class*='send']",
+                "button[aria-label*='发送']",
+                "button[type='submit']",
+            )
+            ArenaService.QWEN -> listOf(
+                "button[aria-label='发送消息']",
+                "button[aria-label*='发送']",
+                "button[aria-label*='Send']",
+                "button[class*='send']",
+                "button[class*='submit']",
+            )
+            ArenaService.YUANBAO -> listOf(
+                "button[aria-label*='发送']",
+                "button[aria-label*='Send']",
+                "button[aria-label='提交']",
+                "button[class*='send']",
+                "button[class*='submit']",
+            )
+            ArenaService.ZHIPU -> listOf(
+                ".button-right-inner",
+                ".send-button-right",
+                "button[aria-label*='发送']",
+                "button[aria-label*='Send']",
+                "button[type='submit']",
+                "button[class*='send']",
+            )
         }
+
+        internal fun sendButtonSelector(service: ArenaService): String =
+            sendButtonSelectors(service).joinToString(", ")
+
+        /**
+         * 千问的 SSE 抓取钩子。抽成独立函数是为了能在单元测试里断言它的
+         * 缓冲策略，不必启动 WebView。
+         */
+        internal fun qwenCaptureScript(): String =
+            """
+                window.__aiArenaQwenResponses = window.__aiArenaQwenResponses || {};
+                window.__aiArenaQwenCaptureChunk = function(chunk, explicitRequestId, forceDone) {
+                  const captureRequestId = explicitRequestId || window.__aiArenaQwenPendingRequestId;
+                  if (!captureRequestId || !chunk) return;
+                  let record = window.__aiArenaQwenResponses[captureRequestId];
+                  if (!record && !chunk.includes('data:')) return;
+                  if (!record) {
+                    record = { done: false, answer: '', error: '', rawBuffer: '', startedAt: Date.now() };
+                    window.__aiArenaQwenResponses[captureRequestId] = record;
+                  }
+                  // 只解析新到达的部分：之前是把最多 2MB 的整段缓冲每次重新 split + JSON.parse，
+                  // SSE 每秒几十个分片时会变成每秒上亿字符操作，渲染进程直接卡死。
+                  record.rawBuffer = (record.rawBuffer || '') + chunk;
+                  const lastBreak = record.rawBuffer.lastIndexOf('\n');
+                  const consumable = lastBreak >= 0 ? record.rawBuffer.slice(0, lastBreak) : '';
+                  record.rawBuffer = lastBreak >= 0 ? record.rawBuffer.slice(lastBreak + 1) : record.rawBuffer;
+                  if (record.rawBuffer.length > 200000) record.rawBuffer = record.rawBuffer.slice(-200000);
+                  let latest = record.answer || '';
+                  for (const line of consumable.split(/\r?\n/)) {
+                    if (!line.startsWith('data:')) continue;
+                    try {
+                      const payload = JSON.parse(line.slice(5));
+                      const messages = payload && payload.data && payload.data.messages || [];
+                      for (const message of messages) {
+                        if (typeof message.content === 'string' && message.content.trim()) {
+                          latest = message.content;
+                        }
+                      }
+                    } catch (_) {}
+                  }
+                  record.answer = latest;
+                  if (forceDone || record.rawBuffer.includes('event:complete')) {
+                    record.done = true;
+                    record.rawLength = record.rawBuffer.length;
+                    record.rawBuffer = '';
+                    if (window.__aiArenaQwenPendingRequestId === captureRequestId) {
+                      window.__aiArenaQwenPendingRequestId = null;
+                    }
+                    try {
+                      sessionStorage.setItem(
+                        '__ai_arena_qwen_response_' + captureRequestId,
+                        JSON.stringify({ done: true, answer: latest, error: record.error || '' })
+                      );
+                    } catch (_) {}
+                  }
+                };
+                const decoderPrototype = window.TextDecoder && window.TextDecoder.prototype;
+                if (decoderPrototype && !decoderPrototype.decode.__aiArenaQwenWrapped) {
+                  const originalDecode = decoderPrototype.decode;
+                  const wrappedDecode = function() {
+                    const decoded = originalDecode.apply(this, arguments);
+                    try { window.__aiArenaQwenCaptureChunk(decoded, null, false); } catch (_) {}
+                    return decoded;
+                  };
+                  wrappedDecode.__aiArenaQwenWrapped = true;
+                  decoderPrototype.decode = wrappedDecode;
+                }
+                if (!window.fetch.__aiArenaQwenWrapped) {
+                  const originalFetch = window.fetch;
+                  const wrappedFetch = async function() {
+                    const args = arguments;
+                    const response = await originalFetch.apply(this, args);
+                    try {
+                      const url = String((args[0] && args[0].url) || args[0] || response.url || '');
+                      const pendingRequestId = window.__aiArenaQwenPendingRequestId;
+                      if (pendingRequestId && url.includes('/api/v2/chat')) {
+                        response.clone().text().then(function(raw) {
+                          window.__aiArenaQwenCaptureChunk(raw, pendingRequestId, true);
+                        }).catch(function(error) {
+                          const record = window.__aiArenaQwenResponses[pendingRequestId] || {
+                            done: false, answer: '', error: '', rawBuffer: '', startedAt: Date.now()
+                          };
+                          window.__aiArenaQwenResponses[pendingRequestId] = record;
+                          record.error = String(error && error.message || error);
+                          record.done = true;
+                        });
+                      }
+                    } catch (_) {}
+                    return response;
+                  };
+                  wrappedFetch.__aiArenaQwenWrapped = true;
+                  window.fetch = wrappedFetch;
+                }
+                window.__aiArenaQwenPendingRequestId = requestId;
+            """.trimIndent()
+
+        /** 注入到页面的按优先级查找辅助函数。 */
+        internal fun selectorHelperScript(): String = """
+            const arenaFirstMatch = function(selectors) {
+              for (const selector of selectors) {
+                try {
+                  const found = document.querySelector(selector);
+                  if (found) return found;
+                } catch (_) {}
+              }
+              return null;
+            };
+        """.trimIndent()
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
         private const val AUTOMATION_READY_ATTEMPTS = 15
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L
         private const val SEND_VERIFY_CALLBACK_TIMEOUT_MS = 10_000L
+
+        /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
+        private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
+        private const val AUTOMATION_QUEUE_INTERVAL_MS = 200L
+        private const val AUTOMATION_QUEUE_TIMEOUT_MS = 20_000L
+        private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
     }
 }

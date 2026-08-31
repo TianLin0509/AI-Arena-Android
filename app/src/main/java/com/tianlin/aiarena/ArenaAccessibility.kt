@@ -205,6 +205,9 @@ class ArenaSpeechController(
     private val mainHandler = Handler(Looper.getMainLooper())
     private var engine: TextToSpeech? = null
     private var initialized = false
+    /** 引擎初始化失败过。此时 initialized 仍是 false，不能再把请求挂成 pending。 */
+    private var engineFailed = false
+    private var engineFailureMessage = "朗读：系统引擎不可用"
     private var destroyed = false
     private var session = 0L
     private var engineGeneration = 0L
@@ -223,6 +226,13 @@ class ArenaSpeechController(
         val normalized = SpeechTextPolicy.normalize(text)
         if (normalized.isBlank()) {
             state.markError("朗读：没有可播放文字")
+            return
+        }
+        if (engineFailed) {
+            // 没有这个分支的话，引擎不可用时请求会被挂成 pending 并把界面标成
+            // "正在播放"，但永远不会有声音，也永远回不到可用状态。
+            pending = null
+            state.markError(engineFailureMessage, engineUnavailable = true)
             return
         }
         if (!initialized) {
@@ -255,13 +265,17 @@ class ArenaSpeechController(
         val current = engine
         if (status != TextToSpeech.SUCCESS || current == null) {
             pending = null
-            state.markError("朗读：系统引擎不可用", engineUnavailable = true)
+            engineFailed = true
+            engineFailureMessage = "朗读：系统引擎不可用"
+            state.markError(engineFailureMessage, engineUnavailable = true)
             return
         }
         val languageStatus = current.setLanguage(Locale.SIMPLIFIED_CHINESE)
         if (languageStatus == TextToSpeech.LANG_MISSING_DATA || languageStatus == TextToSpeech.LANG_NOT_SUPPORTED) {
             pending = null
-            state.markError("朗读：缺少中文语音包", engineUnavailable = true)
+            engineFailed = true
+            engineFailureMessage = "朗读：缺少中文语音包"
+            state.markError(engineFailureMessage, engineUnavailable = true)
             return
         }
         current.setSpeechRate(0.88f)
@@ -287,6 +301,7 @@ class ArenaSpeechController(
             }
         })
         initialized = true
+        engineFailed = false
         state.markReady()
         pending?.also { pending = null }?.let { request ->
             speak(request.key, request.text, allowReconnect = request.allowReconnect)

@@ -2,6 +2,7 @@ package com.tianlin.aiarena
 
 import android.os.Handler
 import android.os.Looper
+import java.util.concurrent.Executors
 import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -50,6 +51,25 @@ class ArenaSessionController(
 
     private val handler = Handler(Looper.getMainLooper())
     private val persistenceHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * 落盘专用单线程。一次 save() 要做全量 JSON 编码 + 两次 fsync，
+     * 而流式回答期间每家 AI 每 1.5 秒轮询一次都会触发它——放在主线程上必然 ANR。
+     */
+    private val persistExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "arena-session-persist").apply { isDaemon = true }
+    }
+    private var persistShutdown = false
+
+    /**
+     * 每次 reset / restoreSession / applySnapshot 都会递增。
+     *
+     * 落盘搬到后台线程之后出现过一个真实回归：reset() 先触发一次 persist（后台任务里
+     * 会 setActiveSession(旧 id)），再同步把活动会话清成 null；后台任务晚一步执行，
+     * 又把旧会话设了回去 —— 用户点了"开始新问题"，冷启动却仍然恢复上一轮。
+     * 这个代号让迟到的任务知道自己已经过期。
+     */
+    private var persistGeneration = 0L
     private val pollStates = mutableMapOf<ArenaService, PollState>()
     private var activeExecution: RoundExecution? = null
     private var summaryExecution: SummaryExecution? = null
@@ -264,6 +284,7 @@ class ArenaSessionController(
         val activeSummary = summaryExecution
         if (activeSummary != null && isSummaryActive(activeSummary)) {
             handler.removeCallbacksAndMessages(null)
+            pool.cancelAutomation()
             summary = summary.copy(phase = ParticipantPhase.ERROR, detail = "已停止总结")
             summaryExecution = null
             sessionEpoch += 1
@@ -274,6 +295,7 @@ class ArenaSessionController(
         val activeRecovery = recoveryExecution
         if (activeRecovery != null && isRecoveryActive(activeRecovery)) {
             handler.removeCallbacksAndMessages(null)
+            pool.cancelAutomation()
             finishRecovery(
                 activeRecovery,
                 runs.getValue(activeRecovery.service).copy(
@@ -287,6 +309,7 @@ class ArenaSessionController(
         val execution = activeExecution ?: return
         if (!isBusy) return
         handler.removeCallbacksAndMessages(null)
+        pool.cancelAutomation()
         pollStates.clear()
         execution.services.forEach { service ->
             val run = runs.getValue(service)
@@ -303,8 +326,12 @@ class ArenaSessionController(
     }
 
     fun reset() {
-        persistNow()
+        // 必须同步写完：后面紧接着要把活动会话清空，异步落盘会把它又设回去。
+        persistNow(synchronous = true)
+        persistGeneration += 1
         persistenceHandler.removeCallbacksAndMessages(null)
+        pool.setProtectedServices(emptySet())
+        pool.cancelAutomation()
         sessionRepository?.setActiveSession(null)
         sessionId = ""
         sessionEpoch += 1
@@ -330,7 +357,11 @@ class ArenaSessionController(
     }
 
     fun destroy() {
+        pool.setProtectedServices(emptySet())
+        // 进程随时可能被回收，最后这一次必须同步写完，不能交给后台线程。
+        persistShutdown = true
         persistNow()
+        persistExecutor.shutdown()
         persistenceHandler.removeCallbacksAndMessages(null)
         sessionEpoch += 1
         handler.removeCallbacksAndMessages(null)
@@ -343,7 +374,8 @@ class ArenaSessionController(
     fun restoreSession(id: String): Boolean {
         if (isBusy) return false
         val snapshot = sessionRepository?.load(id) ?: return false
-        persistNow()
+        persistNow(synchronous = true)
+        persistGeneration += 1
         applySnapshot(snapshot, recovered = false)
         sessionRepository.setActiveSession(snapshot.id)
         schedulePersist()
@@ -402,6 +434,7 @@ class ArenaSessionController(
         )
         lastRoundPrompts = prompts.mapValues { (_, prompt) -> prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS) }
         activeExecution = execution
+        pool.setProtectedServices(services.toSet())
         schedulePersist()
         when (answerMode) {
             AnswerMode.PARALLEL -> dispatchParallel(execution)
@@ -429,6 +462,9 @@ class ArenaSessionController(
             requestId = requestId,
             resend = resend,
             startedAtElapsedMillis = SystemClock.elapsedRealtime(),
+            previousResponse = previous.response,
+            previousTruncated = previous.responseTruncated,
+            previousOriginalLength = previous.originalResponseLength,
         )
         recoveryExecution = execution
         runs[service] = previous.copy(
@@ -570,10 +606,26 @@ class ArenaSessionController(
 
     private fun finishRecovery(execution: RecoveryExecution, result: ParticipantRun) {
         if (!isRecoveryActive(execution)) return
-        runs[execution.service] = result
+        // 重发前会清空 response 以便重新采集；如果这次重发没拿到任何内容，
+        // 就把之前那份部分回答还回去，而不是让用户既没有旧的也没有新的。
+        val restored = if (
+            result.phase == ParticipantPhase.ERROR &&
+            result.response.isBlank() &&
+            execution.previousResponse.isNotBlank()
+        ) {
+            result.copy(
+                response = execution.previousResponse,
+                responseTruncated = execution.previousTruncated,
+                originalResponseLength = execution.previousOriginalLength,
+                detail = "${result.detail}；已保留上一次的部分回答",
+            )
+        } else {
+            result
+        }
+        runs[execution.service] = restored
         recoveryExecution = null
-        updateLatestRoundResult(execution.service, result)
-        sessionMessage = when (result.phase) {
+        updateLatestRoundResult(execution.service, restored)
+        sessionMessage = when (restored.phase) {
             ParticipantPhase.COMPLETE -> "${execution.service.displayName} 单家补救完成"
             else -> "${execution.service.displayName} 单家补救未完成，其他结果仍保留"
         }
@@ -638,11 +690,32 @@ class ArenaSessionController(
             detail = "正在发送",
         )
         schedulePersist()
+        // 并行模式下一家是在上一家 send 回调之后才发的，所以任何一次回调丢失
+        // 都会让整轮永远停在"正在发送"。这里做控制器侧的兜底。
+        var sendSettled = false
+        val sendTimeout = Runnable {
+            if (sendSettled) return@Runnable
+            sendSettled = true
+            if (!isActive(execution) || runs[service]?.requestId != requestId) return@Runnable
+            if (runs[service]?.phase != ParticipantPhase.SENDING) return@Runnable
+            runs[service] = ParticipantRun(
+                phase = ParticipantPhase.ERROR,
+                requestId = requestId,
+                detail = "发送无响应，已停止等待",
+            )
+            onSendFinished(false)
+            schedulePersist()
+            maybeFinishRound(execution)
+        }
+        handler.postDelayed(sendTimeout, SEND_HARD_TIMEOUT_MILLIS)
         pool.sendPrompt(
             service = service,
             prompt = execution.prompts.getValue(service),
             requestId = requestId,
         ) { outcome ->
+            if (sendSettled) return@sendPrompt
+            sendSettled = true
+            handler.removeCallbacks(sendTimeout)
             if (!isActive(execution) || runs[service]?.requestId != requestId) return@sendPrompt
             if (outcome.success) {
                 runs[service] = ParticipantRun(
@@ -809,6 +882,7 @@ class ArenaSessionController(
 
     private fun finishRound(execution: RoundExecution, forcedMessage: String? = null) {
         if (activeExecution !== execution) return
+        pool.setProtectedServices(emptySet())
         val results = execution.services.associateWith { runs.getValue(it) }
         history += RoundRecord(
             number = execution.number,
@@ -935,10 +1009,10 @@ class ArenaSessionController(
         if (immediate) persistNow() else persistenceHandler.postDelayed(persistRunnable, PERSIST_DEBOUNCE_MILLIS)
     }
 
-    private fun persistNow() {
-        val repository = sessionRepository ?: return
-        if (sessionId.isBlank() || originalQuestion.isBlank()) return
-        val snapshot = ArenaSessionSnapshot(
+    /** 在调用线程（主线程）从 Compose 状态取一份不可变快照。 */
+    private fun buildSnapshot(): ArenaSessionSnapshot? {
+        if (sessionId.isBlank() || originalQuestion.isBlank()) return null
+        return ArenaSessionSnapshot(
             id = sessionId,
             originalQuestion = originalQuestion,
             roundNumber = roundNumber,
@@ -951,19 +1025,50 @@ class ArenaSessionController(
             lastRoundPrompts = lastRoundPrompts,
             updatedAtMillis = System.currentTimeMillis(),
         )
+    }
+
+    private fun persistNow(synchronous: Boolean = false) {
+        val repository = sessionRepository ?: return
+        val snapshot = buildSnapshot() ?: return
+        if (synchronous || persistShutdown) {
+            writeSnapshot(repository, snapshot)
+            return
+        }
+        val generation = persistGeneration
+        // 写盘和读取最近列表都在后台线程完成，只把结果回投到主线程更新 UI 状态。
+        persistExecutor.execute {
+            val outcome = runCatching {
+                repository.save(snapshot)
+                repository.listRecent()
+            }
+            persistenceHandler.post {
+                outcome
+                    .onSuccess { sessions ->
+                        storageWarning = null
+                        // 期间用户可能已经开了新问题或恢复了别的会话，此时绝不能把
+                        // 这个旧 id 重新设成活动会话。
+                        if (generation == persistGeneration && sessionId == snapshot.id) {
+                            runCatching { repository.setActiveSession(snapshot.id) }
+                        }
+                        recentSessions.clear()
+                        recentSessions.addAll(sessions)
+                    }
+                    .onFailure { storageWarning = "本地保存失败，当前讨论仍可继续" }
+            }
+        }
+    }
+
+    /** 同步落盘。只在 destroy() 这类"进程可能马上没了"的时刻使用。 */
+    private fun writeSnapshot(repository: ArenaSessionRepository, snapshot: ArenaSessionSnapshot) {
         runCatching {
             repository.save(snapshot)
-            repository.setActiveSession(sessionId)
-        }.onSuccess {
-            storageWarning = null
-            refreshRecentSessions()
-        }.onFailure {
-            storageWarning = "本地保存失败，当前讨论仍可继续"
-        }
+            repository.setActiveSession(snapshot.id)
+        }.onFailure { storageWarning = "本地保存失败，当前讨论仍可继续" }
     }
 
     private fun applySnapshot(snapshot: ArenaSessionSnapshot, recovered: Boolean) {
         sessionEpoch += 1
+        persistGeneration += 1
         handler.removeCallbacksAndMessages(null)
         persistenceHandler.removeCallbacksAndMessages(null)
         pollStates.clear()
@@ -1099,6 +1204,10 @@ class ArenaSessionController(
         val requestId: String,
         val resend: Boolean,
         val startedAtElapsedMillis: Long,
+        /** 重发前已经拿到的部分回答。重发失败时用它回填，不能让用户白白丢掉。 */
+        val previousResponse: String = "",
+        val previousTruncated: Boolean = false,
+        val previousOriginalLength: Int = 0,
         var lastText: String = "",
         var stableCount: Int = 0,
         var consecutiveReadErrors: Int = 0,
@@ -1106,7 +1215,11 @@ class ArenaSessionController(
     )
 
     private companion object {
-        const val PERSIST_DEBOUNCE_MILLIS = 250L
+        // 流式回答期间事件间隔约 500ms，250ms 的去抖等于没有去抖。
+        const val PERSIST_DEBOUNCE_MILLIS = 1_200L
+
+        /** 单家发送的端到端上限，比 WebView 池自身的看门狗更宽，只做最后兜底。 */
+        const val SEND_HARD_TIMEOUT_MILLIS = 60_000L
     }
 
 }

@@ -21,8 +21,14 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AiArena"
         android:usesCleartextTraffic="false">
+        <!--
+            configChanges 是必须的：WebView 池与进行中的圆桌轮次都挂在 Activity 上，
+            一旦系统重建 Activity，已登录的页面会全部重载、正在等待的回答会被判为失败。
+            旋转、深色模式、系统字号、分屏、折叠屏形态变化都必须由 App 自己吸收。
+        -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|uiMode|density|fontScale|keyboard|keyboardHidden|navigation|locale|layoutDirection"
             android:exported="true"
             android:launchMode="singleTask">
             <intent-filter>

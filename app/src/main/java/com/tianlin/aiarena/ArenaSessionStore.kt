@@ -114,17 +114,22 @@ class ArenaSessionStore internal constructor(
             .filter { item -> sessionFile(item.id).isFile }
     }
 
+    /**
+      * 索引损坏时的自愈路径。先按文件修改时间排序并截断到 [MAX_SESSIONS]，再解析——
+      * 否则会把目录里所有会话（每份可达数百 KB）全量解码一遍，只为拿一个标题。
+      */
     private fun scanSessionFiles(): List<RecentArenaSession> = root.listFiles()
         .orEmpty()
         .asSequence()
         .filter { file -> file.isFile && file.name.startsWith("session_") && file.extension == "json" }
+        .sortedByDescending { file -> file.lastModified() }
+        .take(MAX_SESSIONS)
         .mapNotNull { file ->
             runCatching {
                 ArenaSessionJson.decode(JSONObject(file.readText(Charsets.UTF_8))).toRecent()
             }.getOrNull()
         }
         .sortedByDescending { it.updatedAtMillis }
-        .take(MAX_SESSIONS)
         .toList()
 
     private fun writeIndex(items: List<RecentArenaSession>) {
@@ -148,10 +153,8 @@ class ArenaSessionStore internal constructor(
             stream.write(text.toByteArray(Charsets.UTF_8))
             stream.fd.sync()
         }
-        if (target.exists() && !target.delete()) {
-            temporary.delete()
-            throw IOException("无法替换会话文件：${target.name}")
-        }
+        // 不要先 delete 再 rename：POSIX 的 rename 覆盖同名文件本身就是原子的，
+        // 而"先删后改名"会开出一个窗口——进程若在这中间被系统杀掉，整份会话直接消失。
         if (!temporary.renameTo(target)) {
             try {
                 FileOutputStream(target).use { stream ->
@@ -202,7 +205,12 @@ internal object ArenaSessionJson {
         })
         .put("updatedAtMillis", snapshot.updatedAtMillis)
 
+    /** 只认识到 [SCHEMA_VERSION] 为止的文件；更高版本宁可当作不可读，也不要静默丢字段。 */
+    const val SCHEMA_VERSION = 1
+
     fun decode(json: JSONObject): ArenaSessionSnapshot {
+        val version = json.optInt("version", 1)
+        require(version <= SCHEMA_VERSION) { "不支持的会话文件版本：$version" }
         val services = json.optJSONArray("services").enumList<ArenaService>()
         val runsObject = json.optJSONObject("runs") ?: JSONObject()
         val runs = ArenaService.entries.associateWith { service ->

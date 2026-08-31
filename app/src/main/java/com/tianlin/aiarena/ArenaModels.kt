@@ -63,6 +63,12 @@ enum class ArenaService(
         val defaultMembers = listOf(DEEPSEEK, DOUBAO, KIMI)
         const val MIN_MEMBERS = 2
         const val MAX_MEMBERS = 4
+
+        /**
+         * 按枚举名反序列化。与 [valueOf] 不同，未知名称返回 null 而不是抛异常——
+         * 持久化的偏好和 rememberSaveable 恢复出来的字符串可能来自旧版本。
+         */
+        fun fromName(value: String?): ArenaService? = entries.firstOrNull { it.name == value }
     }
 }
 
@@ -139,6 +145,12 @@ enum class AnswerMode(val displayName: String, val description: String) {
         displayName = "串行回答",
         description = "上一家回答结束后，再发送给下一家",
     ),
+    ;
+
+    companion object {
+        fun fromName(value: String?): AnswerMode =
+            entries.firstOrNull { it.name == value } ?: PARALLEL
+    }
 }
 
 enum class RoundKind(val displayName: String) {
@@ -202,6 +214,22 @@ interface ArenaGateway {
         requestId: String,
         callback: (ResponseSnapshot) -> Unit,
     )
+
+    /**
+     * 放弃当前正在进行的网页自动化。
+     *
+     * 控制器"停止本轮"只能停自己的 Handler，网页那边等输入框、点发送按钮的链条
+     * 还在跑；用户紧接着重发时两条链会互相打断。这里给控制器一个明确的中止入口。
+     */
+    fun cancelAutomation() = Unit
+
+    /**
+     * 声明这些成员的网页在本轮结束前不能被回收。
+     *
+     * 用户在轮次进行中改成员选择时，网页池会顺手销毁"不再需要"的 WebView，
+     * 把正在生成的回答一起带走。控制器用这个接口把当前参与者标成受保护。
+     */
+    fun setProtectedServices(services: Set<ArenaService>) = Unit
 }
 
 data class ControllerTiming(
@@ -214,6 +242,8 @@ data class ControllerTiming(
 
 object ArenaLimits {
     const val MAX_QUESTION_CHARS = 24_000
+    /** 除原问题外，讨论/总结模板本身要占用的字符数，用于给出提前警告。 */
+    const val PROMPT_TEMPLATE_RESERVE = 1_500
     const val MAX_GUIDANCE_CHARS = 2_000
     const val MAX_QUOTED_RESPONSE_CHARS = 2_000
     const val MAX_CAPTURED_RESPONSE_CHARS = 12_000

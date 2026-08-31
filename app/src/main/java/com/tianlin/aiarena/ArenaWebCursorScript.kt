@@ -1,17 +1,16 @@
 package com.tianlin.aiarena
 
-import org.json.JSONObject
 
 internal object ArenaWebCursorScript {
     private const val STORAGE_PREFIX = "__ai_arena_cursor_"
 
     fun prepare(service: ArenaService, requestId: String): String {
-        val selectors = responseSelectors(service).joinToString(",") { JSONObject.quote(it) }
+        val selectors = responseSelectors(service).joinToString(",") { ArenaJs.quote(it) }
         val userCount = userCountExpression(service)
         return """
             (function() {
               window.__aiArenaRequests = window.__aiArenaRequests || {};
-              const requestId = ${JSONObject.quote(requestId)};
+              const requestId = ${ArenaJs.quote(requestId)};
               const selectors = [$selectors];
               let assistantBaseline = 0;
               for (const selector of selectors) {
@@ -28,7 +27,7 @@ internal object ArenaWebCursorScript {
                 initialUrl: location.href
               };
               window.__aiArenaRequests[requestId] = state;
-              try { sessionStorage.setItem(${JSONObject.quote(STORAGE_PREFIX)} + requestId, JSON.stringify(state)); } catch (_) {}
+              try { sessionStorage.setItem(${ArenaJs.quote(STORAGE_PREFIX)} + requestId, JSON.stringify(state)); } catch (_) {}
               return JSON.stringify(state);
             })();
         """.trimIndent()
@@ -38,7 +37,7 @@ internal object ArenaWebCursorScript {
         val latestUser = latestUserExpression(service)
         return """
             (function() {
-              const requestId = ${JSONObject.quote(requestId)};
+              const requestId = ${ArenaJs.quote(requestId)};
               const user = $latestUser;
               if (!user) return false;
               user.setAttribute('data-ai-arena-request', requestId);
@@ -48,8 +47,8 @@ internal object ArenaWebCursorScript {
     }
 
     fun stateBootstrap(requestId: String): String = """
-        const requestId = ${JSONObject.quote(requestId)};
-        const cursorKey = ${JSONObject.quote(STORAGE_PREFIX)} + requestId;
+        const requestId = ${ArenaJs.quote(requestId)};
+        const cursorKey = ${ArenaJs.quote(STORAGE_PREFIX)} + requestId;
         let state = window.__aiArenaRequests && window.__aiArenaRequests[requestId];
         if (!state) {
           try { state = JSON.parse(sessionStorage.getItem(cursorKey) || 'null'); } catch (_) { state = null; }

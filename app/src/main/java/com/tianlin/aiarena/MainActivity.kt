@@ -13,9 +13,14 @@ import android.util.Base64
 import android.webkit.ValueCallback
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -45,10 +50,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private lateinit var skinPreferences: ArenaSkinPreferences
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         webViewPool = ArenaWebViewPool(this)
+        skinPreferences = ArenaSkinPreferences(applicationContext)
         speechController = ArenaSpeechController(applicationContext)
         val debugInitialQuestion = if (BuildConfig.DEBUG) {
             val encoded = intent.getStringExtra(DEBUG_PREFILL_BASE64_EXTRA)
@@ -63,7 +72,8 @@ class MainActivity : ComponentActivity() {
             ""
         }
         setContent {
-            ArenaTheme {
+            var skin by remember { mutableStateOf(skinPreferences.loadSkin()) }
+            ArenaTheme(skin = skin) {
                 ArenaApp(
                     pool = webViewPool,
                     debugInitialQuestion = debugInitialQuestion,
@@ -74,6 +84,11 @@ class MainActivity : ComponentActivity() {
                     stopSpeech = speechController::stop,
                     copyText = ::copyText,
                     shareText = ::shareText,
+                    skin = skin,
+                    onSkinChange = { next ->
+                        skin = next
+                        skinPreferences.saveSkin(next)
+                    },
                 )
             }
         }
@@ -81,12 +96,24 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (::webViewPool.isInitialized) webViewPool.probeAll()
+        if (::webViewPool.isInitialized) {
+            webViewPool.resumeAll()
+            webViewPool.probeAll()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 退到后台时挂起全部 WebView：3-4 个聊天页各自的定时器、动画和轮询
+        // 会持续耗电，也会加剧渲染进程被系统回收的概率。
+        if (::webViewPool.isInitialized && !isChangingConfigurations) webViewPool.pauseAll()
     }
 
     override fun onDestroy() {
-        pendingFileCallback?.onReceiveValue(null)
-        pendingFileCallback = null
+        if (!isChangingConfigurations) {
+            pendingFileCallback?.onReceiveValue(null)
+            pendingFileCallback = null
+        }
         if (::webViewPool.isInitialized) webViewPool.destroy()
         if (::speechController.isInitialized) speechController.shutdown()
         super.onDestroy()

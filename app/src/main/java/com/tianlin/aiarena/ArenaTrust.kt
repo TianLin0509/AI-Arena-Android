@@ -88,3 +88,36 @@ object PromptBudgetPolicy {
         )
     }
 }
+
+/**
+ * 提问长度提醒。
+ *
+ * 初始回答直接把原问题发给各家网页，24,000 字都能发出去；但"观点讨论"和"讨论总结"
+ * 要把原问题连同别家回答一起塞进同一条 prompt，受 [PromptBudgetPolicy] 预算限制
+ * （千问只有 8,000）。所以存在一个区间：问题发得出去，但后续讨论一定失败。
+ * 这里在用户还在输入时就提前算出该区间并给出提示，而不是等到点"观点讨论"才报错。
+ */
+object QuestionLengthPolicy {
+    /** 参与成员中最紧的预算，减去模板占用后剩给原问题的字数。 */
+    fun advisoryLimit(services: List<ArenaService>): Int {
+        val budget = services.minOfOrNull(PromptBudgetPolicy::budgetFor)
+            ?: PromptBudgetPolicy.DEFAULT_BUDGET
+        return (budget - ArenaLimits.PROMPT_TEMPLATE_RESERVE).coerceAtLeast(0)
+    }
+
+    fun exceedsHardLimit(question: String): Boolean =
+        question.length > ArenaLimits.MAX_QUESTION_CHARS
+
+    /** 返回给用户看的提示；没有问题时返回 null。 */
+    fun advisory(question: String, services: List<ArenaService>): String? {
+        if (exceedsHardLimit(question)) {
+            return "问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字，请缩短后再发送。"
+        }
+        val limit = advisoryLimit(services)
+        if (question.length <= limit) return null
+        val tightest = services.minByOrNull(PromptBudgetPolicy::budgetFor)
+        val who = tightest?.displayName?.let { "（${it}的上下文最紧）" }.orEmpty()
+        return "问题较长，初始回答可以发送，但「观点讨论」和「讨论总结」可能因超出上下文而失败$who。" +
+            "建议压到 $limit 字以内。"
+    }
+}

@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+        实际配色由 Compose 侧的 ArenaTheme / ArenaSkin 决定（支持 5 套皮肤，含深色）。
+        这里只保留启动窗口需要的最小设定，不再写死状态栏与导航栏颜色，
+        否则深色皮肤下会出现白色系统栏。
+    -->
     <style name="Theme.AiArena" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
         <item name="android:windowActionModeOverlay">true</item>
-        <item name="android:navigationBarColor">#FFFFFF</item>
-        <item name="android:statusBarColor">#F8FBFD</item>
-        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@android:color/white</item>
     </style>
 </resources>
