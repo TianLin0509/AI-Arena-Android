@@ -1,0 +1,304 @@
+package com.tianlin.aiarena
+
+import android.content.Context
+import androidx.core.content.edit
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class ArenaSessionSnapshot(
+    val id: String,
+    val originalQuestion: String,
+    val roundNumber: Int,
+    val currentRoundKind: RoundKind?,
+    val currentAnswerMode: AnswerMode,
+    val services: List<ArenaService>,
+    val runs: Map<ArenaService, ParticipantRun>,
+    val history: List<RoundRecord>,
+    val summary: DiscussionSummary,
+    val lastRoundPrompts: Map<ArenaService, String> = emptyMap(),
+    val updatedAtMillis: Long,
+)
+
+data class RecentArenaSession(
+    val id: String,
+    val title: String,
+    val updatedAtMillis: Long,
+    val roundCount: Int,
+    val serviceCount: Int,
+)
+
+interface ArenaSessionRepository {
+    fun newSessionId(): String
+    fun save(snapshot: ArenaSessionSnapshot)
+    fun load(id: String): ArenaSessionSnapshot?
+    fun loadActive(): ArenaSessionSnapshot?
+    fun setActiveSession(id: String?)
+    fun listRecent(limit: Int = 8): List<RecentArenaSession>
+}
+
+class ArenaSessionStore internal constructor(
+    context: Context,
+    directoryName: String = DIRECTORY_NAME,
+    preferencesName: String = PREFERENCES_NAME,
+) : ArenaSessionRepository {
+    private val root = File(context.applicationContext.filesDir, directoryName).apply { mkdirs() }
+    private val preferences = context.applicationContext.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
+
+    @Synchronized
+    override fun newSessionId(): String =
+        "session_${System.currentTimeMillis()}_${UUID.randomUUID().toString().take(8)}"
+
+    @Synchronized
+    override fun save(snapshot: ArenaSessionSnapshot) {
+        if (!isValidId(snapshot.id) || snapshot.originalQuestion.isBlank()) return
+        root.mkdirs()
+        writeAtomically(sessionFile(snapshot.id), ArenaSessionJson.encode(snapshot).toString())
+        val next = buildList {
+            add(snapshot.toRecent())
+            addAll(readIndex().filterNot { it.id == snapshot.id })
+        }.sortedByDescending { it.updatedAtMillis }
+        writeIndex(next.take(MAX_SESSIONS))
+        next.drop(MAX_SESSIONS).forEach { stale -> sessionFile(stale.id).delete() }
+    }
+
+    @Synchronized
+    override fun load(id: String): ArenaSessionSnapshot? {
+        if (!isValidId(id)) return null
+        val file = sessionFile(id)
+        if (!file.isFile) return null
+        return runCatching { ArenaSessionJson.decode(JSONObject(file.readText(Charsets.UTF_8))) }.getOrNull()
+    }
+
+    @Synchronized
+    override fun loadActive(): ArenaSessionSnapshot? =
+        preferences.getString(KEY_ACTIVE_SESSION, null)?.let(::load)
+
+    override fun setActiveSession(id: String?) {
+        preferences.edit {
+            if (id == null) remove(KEY_ACTIVE_SESSION) else putString(KEY_ACTIVE_SESSION, id)
+        }
+    }
+
+    @Synchronized
+    override fun listRecent(limit: Int): List<RecentArenaSession> =
+        readIndex().sortedByDescending { it.updatedAtMillis }.take(limit.coerceAtLeast(0))
+
+    private fun sessionFile(id: String): File = File(root, "$id.json")
+
+    private fun readIndex(): List<RecentArenaSession> {
+        val file = File(root, INDEX_FILE_NAME)
+        if (!file.isFile) return scanSessionFiles()
+        return runCatching {
+            val items = JSONObject(file.readText(Charsets.UTF_8)).optJSONArray("sessions") ?: JSONArray()
+            buildList {
+                for (index in 0 until items.length()) {
+                    val item = items.optJSONObject(index) ?: continue
+                    val id = item.optString("id")
+                    if (!isValidId(id)) continue
+                    add(
+                        RecentArenaSession(
+                            id = id,
+                            title = item.optString("title").take(MAX_TITLE_CHARACTERS),
+                            updatedAtMillis = item.optLong("updatedAtMillis"),
+                            roundCount = item.optInt("roundCount"),
+                            serviceCount = item.optInt("serviceCount"),
+                        ),
+                    )
+                }
+            }
+        }.getOrElse { scanSessionFiles() }
+            .filter { item -> sessionFile(item.id).isFile }
+    }
+
+    private fun scanSessionFiles(): List<RecentArenaSession> = root.listFiles()
+        .orEmpty()
+        .asSequence()
+        .filter { file -> file.isFile && file.name.startsWith("session_") && file.extension == "json" }
+        .mapNotNull { file ->
+            runCatching {
+                ArenaSessionJson.decode(JSONObject(file.readText(Charsets.UTF_8))).toRecent()
+            }.getOrNull()
+        }
+        .sortedByDescending { it.updatedAtMillis }
+        .take(MAX_SESSIONS)
+        .toList()
+
+    private fun writeIndex(items: List<RecentArenaSession>) {
+        val array = JSONArray()
+        items.forEach { item ->
+            array.put(
+                JSONObject()
+                    .put("id", item.id)
+                    .put("title", item.title)
+                    .put("updatedAtMillis", item.updatedAtMillis)
+                    .put("roundCount", item.roundCount)
+                    .put("serviceCount", item.serviceCount),
+            )
+        }
+        writeAtomically(File(root, INDEX_FILE_NAME), JSONObject().put("sessions", array).toString())
+    }
+
+    private fun writeAtomically(target: File, text: String) {
+        val temporary = File(target.parentFile, "${target.name}.tmp")
+        FileOutputStream(temporary).use { stream ->
+            stream.write(text.toByteArray(Charsets.UTF_8))
+            stream.fd.sync()
+        }
+        if (target.exists() && !target.delete()) {
+            temporary.delete()
+            throw IOException("无法替换会话文件：${target.name}")
+        }
+        if (!temporary.renameTo(target)) {
+            try {
+                FileOutputStream(target).use { stream ->
+                    stream.write(text.toByteArray(Charsets.UTF_8))
+                    stream.fd.sync()
+                }
+            } finally {
+                temporary.delete()
+            }
+        }
+    }
+
+    private fun ArenaSessionSnapshot.toRecent(): RecentArenaSession = RecentArenaSession(
+        id = id,
+        title = originalQuestion.lineSequence().firstOrNull().orEmpty().trim().take(MAX_TITLE_CHARACTERS),
+        updatedAtMillis = updatedAtMillis,
+        roundCount = roundNumber,
+        serviceCount = services.size,
+    )
+
+    private fun isValidId(id: String): Boolean = ID_PATTERN.matches(id)
+
+    private companion object {
+        const val DIRECTORY_NAME = "arena_sessions"
+        const val INDEX_FILE_NAME = "index.json"
+        const val PREFERENCES_NAME = "arena_session_pointer"
+        const val KEY_ACTIVE_SESSION = "active_session"
+        const val MAX_SESSIONS = 20
+        const val MAX_TITLE_CHARACTERS = 48
+        val ID_PATTERN = Regex("[A-Za-z0-9_-]{1,80}")
+    }
+}
+
+internal object ArenaSessionJson {
+    fun encode(snapshot: ArenaSessionSnapshot): JSONObject = JSONObject()
+        .put("version", 1)
+        .put("id", snapshot.id)
+        .put("originalQuestion", snapshot.originalQuestion)
+        .put("roundNumber", snapshot.roundNumber)
+        .put("currentRoundKind", snapshot.currentRoundKind?.name ?: JSONObject.NULL)
+        .put("currentAnswerMode", snapshot.currentAnswerMode.name)
+        .put("services", JSONArray(snapshot.services.map { it.name }))
+        .put("runs", encodeRuns(snapshot.runs))
+        .put("history", JSONArray().also { array -> snapshot.history.forEach { array.put(encodeRound(it)) } })
+        .put("summary", encodeSummary(snapshot.summary))
+        .put("lastRoundPrompts", JSONObject().also { prompts ->
+            snapshot.lastRoundPrompts.forEach { (service, prompt) -> prompts.put(service.name, prompt) }
+        })
+        .put("updatedAtMillis", snapshot.updatedAtMillis)
+
+    fun decode(json: JSONObject): ArenaSessionSnapshot {
+        val services = json.optJSONArray("services").enumList<ArenaService>()
+        val runsObject = json.optJSONObject("runs") ?: JSONObject()
+        val runs = ArenaService.entries.associateWith { service ->
+            runsObject.optJSONObject(service.name)?.let(::decodeRun) ?: ParticipantRun()
+        }
+        val historyArray = json.optJSONArray("history") ?: JSONArray()
+        val history = buildList {
+            for (index in 0 until historyArray.length()) {
+                historyArray.optJSONObject(index)?.let { add(decodeRound(it)) }
+            }
+        }.takeLast(ArenaLimits.MAX_HISTORY_ROUNDS)
+        return ArenaSessionSnapshot(
+            id = json.getString("id"),
+            originalQuestion = json.optString("originalQuestion").take(ArenaLimits.MAX_QUESTION_CHARS),
+            roundNumber = json.optInt("roundNumber").coerceAtLeast(0),
+            currentRoundKind = json.optString("currentRoundKind").enumOrNull<RoundKind>(),
+            currentAnswerMode = json.optString("currentAnswerMode").enumOrNull<AnswerMode>() ?: AnswerMode.PARALLEL,
+            services = services.ifEmpty { ArenaService.defaultMembers },
+            runs = runs,
+            history = history,
+            summary = json.optJSONObject("summary")?.let(::decodeSummary) ?: DiscussionSummary(),
+            lastRoundPrompts = json.optJSONObject("lastRoundPrompts")?.let { prompts ->
+                ArenaService.entries.mapNotNull { service ->
+                    prompts.optString(service.name).takeIf { it.isNotBlank() }?.let { prompt ->
+                        service to prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS)
+                    }
+                }.toMap()
+            }.orEmpty(),
+            updatedAtMillis = json.optLong("updatedAtMillis"),
+        )
+    }
+
+    private fun encodeRuns(runs: Map<ArenaService, ParticipantRun>): JSONObject = JSONObject().also { json ->
+        ArenaService.entries.forEach { service -> json.put(service.name, encodeRun(runs[service] ?: ParticipantRun())) }
+    }
+
+    private fun encodeRun(run: ParticipantRun): JSONObject = JSONObject()
+        .put("phase", run.phase.name)
+        .put("requestId", run.requestId)
+        .put("response", run.response)
+        .put("detail", run.detail)
+        .put("responseTruncated", run.responseTruncated)
+        .put("originalResponseLength", run.originalResponseLength)
+
+    private fun decodeRun(json: JSONObject): ParticipantRun = ParticipantRun(
+        phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
+        requestId = json.optString("requestId"),
+        response = json.optString("response").take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
+        detail = json.optString("detail").take(200),
+        responseTruncated = json.optBoolean("responseTruncated"),
+        originalResponseLength = json.optInt("originalResponseLength"),
+    )
+
+    private fun encodeRound(round: RoundRecord): JSONObject = JSONObject()
+        .put("number", round.number)
+        .put("kind", round.kind.name)
+        .put("answerMode", round.answerMode.name)
+        .put("guidance", round.guidance)
+        .put("results", encodeRuns(round.results))
+        .put("startedAtMillis", round.startedAtMillis)
+        .put("finishedAtMillis", round.finishedAtMillis)
+
+    private fun decodeRound(json: JSONObject): RoundRecord = RoundRecord(
+        number = json.optInt("number"),
+        kind = json.optString("kind").enumOrNull<RoundKind>() ?: RoundKind.INITIAL,
+        answerMode = json.optString("answerMode").enumOrNull<AnswerMode>() ?: AnswerMode.PARALLEL,
+        guidance = json.optString("guidance").take(ArenaLimits.MAX_GUIDANCE_CHARS),
+        results = ArenaService.entries.associateWith { service ->
+            json.optJSONObject("results")?.optJSONObject(service.name)?.let(::decodeRun) ?: ParticipantRun()
+        },
+        startedAtMillis = json.optLong("startedAtMillis"),
+        finishedAtMillis = json.optLong("finishedAtMillis"),
+    )
+
+    private fun encodeSummary(summary: DiscussionSummary): JSONObject = JSONObject()
+        .put("phase", summary.phase.name)
+        .put("judge", summary.judge?.name ?: JSONObject.NULL)
+        .put("requestId", summary.requestId)
+        .put("text", summary.text)
+        .put("detail", summary.detail)
+
+    private fun decodeSummary(json: JSONObject): DiscussionSummary = DiscussionSummary(
+        phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
+        judge = json.optString("judge").enumOrNull<ArenaService>(),
+        requestId = json.optString("requestId"),
+        text = json.optString("text").take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
+        detail = json.optString("detail").take(200),
+    )
+
+    private inline fun <reified T : Enum<T>> String.enumOrNull(): T? =
+        enumValues<T>().firstOrNull { it.name == this }
+
+    private inline fun <reified T : Enum<T>> JSONArray?.enumList(): List<T> {
+        if (this == null) return emptyList()
+        return buildList {
+            for (index in 0 until length()) optString(index).enumOrNull<T>()?.let(::add)
+        }.distinct()
+    }
+}

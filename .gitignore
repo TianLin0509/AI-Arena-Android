@@ -1,0 +1,19 @@
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+captures/
+*.iml
+*.apk
+*.aab
+*.hprof
+*.jks
+*.keystore
+keystore.properties
+
+# Local verification artifacts and emulator output
+/artifacts/
+/output/
+/*.xml
+/*.log
