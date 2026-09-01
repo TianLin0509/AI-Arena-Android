@@ -31,7 +31,8 @@ enum class ArenaSkin(
     val displayName: String,
     val tagline: String,
 ) {
-    CLEAR("清朗", "明亮通透，默认风格"),
+    PURE("净白", "纯白留白，渐变标题"),
+    CLEAR("清朗", "明亮通透，蓝绿顶栏"),
     INK("墨韵", "宣纸朱砂，中式沉稳"),
     NIGHT("夜航", "深色护眼，适合夜间"),
     ELDER("长辈", "大字粗描边，高对比"),
@@ -39,7 +40,7 @@ enum class ArenaSkin(
     ;
 
     companion object {
-        val default = CLEAR
+        val default = PURE
 
         /** 反序列化持久化的皮肤名；无法识别时回退默认值，不抛异常。 */
         fun fromName(value: String?): ArenaSkin =
@@ -75,6 +76,8 @@ data class ArenaPalette(
     val summarySurface: Color,
     val summaryBorder: Color,
     val navSurface: Color,
+    /** 主标题渐变色；null 表示标题用纯色 ink。只有「净白」用到。 */
+    val headingGradient: List<Color>? = null,
 ) {
     val heroBrush: Brush get() = Brush.linearGradient(listOf(heroStart, heroEnd))
 }
@@ -94,6 +97,8 @@ data class ArenaMetrics(
     val typeScale: Float,
     val heroGradient: Boolean,
     val headingFamily: FontFamily,
+    /** 扁平化：顶栏与页面同色、卡片无阴影、只留发丝描边。 */
+    val flatSurfaces: Boolean = false,
 )
 
 val LocalArenaPalette = staticCompositionLocalOf { ArenaSkin.CLEAR.palette }
@@ -107,6 +112,37 @@ object ArenaStyle {
     val metrics: ArenaMetrics
         @Composable @ReadOnlyComposable get() = LocalArenaMetrics.current
 }
+
+private val PurePalette = ArenaPalette(
+    isDark = false,
+    page = Color(0xFFFFFFFF),
+    surface = Color(0xFFFFFFFF),
+    surfaceAlt = Color(0xFFFAFAFC),
+    ink = Color(0xFF16171A),
+    muted = Color(0xFF8C8F98),
+    accent = Color(0xFF6E5BFF),
+    accentSoft = Color(0xFFEFECFF),
+    onAccent = Color(0xFFFFFFFF),
+    border = Color(0xFFF0F0F3),
+    borderStrong = Color(0xFFE0E0E6),
+    success = Color(0xFF0B7A45),
+    successSoft = Color(0xFFE7F7EE),
+    warning = Color(0xFF9A5B18),
+    warningSoft = Color(0xFFFFF4E6),
+    debate = Color(0xFF7A5AF8),
+    debateSoft = Color(0xFFF0EDFF),
+    error = Color(0xFFB02121),
+    errorSoft = Color(0xFFFDECEC),
+    // 顶栏与页面同色，所以「净白」看不到任何色块顶栏
+    heroStart = Color(0xFFFFFFFF),
+    heroEnd = Color(0xFFFFFFFF),
+    onHero = Color(0xFF16171A),
+    onHeroMuted = Color(0xFF8C8F98),
+    summarySurface = Color(0xFFFCFBFF),
+    summaryBorder = Color(0xFFE7E3FA),
+    navSurface = Color(0xFFFFFFFF),
+    headingGradient = listOf(Color(0xFF6E5BFF), Color(0xFFB15CFF), Color(0xFFFF6E9C)),
+)
 
 private val ClearPalette = ArenaPalette(
     isDark = false,
@@ -255,6 +291,7 @@ private val SunrisePalette = ArenaPalette(
 
 val ArenaSkin.palette: ArenaPalette
     get() = when (this) {
+        ArenaSkin.PURE -> PurePalette
         ArenaSkin.CLEAR -> ClearPalette
         ArenaSkin.INK -> InkPalette
         ArenaSkin.NIGHT -> NightPalette
@@ -264,6 +301,22 @@ val ArenaSkin.palette: ArenaPalette
 
 val ArenaSkin.metrics: ArenaMetrics
     get() = when (this) {
+        ArenaSkin.PURE -> ArenaMetrics(
+            cardCorner = 16.dp,
+            controlCorner = 26.dp,
+            chipCorner = 999.dp,
+            borderWidth = 1.dp,
+            cardElevation = 0.dp,
+            heroElevation = 0.dp,
+            gutter = 20.dp,
+            gap = 14.dp,
+            minTouch = 48.dp,
+            primaryButtonHeight = 56.dp,
+            typeScale = 1.0f,
+            heroGradient = false,
+            headingFamily = FontFamily.SansSerif,
+            flatSurfaces = true,
+        )
         ArenaSkin.CLEAR -> ArenaMetrics(
             cardCorner = 18.dp,
             controlCorner = 16.dp,
@@ -346,6 +399,14 @@ private fun arenaTypography(metrics: ArenaMetrics): Typography {
     val heading = metrics.headingFamily
     fun sp(value: Float) = (value * s).sp
     return Typography(
+        // 提问页的渐变大标题。中文在系统字体下只有 400 一个字重，
+        // 这里靠字号和渐变拉层次，不靠字重。
+        headlineLarge = TextStyle(
+            fontFamily = heading,
+            fontWeight = FontWeight.Medium,
+            fontSize = sp(30f),
+            lineHeight = sp(38f),
+        ),
         headlineMedium = TextStyle(
             fontFamily = heading,
             fontWeight = FontWeight.Bold,
@@ -490,7 +551,22 @@ class ArenaSkinPreferences(context: Context) {
         Context.MODE_PRIVATE,
     )
 
-    fun loadSkin(): ArenaSkin = ArenaSkin.fromName(preferences.getString(KEY_SKIN, null))
+    /**
+     * 读取皮肤。0.5.0 把默认皮肤从「清朗」换成了「净白」，做一次性迁移：
+     * 只有当存的值正好是**旧的默认值**时才搬过去 —— 这些用户等同于"从没选过"。
+     * 主动选过其它皮肤的人不受影响，迁移后再改回清朗也不会被再次覆盖。
+     */
+    fun loadSkin(): ArenaSkin {
+        val stored = preferences.getString(KEY_SKIN, null)
+        if (!preferences.getBoolean(KEY_DEFAULT_MIGRATED, false)) {
+            preferences.edit { putBoolean(KEY_DEFAULT_MIGRATED, true) }
+            if (stored == null || stored == LEGACY_DEFAULT_SKIN) {
+                saveSkin(ArenaSkin.default)
+                return ArenaSkin.default
+            }
+        }
+        return ArenaSkin.fromName(stored)
+    }
 
     fun saveSkin(skin: ArenaSkin) {
         preferences.edit { putString(KEY_SKIN, skin.name) }
@@ -498,5 +574,7 @@ class ArenaSkinPreferences(context: Context) {
 
     private companion object {
         const val KEY_SKIN = "skin"
+        const val KEY_DEFAULT_MIGRATED = "default_skin_migrated_v5"
+        const val LEGACY_DEFAULT_SKIN = "CLEAR"
     }
 }

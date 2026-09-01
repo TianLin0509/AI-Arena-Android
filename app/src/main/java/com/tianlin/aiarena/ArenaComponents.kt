@@ -40,8 +40,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -239,6 +241,39 @@ fun ArenaHero(
     }
     Box(modifier = modifier.then(background)) {
         Box(Modifier.padding(contentPadding)) { content() }
+    }
+}
+
+/**
+ * 主标题。皮肤给了渐变色就用渐变填字（「净白」的签名元素），
+ * 否则退回纯色，其余皮肤观感不变。
+ */
+@Composable
+fun ArenaHeading(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = MaterialTheme.typography.headlineMedium,
+    color: Color = ArenaStyle.colors.onHero,
+    maxLines: Int = Int.MAX_VALUE,
+) {
+    val gradient = ArenaStyle.colors.headingGradient
+    if (gradient != null && gradient.size >= 2) {
+        Text(
+            text = text,
+            modifier = modifier,
+            style = style.merge(TextStyle(brush = Brush.linearGradient(gradient))),
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+        )
+    } else {
+        Text(
+            text = text,
+            modifier = modifier,
+            style = style,
+            color = color,
+            maxLines = maxLines,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

@@ -885,18 +885,12 @@ private fun AskHome(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                        Text(
-                            text = "AI 圆桌",
-                            color = colors.onHero,
-                            style = MaterialTheme.typography.headlineMedium,
-                        )
-                        Text(
-                            text = "一个问题，多家 AI 一起回答",
-                            color = colors.onHeroMuted,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
+                    Text(
+                        text = "圆桌",
+                        color = colors.onHero,
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f),
+                    )
                     ArenaTextAction(
                         text = if (historyCount > 0) "历史 $historyCount" else "历史",
                         onClick = onHistory,
@@ -911,6 +905,18 @@ private fun AskHome(
                     )
                 }
 
+                ArenaHeading(
+                    text = "今天想问点什么？",
+                    style = MaterialTheme.typography.headlineLarge,
+                    modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                )
+                Text(
+                    text = "多家 AI 同时回答，答完自动帮你对一遍。",
+                    color = colors.onHeroMuted,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(bottom = 4.dp),
+                )
+
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -919,7 +925,7 @@ private fun AskHome(
                             contentDescription = "当前成员 ${selectedServices.joinToString("、") { it.displayName }}，" +
                                 "$usableCount 家可用，点击调整"
                         },
-                    color = colors.onHero.copy(alpha = 0.14f),
+                    color = if (metrics.flatSurfaces) colors.accentSoft else colors.onHero.copy(alpha = 0.14f),
                     shape = RoundedCornerShape(metrics.cardCorner),
                 ) {
                     Row(
@@ -1132,7 +1138,7 @@ private fun QuestionComposer(
             ) {
                 if (voiceInputEnabled) {
                     ArenaTextAction(
-                        text = if (voiceInputActive) "听写中…" else "🎤 语音",
+                        text = if (voiceInputActive) "听写中…" else "语音输入",
                         onClick = onVoiceInput,
                         enabled = !voiceInputActive,
                         contentDescriptionText = "语音输入问题",
@@ -1234,10 +1240,10 @@ private fun RoundStage(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(
+                        ArenaHeading(
                             text = sessionController.currentRoundKind?.displayName ?: "AI 圆桌",
-                            color = colors.onHero,
                             style = MaterialTheme.typography.titleLarge,
+                            maxLines = 1,
                         )
                         Text(
                             text = sessionController.sessionMessage,
