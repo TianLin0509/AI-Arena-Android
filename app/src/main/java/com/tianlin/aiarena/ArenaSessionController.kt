@@ -823,12 +823,24 @@ class ArenaSessionController(
                 val waitedSeconds = (SystemClock.elapsedRealtime() - state.startedAtElapsedMillis) / 1_000
                 runs[service] = runs.getValue(service).copy(
                     phase = ParticipantPhase.WAITING,
-                    detail = "等待回答 · ${waitedSeconds}秒",
+                    detail = stalledWaitDetail(waitedSeconds),
                 )
                 schedulePersist()
             }
             handler.postDelayed({ poll(execution, service, state) }, timing.pollIntervalMillis)
         }
+    }
+
+    /**
+     * 一直没读到任何文字时的文案。
+     *
+     * 超时上限是 5 分钟，但真实原因通常在头一分钟就已经确定：网页掉登录了、
+     * 弹了验证码、或者发送根本没进去。让用户干等 5 分钟再看到"超时"是最差的体验，
+     * 所以过了阈值就把文案换成可操作的提示，而不是继续只报秒数。
+     */
+    private fun stalledWaitDetail(waitedSeconds: Long): String = when {
+        waitedSeconds < STALL_HINT_SECONDS -> "等待回答 · ${waitedSeconds}秒"
+        else -> "等待回答 · ${waitedSeconds}秒 · 迟迟没有回应，可点「原网页」看看是否需要登录或完成验证"
     }
 
     private fun handleReadFailure(
@@ -1220,6 +1232,9 @@ class ArenaSessionController(
 
         /** 单家发送的端到端上限，比 WebView 池自身的看门狗更宽，只做最后兜底。 */
         const val SEND_HARD_TIMEOUT_MILLIS = 60_000L
+
+        /** 超过这个秒数还一个字都没读到，就把文案换成可操作的排查提示。 */
+        const val STALL_HINT_SECONDS = 75L
     }
 
 }

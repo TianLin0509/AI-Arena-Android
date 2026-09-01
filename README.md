@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.3.0`（`versionCode 3`）
+当前版本：`v0.4.0`（`versionCode 4`）
 
 面向国内 Android 用户的多 AI 圆桌工具。应用本身无需注册账号、没有自建后端；用户只需在内嵌的 AI 官网完成一次登录，之后由 App 复用本机 WebView 登录状态，汇总多家回答并支持后续讨论。
 
@@ -99,9 +99,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.3.0`，`versionCode=3`。
-- 小修复：`0.3.1 / versionCode 4`。
-- 向后兼容的新功能：`0.4.0 / versionCode 5`。
+- 当前基线：`versionName=0.4.0`，`versionCode=4`。
+- 小修复：`0.4.1 / versionCode 5`。
+- 向后兼容的新功能：`0.5.0 / versionCode 6`。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：
@@ -110,7 +110,17 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 - 相同签名密钥。
 - 覆盖安装；禁止卸载、`pm clear`、擦除 AVD 或更换包名。
 
-Debug 构建使用 Android 默认 debug key，只适合开发测试。正式分发前必须建立并安全保存独立 release keystore；丢失正式签名密钥后无法对原安装进行保登录升级。
+分发给用户请用 **release 包**（已签名、开启 R8，约 1.4 MB）：
+
+```text
+app/build/outputs/apk/release/app-release.apk
+```
+
+release 签名从仓库外、且 gitignore 的 `keystore.properties` 读取；该文件不存在时
+（例如 CI）构建照常进行，只是产出未签名包。
+
+> **密钥丢失 = 永远无法对已安装版本做保登录升级。** 请把 keystore 与其
+> properties 文件异地备份（网盘 / 密码管理器 / 离线介质），且不要提交进 git。
 
 ## 隐私与安全边界
 

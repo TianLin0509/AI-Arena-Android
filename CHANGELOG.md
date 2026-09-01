@@ -2,6 +2,49 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-08-31
+
+把交付质量补到「可上架」水准：发布链路、包体、图标、崩溃可见性和 minSdk 验证。
+
+### Added
+
+- **release 签名链路**：`signingConfig` 从仓库外、且 gitignore 的 `keystore.properties`
+  读取；文件不存在时（例如 CI）照常构建，只产出未签名包。首个正式 release 密钥已生成。
+- **自适应启动图标**：此前把一个 24dp 矢量直接当 launcher icon 用，桌面上没有背景、
+  没有安全区、也没有 Android 13+ 的主题图标。现在是标准 adaptive-icon
+  （品牌色底 + 白色前景 + monochrome），前景内容收在 108 画布的中心安全区内。
+- **本地崩溃记录**：崩溃时在本机写一份含版本号、机型、系统版本和完整堆栈的报告，
+  设置页可导出分享、可清除。不联网、不上传，与「登录信息只保存在本机」一致。
+  已用真实 uncaught exception 验证：报告落盘 → 设置页出现卡片 → 可导出。
+- 设置页明确声明本应用不是任何 AI 厂商的官方客户端，自动化操作存在账号风险。
+
+### Changed
+
+- **release 开启 R8 + 资源收缩**：APK 从 8.65 MB 降到 **1.43 MB**（−83%）。
+  本工程无反射、无 `@JavascriptInterface`，注入网页的脚本都是字符串常量，默认规则即可。
+- **CI 增加 `assembleRelease`**：R8 只在 release 生效，不进 CI 等于没人验证。
+- 等待回答超过 75 秒仍一个字都没读到时，文案从单纯报秒数换成可操作提示
+  （「可点原网页看看是否需要登录或完成验证」）。此前要干等满 5 分钟才知道出了问题。
+- 按路径精确豁免 `ObsoleteSdkInt`：lint 建议把 `mipmap-anydpi-v26` 合并成
+  `mipmap-anydpi`，但实测去掉 `-v26` 后资源合并器不收录该目录、AAPT2 直接报错。
+  豁免只作用于该目录，其余位置仍然检查。
+
+### Fixed
+
+- `providerHeaderPx` 用 `mutableIntStateOf` 避免装箱（lint AutoboxingStateCreation）。
+
+### Verification
+
+- JVM 64/64 PASS；Android instrumentation 34/34 PASS。
+- **Lint 0 条问题**（v0.3.0 时还有 1 Hint；本次新增的 1 Warning 也已处理）。
+- debug 与 release 两种构建都通过；release 为已签名包。
+- **API 26（minSdk）真机验证**：全新安装 + release→release 覆盖升级，
+  `firstInstallTime` 保持不变（登录态可保留），启动、渲染、图标均正常。
+  这是 v0.3.0 之前从未跑过的路径。
+- 真机压力测试 30 项检查全通过（旋转 / 深浅色 / 系统字号 / 五套皮肤 / 大字叠加 /
+  Monkey 1500 / 强杀重启）。
+- 崩溃记录用 `am crash` 触发真实 uncaught exception 验证，端到端可用。
+
 ## [0.3.0] - 2026-08-31
 
 界面全面重做 + 一批只有在真机上才会暴露的稳定性问题修复。升级为覆盖安装，登录态保留。

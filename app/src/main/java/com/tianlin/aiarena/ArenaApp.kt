@@ -56,6 +56,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -126,6 +127,11 @@ fun ArenaApp(
     val sessionRepository = remember(context) { ArenaSessionStore(context) }
     val sessionController = remember(pool, sessionRepository) {
         ArenaSessionController(pool = pool, sessionRepository = sessionRepository)
+    }
+    // 只在启动时读一次；清除后用这个计数触发重读。
+    var crashReportGeneration by remember { mutableIntStateOf(0) }
+    val crashReport = remember(context, crashReportGeneration) {
+        runCatching { ArenaCrashReporter.latest(context) }.getOrNull()
     }
     var largeTextEnabled by rememberSaveable {
         mutableStateOf(accessibilityPreferences.isLargeTextEnabled())
@@ -211,7 +217,7 @@ fun ArenaApp(
     )
     CompositionLocalProvider(LocalDensity provides scaledDensity) {
         // 顶部 header 高度按实际测量值让位给 WebView，避免大字模式下写死高度被裁切。
-        var providerHeaderPx by remember { mutableStateOf(0) }
+        var providerHeaderPx by remember { mutableIntStateOf(0) }
         val providerHeaderHeight = if (selectedService == null) {
             0.dp
         } else {
@@ -281,6 +287,11 @@ fun ArenaApp(
                         shareText = shareText,
                         skin = skin,
                         onSkinChange = onSkinChange,
+                        crashReport = crashReport,
+                        onClearCrashReport = {
+                            ArenaCrashReporter.clear(context)
+                            crashReportGeneration += 1
+                        },
                     )
                 } else {
                     ProviderHeader(
@@ -320,6 +331,8 @@ private fun RoundtableRoot(
     shareText: TextShareRequest?,
     skin: ArenaSkin,
     onSkinChange: (ArenaSkin) -> Unit,
+    crashReport: ArenaCrashReport?,
+    onClearCrashReport: () -> Unit,
 ) {
     val usableCount = selectedServices.count {
         pool.statuses[it]?.state?.isUsable() == true
@@ -346,6 +359,8 @@ private fun RoundtableRoot(
             shareText = shareText,
             skin = skin,
             onSkinChange = onSkinChange,
+            crashReport = crashReport,
+            onClearCrashReport = onClearCrashReport,
         )
     } else {
         ConnectionGuide(
@@ -596,6 +611,8 @@ private fun DiscussionHome(
     shareText: TextShareRequest?,
     skin: ArenaSkin,
     onSkinChange: (ArenaSkin) -> Unit,
+    crashReport: ArenaCrashReport?,
+    onClearCrashReport: () -> Unit,
 ) {
     var question by rememberSaveable {
         mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion })
@@ -708,6 +725,15 @@ private fun DiscussionHome(
             RoundtablePage.SETTINGS -> RoundtableSettingsPage(
                 selectedServices = selectedServices,
                 usableCount = usableCount,
+                crashReport = crashReport,
+                onClearCrashReport = onClearCrashReport,
+                onShareCrashReport = shareText?.let { share ->
+                    { report: ArenaCrashReport ->
+                        if (!share("AI 圆桌崩溃记录", report.text)) {
+                            scope.launch { snackbarHostState.showSnackbar("当前设备没有可用的分享方式") }
+                        }
+                    }
+                },
                 largeTextEnabled = largeTextEnabled,
                 onLargeTextChange = onLargeTextChange,
                 speechState = speechState,
@@ -2028,6 +2054,9 @@ private fun RoundtableHistoryPage(
 private fun RoundtableSettingsPage(
     selectedServices: List<ArenaService>,
     usableCount: Int,
+    crashReport: ArenaCrashReport?,
+    onClearCrashReport: () -> Unit,
+    onShareCrashReport: ((ArenaCrashReport) -> Unit)?,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
     speechState: SpeechPlaybackState?,
@@ -2113,6 +2142,53 @@ private fun RoundtableSettingsPage(
                             color = colors.muted,
                             style = MaterialTheme.typography.bodyMedium,
                         )
+                        Text(
+                            text = "本应用不是任何 AI 厂商的官方客户端，它通过各家的网页版工作。" +
+                                "自动化操作可能被厂商判定为异常访问，请知悉风险。",
+                            color = colors.muted,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
+            if (crashReport != null) {
+                item(key = "crash") {
+                    ArenaCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = colors.errorSoft,
+                        borderColor = colors.error,
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = "上次异常退出",
+                                color = colors.error,
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Text(
+                                text = "${ArenaCrashReporter.formatTime(crashReport.recordedAtMillis)}" +
+                                    " · 记录只保存在本机，不会自动上传。导出后发给开发者可以帮助定位问题。",
+                                color = colors.muted,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                if (onShareCrashReport != null) {
+                                    ArenaTextAction(
+                                        text = "导出",
+                                        onClick = { onShareCrashReport(crashReport) },
+                                        contentDescriptionText = "导出上次崩溃记录",
+                                    )
+                                }
+                                ArenaTextAction(
+                                    text = "清除",
+                                    onClick = onClearCrashReport,
+                                    color = colors.muted,
+                                    contentDescriptionText = "清除崩溃记录",
+                                )
+                            }
+                        }
                     }
                 }
             }

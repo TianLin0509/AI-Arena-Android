@@ -31,8 +31,8 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew
 
-      - name: Test, lint and build
-        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+      - name: Test, lint and build (release 也要构建：R8 只在 release 生效)
+        run: ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v7

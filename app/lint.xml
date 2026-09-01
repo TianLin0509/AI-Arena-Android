@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!--
+        ObsoleteSdkInt 会建议把 mipmap-anydpi-v26 合并进 mipmap-anydpi（因为 minSdk 已经是 26）。
+        实测这条建议在本工程不成立：去掉 -v26 之后资源合并器不会收录该目录，
+        AAPT2 直接报 "resource mipmap/ic_launcher not found"，构建失败。
+        所以按路径精确豁免，其余位置仍然保留这条检查。
+    -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+</lint>

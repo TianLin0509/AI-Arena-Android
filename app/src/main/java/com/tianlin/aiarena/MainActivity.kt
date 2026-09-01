@@ -54,6 +54,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 必须在建 WebView / Compose 之前装，才能覆盖启动期的崩溃。
+        ArenaCrashReporter.install(this)
         enableEdgeToEdge()
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         webViewPool = ArenaWebViewPool(this)

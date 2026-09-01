@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    minSdk = 26，所有设备都走自适应图标，不需要再补各密度 PNG。
+    -v26 限定符必须保留：去掉后资源合并器不会收录本目录（见 app/lint.xml 注释）。
+    monochrome 供 Android 13+ 的主题图标使用；缺了它在开启主题图标的桌面上
+    会退化成一个灰底方块。
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <monochrome android:drawable="@drawable/ic_launcher_foreground" />
+</adaptive-icon>
