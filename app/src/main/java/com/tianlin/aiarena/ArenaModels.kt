@@ -246,7 +246,12 @@ object ArenaLimits {
     const val PROMPT_TEMPLATE_RESERVE = 1_500
     const val MAX_GUIDANCE_CHARS = 2_000
     const val MAX_QUOTED_RESPONSE_CHARS = 2_000
-    const val MAX_CAPTURED_RESPONSE_CHARS = 12_000
+    /**
+     * 抓取单条回答的字符上限。0.5.1 起抓的是 Markdown 而不是纯文本，
+     * 星号 / 井号 / 表格竖线本身要占字符（实测约 +8%），阈值不跟着抬
+     * 就等于变相少抓了一截正文。
+     */
+    const val MAX_CAPTURED_RESPONSE_CHARS = 14_000
     const val MAX_STORED_PROMPT_CHARS = 32_000
     const val MAX_HISTORY_ROUNDS = 8
 }

@@ -40,10 +40,10 @@ internal object ArenaWebResponseScript {
           // 没有锚点就退回"取最后一个"，避免把上一轮的回答一起拼进来。
           if (anchored && fragmentSelectors.indexOf(selector) >= 0) {
             return clean(filled.map(function(row) {
-              return clean(row.innerText || row.textContent || '');
-            }).join('\n'));
+              return arenaToMarkdown(row);
+            }).filter(function(part) { return part.length > 0; }).join('\n\n'));
           }
-          return clean(filled[filled.length - 1].innerText || filled[filled.length - 1].textContent || '');
+          return arenaToMarkdown(filled[filled.length - 1]);
         };
     """.trimIndent()
 
@@ -72,7 +72,7 @@ internal object ArenaWebResponseScript {
                     return clean(row.innerText || row.textContent || '').length > 0;
                   }).pop() || null;
                 }
-                text = element ? clean(element.innerText || element.textContent || '') : '';
+                text = element ? arenaToMarkdown(element) : '';
                 streaming = !!document.querySelector('.ds-loading, [class*=generating], button[class*=stop]');
             """.trimIndent()
             ArenaService.DOUBAO -> """
@@ -88,7 +88,7 @@ internal object ArenaWebResponseScript {
                     return !row.querySelector('[class*=bg-g-send]');
                   });
                   const element = answerRow && (answerRow.querySelector('.md-box-root') || answerRow);
-                  text = element ? clean(element.innerText || element.textContent || '') : '';
+                  text = element ? arenaToMarkdown(element) : '';
                   streaming = !!answerRow && !answerRow.querySelector('[class*=message-action-bar]');
                 }
             """.trimIndent()
@@ -109,7 +109,7 @@ internal object ArenaWebResponseScript {
                   const element = finalBlocks.filter(function(item) {
                     return clean(item.innerText || item.textContent || '').length > 0;
                   }).pop();
-                  text = element ? clean(element.innerText || element.textContent || '') : '';
+                  text = element ? arenaToMarkdown(element) : '';
                   streaming = !!assistant && !assistant.querySelector('.segment-assistant-actions');
                 }
             """.trimIndent()
@@ -163,6 +163,7 @@ internal object ArenaWebResponseScript {
             (function() {
               $stateBootstrap
               const clean = function(value) { return String(value || '').trim(); };
+              ${ArenaMarkdownScript.helper}
               $scopeHelper
               let text = '';
               let streaming = false;

@@ -1659,12 +1659,12 @@ private fun ProviderResultCard(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text(
-                        text = run.response,
+                    // 折叠态同样走 Markdown 渲染：它是默认视图，不能退回无格式纯文本。
+                    MarkdownText(
+                        markdown = run.response,
                         color = colors.ink,
                         style = MaterialTheme.typography.bodyLarge,
-                        maxLines = if (expanded) Int.MAX_VALUE else collapsedLines,
-                        overflow = if (expanded) TextOverflow.Clip else TextOverflow.Ellipsis,
+                        collapsedLines = if (expanded) null else collapsedLines,
                     )
                     if (run.responseTruncated) {
                         Text(
@@ -1824,8 +1824,8 @@ private fun DiscussionSummaryCard(
                     }
                 }
                 HorizontalDivider(color = colors.summaryBorder)
-                Text(
-                    text = summary.text,
+                MarkdownText(
+                    markdown = summary.text,
                     color = colors.ink,
                     style = MaterialTheme.typography.bodyLarge,
                 )

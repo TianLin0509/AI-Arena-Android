@@ -168,9 +168,18 @@ typealias SpeechPlaybackRequest = (key: String, text: String) -> Unit
 object SpeechTextPolicy {
     const val DEFAULT_CHUNK_CHARACTERS = 3_000
 
+    // 引用角标（网页侧已转成 \u00B9\u2074\u2078 这类上标字符）逐字读出来毫无意义，
+    // 代码块逐字读更难听，这里直接换成一句提示。
+    private val citationMarks = Regex("[\u00B2\u00B3\u00B9\u2070\u2074-\u2079]+")
+    private val fencedCode = Regex("```[\u0000-\uFFFF]*?```")
+    private val tableRule = Regex("^[ \u0009]*\\|?[ :|-]*\\-{2,}[ :|-]*$", RegexOption.MULTILINE)
+
     fun normalize(raw: String): String = raw
+        .replace(fencedCode, " 代码块 ")
         .replace(Regex("\\[([^]]+)]\\([^)]*\\)"), "$1")
-        .replace(Regex("[#*_`>]+"), " ")
+        .replace(citationMarks, "")
+        .replace(tableRule, " ")
+        .replace(Regex("[#*_`>~|]+"), " ")
         .replace(Regex("\\s+"), " ")
         .trim()
 
