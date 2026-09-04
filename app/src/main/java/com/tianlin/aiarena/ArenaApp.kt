@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -224,21 +225,28 @@ fun ArenaApp(
             with(LocalDensity.current) { providerHeaderPx.toDp() }
         }
 
+        val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+
         Scaffold(
             containerColor = colors.page,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             snackbarHost = { SnackbarHost(snackbarHostState) },
             bottomBar = {
-                ArenaBottomBar(
-                    selected = selectedService,
-                    onRoundtable = { returnToRoundtable() },
-                    onService = { service ->
-                        pool.open(service)
-                        selectedServiceName = service.name
-                    },
-                    statuses = pool.statuses,
-                    services = selectedMembers,
-                )
+                // 键盘弹出时底栏本来就被完全挡住，但它仍然占着 innerPadding.bottom，
+                // 而内容侧又叠了一层 imePadding() —— 两份底部内边距叠加会把中间可滚区
+                // 挤到只剩一行，输入框因此被固定在底部的主按钮压住。键盘打开时直接不摆它。
+                if (!imeVisible) {
+                    ArenaBottomBar(
+                        selected = selectedService,
+                        onRoundtable = { returnToRoundtable() },
+                        onService = { service ->
+                            pool.open(service)
+                            selectedServiceName = service.name
+                        },
+                        statuses = pool.statuses,
+                        services = selectedMembers,
+                    )
+                }
             },
         ) { innerPadding ->
             Box(
@@ -689,16 +697,21 @@ private fun DiscussionHome(
 
     val restoreRecentSession: (String) -> Unit = { sessionId ->
         stopSpeech?.invoke()
-        if (sessionController.restoreSession(sessionId)) {
+        val outcome = sessionController.restoreSession(sessionId)
+        if (outcome == RestoreOutcome.OK || outcome == RestoreOutcome.OK_AFTER_STOP) {
             question = sessionController.originalQuestion
             roundGuidance = ""
             expandedAnswers.clear()
             roundtablePageName = RoundtablePage.HOME.name
             onSelectedServicesChange(sessionController.sessionServices)
-            scope.launch { snackbarHostState.showSnackbar("已恢复本地讨论") }
-        } else {
-            scope.launch { snackbarHostState.showSnackbar("该历史记录无法恢复") }
         }
+        val message = when (outcome) {
+            RestoreOutcome.OK -> "已打开这条讨论"
+            RestoreOutcome.OK_AFTER_STOP -> "已停止进行中的一轮，并打开这条讨论"
+            RestoreOutcome.UNREADABLE -> "这条记录的文件已损坏，已从列表移除"
+            RestoreOutcome.NO_STORAGE -> "本地存储不可用，无法打开历史"
+        }
+        scope.launch { snackbarHostState.showSnackbar(message) }
     }
 
     BackHandler(enabled = roundtablePage != RoundtablePage.HOME) {
@@ -863,6 +876,7 @@ private fun AskHome(
     val metrics = ArenaStyle.metrics
     val ready = usableCount >= ArenaService.MIN_MEMBERS
     val scrollState = rememberScrollState()
+    val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
     Column(
         modifier = Modifier
@@ -981,6 +995,7 @@ private fun AskHome(
                 voiceInputActive = voiceInputActive,
                 voiceInputEnabled = voiceInputEnabled,
                 onVoiceInput = onVoiceInput,
+                compact = imeVisible,
             )
 
             AnimatedVisibility(
@@ -1087,6 +1102,8 @@ private fun QuestionComposer(
     voiceInputActive: Boolean,
     voiceInputEnabled: Boolean,
     onVoiceInput: () -> Unit,
+    /** 键盘占掉大半屏时压矮一档，好让分隔线和语音/清空那行也留在可视区内。 */
+    compact: Boolean = false,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
@@ -1102,7 +1119,7 @@ private fun QuestionComposer(
                 onValueChange = onQuestionChange,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 110.dp),
+                    .heightIn(min = if (compact) 64.dp else 110.dp),
                 placeholder = {
                     Text(
                         text = "写下你的问题，多家 AI 会一起回答…",
@@ -1127,8 +1144,8 @@ private fun QuestionComposer(
                     unfocusedTextColor = colors.ink,
                 ),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default),
-                minLines = 3,
-                maxLines = 8,
+                minLines = if (compact) 2 else 3,
+                maxLines = if (compact) 4 else 8,
             )
             HorizontalDivider(color = colors.border)
             Row(

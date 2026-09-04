@@ -11,6 +11,17 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
+/** 打开历史会话的结果。分开报，界面才能说清楚到底发生了什么。 */
+enum class RestoreOutcome {
+    OK,
+    /** 打开成功，但为此中止了正在进行的一轮。 */
+    OK_AFTER_STOP,
+    /** 记录文件缺失或损坏，已从列表移除。 */
+    UNREADABLE,
+    /** 本地存储不可用。 */
+    NO_STORAGE,
+}
+
 class ArenaSessionController(
     private val pool: ArenaGateway,
     private val timing: ControllerTiming = ControllerTiming(),
@@ -371,15 +382,31 @@ class ArenaSessionController(
         recoveryExecution = null
     }
 
-    fun restoreSession(id: String): Boolean {
-        if (isBusy) return false
-        val snapshot = sessionRepository?.load(id) ?: return false
+    /**
+     * 打开一条历史会话。
+     *
+     * 原来这里是 `if (isBusy) return false`，调用方只能笼统提示"该历史记录无法恢复" ——
+     * 用户刚问完一轮、总结还在跑的时候点历史，必然撞上这条，而且看不出是为什么。
+     * 现在忙的时候先把本轮停掉再打开（这正是用户点"继续"想表达的意思），
+     * 真失败时也回具体原因，让界面能说人话。
+     */
+    fun restoreSession(id: String): RestoreOutcome {
+        val repository = sessionRepository ?: return RestoreOutcome.NO_STORAGE
+        val interrupted = isBusy
+        if (interrupted) cancelCurrentRound()
+        val snapshot = repository.load(id)
+        if (snapshot == null) {
+            // 索引里有、文件读不出来：留着它只会让用户每次点每次失败。
+            repository.forget(id)
+            refreshRecentSessions()
+            return RestoreOutcome.UNREADABLE
+        }
         persistNow(synchronous = true)
         persistGeneration += 1
         applySnapshot(snapshot, recovered = false)
-        sessionRepository.setActiveSession(snapshot.id)
+        repository.setActiveSession(snapshot.id)
         schedulePersist()
-        return true
+        return if (interrupted) RestoreOutcome.OK_AFTER_STOP else RestoreOutcome.OK
     }
 
     private fun startRound(

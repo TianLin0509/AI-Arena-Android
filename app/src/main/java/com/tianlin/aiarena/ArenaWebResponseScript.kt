@@ -31,18 +31,43 @@ internal object ArenaWebResponseScript {
           }
           return { nodes: [], selector: '' };
         };
+        /**
+         * 思考过程 / 工具调用 / 联网搜索结果这些辅助区块不算正式回答。
+         * 以前只取最后一个节点时它们天然被排除掉，改成整段拼接后必须显式过滤，
+         * 否则「深度思考」的内容会被当成答案的一部分抓回来。
+         * 万一过滤把候选清空了（类名撞车），退回不过滤的原集合，宁可多抓也不要抓空。
+         */
+        const auxiliaryPattern = '[class*=think], [class*=thought], [class*=reason], [class*=toolcall], [class*=tool-call], [class*=tool_call], [class*=search-result]';
+        const withoutAuxiliary = function(nodes) {
+          const kept = nodes.filter(function(node) {
+            try { return !(node.closest && node.closest(auxiliaryPattern)); } catch (_) { return true; }
+          });
+          return kept.length ? kept : nodes;
+        };
+        /** 去掉被别的候选包住的节点，避免同一段内容被算两遍。 */
+        const topLevelOnly = function(nodes) {
+          return nodes.filter(function(node) {
+            return !nodes.some(function(other) {
+              return other !== node && other.contains && other.contains(node);
+            });
+          });
+        };
         const collectText = function(scoped, fragmentSelectors, selector, anchored) {
           const filled = scoped.nodes.filter(function(row) {
             return clean(row.innerText || row.textContent || '').length > 0;
           });
           if (!filled.length) return '';
-          // 段落级选择器只有在标记锚定成功时才敢整段拼接：此时范围确定属于本轮回答。
-          // 没有锚点就退回"取最后一个"，避免把上一轮的回答一起拼进来。
-          if (anchored && fragmentSelectors.indexOf(selector) >= 0) {
-            return clean(filled.map(function(row) {
+          // 锚定成功时 scoped 里的节点已确定全部排在本轮那条用户消息之后，整段拼接是安全的。
+          // 此前还额外要求选择器出现在 fragmentSelectors 白名单里，而元宝和智谱传的是空数组，
+          // 于是它们永远只取最后一个节点 —— 站点把一条回答拆成多个 markdown 容器时，
+          // 就只能抓到结尾那一小段。先剔除互相嵌套的候选，再按文档顺序拼。
+          if (anchored) {
+            const parts = topLevelOnly(withoutAuxiliary(filled)).map(function(row) {
               return arenaToMarkdown(row);
-            }).filter(function(part) { return part.length > 0; }).join('\n\n'));
+            }).filter(function(part) { return part.length > 0; });
+            if (parts.length) return clean(parts.join('\n\n'));
           }
+          // 没有锚点时范围只是猜的，仍旧退回"取最后一个"，避免把上一轮的回答拼进来。
           return arenaToMarkdown(filled[filled.length - 1]);
         };
     """.trimIndent()
@@ -106,10 +131,16 @@ internal object ArenaWebResponseScript {
                   const finalBlocks = assistant ? Array.from(assistant.querySelectorAll('.markdown-container:not(.toolcall-content-text)')).filter(function(item) {
                     return !item.closest('[class*=toolcall], [class*=thinking], [class*=thought]');
                   }) : [];
-                  const element = finalBlocks.filter(function(item) {
+                  // finalBlocks 已经限定在本轮那条 assistant 节点内部，整段拼接是安全的。
+                  // 原来这里 .pop() 只取最后一块，Kimi 把回答拆成多个 markdown-container 时
+                  // 就只剩结尾一小段。
+                  const blocks = finalBlocks.filter(function(item) {
                     return clean(item.innerText || item.textContent || '').length > 0;
-                  }).pop();
-                  text = element ? arenaToMarkdown(element) : '';
+                  });
+                  const parts = blocks.map(function(item) {
+                    return arenaToMarkdown(item);
+                  }).filter(function(part) { return part.length > 0; });
+                  text = parts.join('\n\n');
                   streaming = !!assistant && !assistant.querySelector('.segment-assistant-actions');
                 }
             """.trimIndent()

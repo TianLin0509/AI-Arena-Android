@@ -38,6 +38,9 @@ interface ArenaSessionRepository {
     fun loadActive(): ArenaSessionSnapshot?
     fun setActiveSession(id: String?)
     fun listRecent(limit: Int = 8): List<RecentArenaSession>
+
+    /** 从索引里剔除一条并删掉它的文件。用于清理点开必然失败的死条目。 */
+    fun forget(id: String)
 }
 
 class ArenaSessionStore internal constructor(
@@ -86,6 +89,14 @@ class ArenaSessionStore internal constructor(
     @Synchronized
     override fun listRecent(limit: Int): List<RecentArenaSession> =
         readIndex().sortedByDescending { it.updatedAtMillis }.take(limit.coerceAtLeast(0))
+
+    @Synchronized
+    override fun forget(id: String) {
+        if (!isValidId(id)) return
+        writeIndex(readIndex().filterNot { it.id == id })
+        sessionFile(id).delete()
+        if (preferences.getString(KEY_ACTIVE_SESSION, null) == id) setActiveSession(null)
+    }
 
     private fun sessionFile(id: String): File = File(root, "$id.json")
 

@@ -791,6 +791,11 @@ class ArenaSessionControllerInstrumentedTest {
             activeId = id
         }
 
+        override fun forget(id: String) {
+            snapshots.remove(id)
+            if (activeId == id) activeId = null
+        }
+
         override fun listRecent(limit: Int): List<RecentArenaSession> = snapshots.values
             .sortedByDescending { it.updatedAtMillis }
             .take(limit)
