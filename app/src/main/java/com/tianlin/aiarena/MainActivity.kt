@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
                     copyText = ::copyText,
                     shareText = ::shareText,
                     openExternalUrl = ::openExternalUrl,
+                    restartApp = { ArenaRestart.trigger(this) },
                     skin = skin,
                     onSkinChange = { next ->
                         skin = next

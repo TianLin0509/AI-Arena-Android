@@ -147,6 +147,21 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ensureWebView(service)?.reload()
     }
 
+    /**
+     * 「重新加载 AI 网页」：设置页的第一道修复手段。
+     * 已经打开的网页原地刷新；渲染进程死掉后被移除的（见 onRenderProcessGone）重新建一个。
+     * 不碰 Cookie，登录态不会丢。轮次进行中不允许，否则会打断正在收的回答。
+     */
+    fun reloadAll(): Int {
+        if (destroyed || automationService != null) return 0
+        val targets = (desiredServices + webViews.keys).toList()
+        targets.forEach { service ->
+            val existing = webViews[service]
+            if (existing != null) existing.reload() else ensureWebView(service)
+        }
+        return targets.size
+    }
+
     fun canGoBack(service: ArenaService): Boolean = webViews[service]?.canGoBack() == true
 
     fun goBack(service: ArenaService): Boolean {

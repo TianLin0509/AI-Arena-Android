@@ -14,6 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -28,11 +29,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -43,31 +47,36 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.res.painterResource
 
-/** 基础卡片。阴影 / 描边 / 圆角全部跟随当前皮肤。 */
+/**
+ * 基础容器。底色默认取皮肤的 `card`；扁平皮肤（净白）不画描边、不投阴影，
+ * 其它皮肤保留描边和阴影。传入的 borderColor 在扁平皮肤下会被忽略——
+ * 需要表达状态时用填色、圆点或文字，不要依赖描边。
+ */
 @Composable
 fun ArenaCard(
     modifier: Modifier = Modifier,
-    color: Color = ArenaStyle.colors.surface,
+    color: Color = ArenaStyle.colors.card,
     borderColor: Color = ArenaStyle.colors.border,
     onClick: (() -> Unit)? = null,
     content: @Composable () -> Unit,
 ) {
     val metrics = ArenaStyle.metrics
+    val shape = RoundedCornerShape(metrics.cardCorner)
     Surface(
-        modifier = if (onClick != null) modifier.clickable(onClick = onClick) else modifier,
+        modifier = if (onClick != null) modifier.clip(shape).clickable(onClick = onClick) else modifier,
         color = color,
-        shape = RoundedCornerShape(metrics.cardCorner),
-        border = BorderStroke(metrics.borderWidth, borderColor),
-        shadowElevation = metrics.cardElevation,
+        shape = shape,
+        border = if (metrics.flatSurfaces) null else BorderStroke(metrics.borderWidth, borderColor),
+        shadowElevation = if (metrics.flatSurfaces) 0.dp else metrics.cardElevation,
         content = content,
     )
 }
@@ -81,6 +90,7 @@ fun ArenaPrimaryButton(
     enabled: Boolean = true,
     containerColor: Color = ArenaStyle.colors.accent,
     contentColor: Color = ArenaStyle.colors.onAccent,
+    leading: (@Composable () -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
@@ -97,6 +107,10 @@ fun ArenaPrimaryButton(
         ),
         contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp),
     ) {
+        if (leading != null) {
+            leading()
+            Spacer(Modifier.width(8.dp))
+        }
         Text(
             text = text,
             style = MaterialTheme.typography.titleMedium,
@@ -106,6 +120,10 @@ fun ArenaPrimaryButton(
     }
 }
 
+/**
+ * 次要按钮。扁平皮肤用淡色填充（豆包 / 微信的"次按钮"做法），
+ * 其它皮肤保留描边样式。
+ */
 @Composable
 fun ArenaSecondaryButton(
     text: String,
@@ -116,23 +134,46 @@ fun ArenaSecondaryButton(
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
-    OutlinedButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier.heightIn(min = metrics.minTouch),
-        shape = RoundedCornerShape(metrics.controlCorner),
-        border = BorderStroke(metrics.borderWidth, if (enabled) colors.accent else colors.border),
-        colors = ButtonDefaults.outlinedButtonColors(
-            contentColor = colors.accent,
-            disabledContentColor = colors.muted,
-        ),
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
-    ) {
-        if (leading != null) {
-            leading()
-            Spacer(Modifier.width(8.dp))
+    if (metrics.flatSurfaces) {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = modifier.heightIn(min = metrics.minTouch),
+            shape = RoundedCornerShape(metrics.controlCorner),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = colors.accentSoft,
+                contentColor = colors.accent,
+                disabledContainerColor = colors.card,
+                disabledContentColor = colors.muted,
+            ),
+            elevation = null,
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+        ) {
+            if (leading != null) {
+                leading()
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, maxLines = 1)
         }
-        Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, maxLines = 1)
+    } else {
+        OutlinedButton(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = modifier.heightIn(min = metrics.minTouch),
+            shape = RoundedCornerShape(metrics.controlCorner),
+            border = BorderStroke(metrics.borderWidth, if (enabled) colors.accent else colors.border),
+            colors = ButtonDefaults.outlinedButtonColors(
+                contentColor = colors.accent,
+                disabledContentColor = colors.muted,
+            ),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+        ) {
+            if (leading != null) {
+                leading()
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, maxLines = 1)
+        }
     }
 }
 
@@ -277,6 +318,389 @@ fun ArenaHeading(
     }
 }
 
+/** 矢量图标的统一入口：资源 + 着色 + 尺寸。 */
+@Composable
+fun ArenaIcon(
+    resId: Int,
+    modifier: Modifier = Modifier,
+    tint: Color = ArenaStyle.colors.ink,
+    size: Dp = 22.dp,
+    contentDescription: String? = null,
+) {
+    Icon(
+        painter = painterResource(resId),
+        contentDescription = contentDescription,
+        tint = tint,
+        modifier = modifier.size(size),
+    )
+}
+
+/** 返回按钮：箭头 + 文字，触摸区足够大，读屏描述固定为「返回上一页」。 */
+@Composable
+fun ArenaBackButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    label: String = "返回",
+    color: Color = ArenaStyle.colors.accent,
+    contentDescriptionText: String = "返回上一页",
+) {
+    val metrics = ArenaStyle.metrics
+    TextButton(
+        onClick = onClick,
+        modifier = modifier
+            .heightIn(min = metrics.minTouch)
+            .semantics { contentDescription = contentDescriptionText },
+        contentPadding = PaddingValues(start = 8.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
+    ) {
+        ArenaIcon(R.drawable.ic_arrow_back, tint = color, size = 24.dp)
+        Spacer(Modifier.width(2.dp))
+        Text(
+            text = label,
+            color = color,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
+    }
+}
+
+/**
+ * 分组列表容器（iOS 设置 / 微信「我」页的样式）：可选的小标题 + 一个圆角容器，
+ * 行与行之间用 [ArenaRowDivider] 分隔。
+ */
+@Composable
+fun ArenaGroup(
+    modifier: Modifier = Modifier,
+    title: String? = null,
+    color: Color = ArenaStyle.colors.card,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val colors = ArenaStyle.colors
+    Column(modifier = modifier.fillMaxWidth()) {
+        if (title != null) {
+            Text(
+                text = title,
+                color = colors.muted,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.padding(start = 6.dp, bottom = 8.dp),
+            )
+        }
+        ArenaCard(modifier = Modifier.fillMaxWidth(), color = color) {
+            Column(content = content)
+        }
+    }
+}
+
+/** 分组列表中行与行之间的发丝线，左侧缩进与文字对齐。 */
+@Composable
+fun ArenaRowDivider(startIndent: Dp = 16.dp) {
+    HorizontalDivider(
+        color = ArenaStyle.colors.border,
+        modifier = Modifier.padding(start = startIndent),
+    )
+}
+
+/**
+ * 分组列表的一行：标题 + 说明 + 右侧内容（默认是右箭头）。
+ * 行高不低于皮肤的 rowHeight，整行可点。
+ */
+@Composable
+fun ArenaRow(
+    title: String,
+    modifier: Modifier = Modifier,
+    detail: String? = null,
+    detailColor: Color = ArenaStyle.colors.muted,
+    titleColor: Color = ArenaStyle.colors.ink,
+    leading: (@Composable () -> Unit)? = null,
+    trailing: (@Composable () -> Unit)? = null,
+    trailingText: String? = null,
+    trailingColor: Color = ArenaStyle.colors.muted,
+    chevron: Boolean = true,
+    onClick: (() -> Unit)? = null,
+    contentDescriptionText: String? = null,
+) {
+    val colors = ArenaStyle.colors
+    val metrics = ArenaStyle.metrics
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .then(
+                if (contentDescriptionText != null) {
+                    Modifier.semantics { contentDescription = contentDescriptionText }
+                } else {
+                    Modifier
+                }
+            )
+            .heightIn(min = metrics.rowHeight)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        if (leading != null) leading()
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = title,
+                color = titleColor,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (!detail.isNullOrBlank()) {
+                Text(
+                    text = detail,
+                    color = detailColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (trailingText != null) {
+            Text(
+                text = trailingText,
+                color = trailingColor,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (trailing != null) trailing()
+        if (chevron && onClick != null) {
+            ArenaIcon(R.drawable.ic_chevron_right, tint = colors.muted.copy(alpha = 0.7f), size = 22.dp)
+        }
+    }
+}
+
+/** 带开关的行。开关的读屏描述由调用方给出，与旧版「开启/关闭大字模式」保持一致。 */
+@Composable
+fun ArenaSwitchRow(
+    title: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    detail: String? = null,
+    leading: (@Composable () -> Unit)? = null,
+    contentDescriptionText: String? = null,
+) {
+    val colors = ArenaStyle.colors
+    ArenaRow(
+        title = title,
+        detail = detail,
+        leading = leading,
+        modifier = modifier,
+        chevron = false,
+        onClick = { onCheckedChange(!checked) },
+        trailing = {
+            Switch(
+                checked = checked,
+                onCheckedChange = onCheckedChange,
+                modifier = if (contentDescriptionText != null) {
+                    Modifier.semantics { contentDescription = contentDescriptionText }
+                } else {
+                    Modifier
+                },
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = colors.onAccent,
+                    checkedTrackColor = colors.accent,
+                    uncheckedThumbColor = colors.surface,
+                    uncheckedTrackColor = colors.surfaceAlt,
+                    uncheckedBorderColor = colors.borderStrong,
+                ),
+            )
+        },
+    )
+}
+
+/** 提示条的语气，决定配色和图标。 */
+enum class NoticeTone { INFO, SUCCESS, WARNING, ERROR }
+
+/**
+ * 提示条：一句话说明 + 可选的一个动作。用于断网、登录成功、上次异常退出等
+ * "需要用户知道、但不该打断他"的场合。永远不是弹窗。
+ */
+@Composable
+fun ArenaNotice(
+    text: String,
+    tone: NoticeTone,
+    modifier: Modifier = Modifier,
+    title: String? = null,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+    secondaryLabel: String? = null,
+    onSecondary: (() -> Unit)? = null,
+    actionContentDescription: String? = null,
+) {
+    val colors = ArenaStyle.colors
+    val metrics = ArenaStyle.metrics
+    val (foreground, background, icon) = when (tone) {
+        NoticeTone.INFO -> Triple(colors.accent, colors.accentSoft, R.drawable.ic_info)
+        NoticeTone.SUCCESS -> Triple(colors.success, colors.successSoft, R.drawable.ic_check_circle)
+        NoticeTone.WARNING -> Triple(colors.warning, colors.warningSoft, R.drawable.ic_warning)
+        NoticeTone.ERROR -> Triple(colors.error, colors.errorSoft, R.drawable.ic_error)
+    }
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = background,
+        shape = RoundedCornerShape(metrics.cardCorner),
+    ) {
+        Column(
+            modifier = Modifier.padding(start = 14.dp, end = 10.dp, top = 12.dp, bottom = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                ArenaIcon(icon, tint = foreground, size = 22.dp, modifier = Modifier.padding(top = 2.dp))
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (title != null) {
+                        Text(
+                            text = title,
+                            color = foreground,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                    }
+                    Text(
+                        text = text,
+                        color = if (title != null) colors.ink else foreground,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+            if (actionLabel != null && onAction != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    if (secondaryLabel != null && onSecondary != null) {
+                        ArenaTextAction(
+                            text = secondaryLabel,
+                            onClick = onSecondary,
+                            color = colors.muted,
+                        )
+                    }
+                    ArenaTextAction(
+                        text = actionLabel,
+                        onClick = onAction,
+                        color = foreground,
+                        contentDescriptionText = actionContentDescription,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 步骤序号：圆圈里的数字；完成后换成对勾。用在登录引导和首次使用说明里。 */
+@Composable
+fun ArenaStepBadge(
+    number: Int,
+    done: Boolean = false,
+    active: Boolean = false,
+    size: Dp = 30.dp,
+) {
+    val colors = ArenaStyle.colors
+    val background = when {
+        done -> colors.success
+        active -> colors.accent
+        else -> colors.surfaceAlt
+    }
+    val foreground = when {
+        done || active -> colors.onAccent
+        else -> colors.muted
+    }
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(RoundedCornerShape(99.dp))
+            .background(background),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (done) {
+            ArenaIcon(R.drawable.ic_check, tint = foreground, size = size * 0.6f)
+        } else {
+            Text(
+                text = number.toString(),
+                color = foreground,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+/** 分段选择器：两三个互斥选项，当前项用白色浮起。 */
+@Composable
+fun ArenaSegmented(
+    options: List<String>,
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    captions: List<String>? = null,
+    contentDescriptions: List<String>? = null,
+) {
+    val colors = ArenaStyle.colors
+    val metrics = ArenaStyle.metrics
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        color = colors.surfaceAlt,
+        shape = RoundedCornerShape(metrics.controlCorner),
+    ) {
+        Row(
+            modifier = Modifier.padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            options.forEachIndexed { index, label ->
+                val isSelected = index == selectedIndex
+                val background by animateColorAsState(
+                    targetValue = if (isSelected) colors.surface else Color.Transparent,
+                    label = "segment-bg",
+                )
+                val description = contentDescriptions?.getOrNull(index)
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = metrics.minTouch)
+                        .then(
+                            if (description != null) {
+                                Modifier.semantics { contentDescription = description }
+                            } else {
+                                Modifier
+                            }
+                        )
+                        .clip(RoundedCornerShape(metrics.controlCorner - 4.dp))
+                        .clickable(enabled = enabled) { onSelect(index) },
+                    color = background,
+                    shape = RoundedCornerShape(metrics.controlCorner - 4.dp),
+                    shadowElevation = if (isSelected) 1.dp else 0.dp,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Text(
+                            text = label,
+                            color = if (isSelected) colors.accent else colors.muted,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        val caption = captions?.getOrNull(index)
+                        if (caption != null) {
+                            Text(
+                                text = caption,
+                                color = if (isSelected) colors.accent else colors.muted,
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /** 品牌头像。有矢量图标用图标，没有的用品牌色 + 单字。 */
 @Composable
 fun BrandAvatar(
@@ -414,20 +838,21 @@ fun SkinPicker(
                 row.forEach { skin ->
                     val isSelected = skin == selected
                     val borderColor by animateColorAsState(
-                        targetValue = if (isSelected) colors.accent else colors.border,
+                        targetValue = if (isSelected) colors.accent else colors.card,
                         label = "skin-border",
                     )
                     Surface(
                         modifier = Modifier
                             .weight(1f)
+                            .clip(RoundedCornerShape(metrics.cardCorner))
                             .clickable { onSelect(skin) }
                             .semantics {
                                 contentDescription =
                                     "${skin.displayName}风格，${if (isSelected) "已选择" else "未选择"}"
                             },
-                        color = colors.surface,
+                        color = colors.card,
                         shape = RoundedCornerShape(metrics.cardCorner),
-                        border = BorderStroke(if (isSelected) 2.dp else metrics.borderWidth, borderColor),
+                        border = BorderStroke(2.dp, if (isSelected) borderColor else if (metrics.flatSurfaces) colors.card else colors.border),
                     ) {
                         Column(
                             modifier = Modifier.padding(10.dp),
@@ -479,6 +904,7 @@ private fun SkinSwatch(skin: ArenaSkin) {
             .heightIn(min = 66.dp)
             .clip(RoundedCornerShape(m.cardCorner / 1.6f))
             .background(p.page)
+            .then(if (m.flatSurfaces) Modifier.background(p.page) else Modifier)
             .padding(7.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
@@ -488,10 +914,10 @@ private fun SkinSwatch(skin: ArenaSkin) {
                 .height(15.dp)
                 .clip(RoundedCornerShape(m.cardCorner / 2.4f))
                 .then(
-                    if (m.heroGradient) {
-                        Modifier.background(p.heroBrush)
-                    } else {
-                        Modifier.background(p.heroStart)
+                    when {
+                        m.heroGradient -> Modifier.background(p.heroBrush)
+                        p.headingGradient != null -> Modifier.background(Brush.linearGradient(p.headingGradient))
+                        else -> Modifier.background(p.heroStart)
                     }
                 ),
         )
@@ -502,7 +928,8 @@ private fun SkinSwatch(skin: ArenaSkin) {
                     .weight(1f)
                     .height(17.dp)
                     .clip(RoundedCornerShape(m.cardCorner / 2.4f))
-                    .background(p.surface),
+                    .background(p.card)
+                    .then(if (m.flatSurfaces) Modifier else Modifier.background(p.surface)),
             )
             Box(
                 modifier = Modifier

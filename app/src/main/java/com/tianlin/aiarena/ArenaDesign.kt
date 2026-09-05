@@ -31,7 +31,7 @@ enum class ArenaSkin(
     val displayName: String,
     val tagline: String,
 ) {
-    PURE("净白", "纯白留白，渐变标题"),
+    PURE("净白", "白底留白，渐变标题"),
     CLEAR("清朗", "明亮通透，蓝绿顶栏"),
     INK("墨韵", "宣纸朱砂，中式沉稳"),
     NIGHT("夜航", "深色护眼，适合夜间"),
@@ -53,6 +53,11 @@ data class ArenaPalette(
     val isDark: Boolean,
     val page: Color,
     val surface: Color,
+    /**
+     * 放在页面上的"容器"底色：输入框、示例、分组列表、回答卡片都用它。
+     * 「净白」是浅灰色块压在白底上（豆包 / Kimi 的做法），其它皮肤是白卡片压在有色页面上。
+     */
+    val card: Color,
     val surfaceAlt: Color,
     val ink: Color,
     val muted: Color,
@@ -93,11 +98,13 @@ data class ArenaMetrics(
     val gutter: Dp,
     val gap: Dp,
     val minTouch: Dp,
+    /** 分组列表的行高下限（微信「我」页约 56dp，长辈皮肤更高）。 */
+    val rowHeight: Dp,
     val primaryButtonHeight: Dp,
     val typeScale: Float,
     val heroGradient: Boolean,
     val headingFamily: FontFamily,
-    /** 扁平化：顶栏与页面同色、卡片无阴影、只留发丝描边。 */
+    /** 扁平化：顶栏与页面同色、容器只靠填色区分，不画描边、不投阴影。 */
     val flatSurfaces: Boolean = false,
 )
 
@@ -113,22 +120,28 @@ object ArenaStyle {
         @Composable @ReadOnlyComposable get() = LocalArenaMetrics.current
 }
 
+/**
+ * 「净白」2.0。白底不变、渐变标题不变；容器从"白底 + 发丝描边"改成"浅灰填色、无描边"。
+ * 灰阶按 iOS systemFill / 豆包输入框的明度取；muted 与 accent 都提到白底 5:1 以上的对比度，
+ * 因为使用者里有长辈。
+ */
 private val PurePalette = ArenaPalette(
     isDark = false,
     page = Color(0xFFFFFFFF),
     surface = Color(0xFFFFFFFF),
-    surfaceAlt = Color(0xFFFAFAFC),
+    card = Color(0xFFF4F4F7),
+    surfaceAlt = Color(0xFFE9E9EF),
     ink = Color(0xFF16171A),
-    muted = Color(0xFF8C8F98),
-    accent = Color(0xFF6E5BFF),
-    accentSoft = Color(0xFFEFECFF),
+    muted = Color(0xFF6B6F7A),
+    accent = Color(0xFF6252F5),
+    accentSoft = Color(0xFFEEEBFF),
     onAccent = Color(0xFFFFFFFF),
-    border = Color(0xFFF0F0F3),
-    borderStrong = Color(0xFFE0E0E6),
+    border = Color(0xFFE6E6EC),
+    borderStrong = Color(0xFFD6D6DE),
     success = Color(0xFF0B7A45),
-    successSoft = Color(0xFFE7F7EE),
+    successSoft = Color(0xFFE3F5EA),
     warning = Color(0xFF9A5B18),
-    warningSoft = Color(0xFFFFF4E6),
+    warningSoft = Color(0xFFFFF3E3),
     debate = Color(0xFF7A5AF8),
     debateSoft = Color(0xFFF0EDFF),
     error = Color(0xFFB02121),
@@ -137,9 +150,9 @@ private val PurePalette = ArenaPalette(
     heroStart = Color(0xFFFFFFFF),
     heroEnd = Color(0xFFFFFFFF),
     onHero = Color(0xFF16171A),
-    onHeroMuted = Color(0xFF8C8F98),
-    summarySurface = Color(0xFFFCFBFF),
-    summaryBorder = Color(0xFFE7E3FA),
+    onHeroMuted = Color(0xFF6B6F7A),
+    summarySurface = Color(0xFFF3F0FF),
+    summaryBorder = Color(0xFFE2DCFF),
     navSurface = Color(0xFFFFFFFF),
     headingGradient = listOf(Color(0xFF6E5BFF), Color(0xFFB15CFF), Color(0xFFFF6E9C)),
 )
@@ -148,6 +161,7 @@ private val ClearPalette = ArenaPalette(
     isDark = false,
     page = Color(0xFFF2F6FA),
     surface = Color(0xFFFFFFFF),
+    card = Color(0xFFFFFFFF),
     surfaceAlt = Color(0xFFEDF3F7),
     ink = Color(0xFF0F1E29),
     muted = Color(0xFF556B7A),
@@ -177,6 +191,7 @@ private val InkPalette = ArenaPalette(
     isDark = false,
     page = Color(0xFFF4EFE4),
     surface = Color(0xFFFCFAF4),
+    card = Color(0xFFFCFAF4),
     surfaceAlt = Color(0xFFEDE6D8),
     ink = Color(0xFF1B1915),
     muted = Color(0xFF6B6253),
@@ -206,6 +221,7 @@ private val NightPalette = ArenaPalette(
     isDark = true,
     page = Color(0xFF0D1117),
     surface = Color(0xFF161C24),
+    card = Color(0xFF161C24),
     surfaceAlt = Color(0xFF1E2732),
     ink = Color(0xFFE7EEF5),
     muted = Color(0xFF97A5B5),
@@ -235,6 +251,7 @@ private val ElderPalette = ArenaPalette(
     isDark = false,
     page = Color(0xFFFFFFFF),
     surface = Color(0xFFFFFFFF),
+    card = Color(0xFFFFFFFF),
     surfaceAlt = Color(0xFFEFF3F8),
     ink = Color(0xFF000000),
     muted = Color(0xFF35414D),
@@ -264,6 +281,7 @@ private val SunrisePalette = ArenaPalette(
     isDark = false,
     page = Color(0xFFFFF7F1),
     surface = Color(0xFFFFFFFF),
+    card = Color(0xFFFFFFFF),
     surfaceAlt = Color(0xFFFDEDE2),
     ink = Color(0xFF2C1D14),
     muted = Color(0xFF7C6455),
@@ -302,15 +320,16 @@ val ArenaSkin.palette: ArenaPalette
 val ArenaSkin.metrics: ArenaMetrics
     get() = when (this) {
         ArenaSkin.PURE -> ArenaMetrics(
-            cardCorner = 16.dp,
-            controlCorner = 26.dp,
+            cardCorner = 20.dp,
+            controlCorner = 18.dp,
             chipCorner = 999.dp,
             borderWidth = 1.dp,
             cardElevation = 0.dp,
             heroElevation = 0.dp,
             gutter = 20.dp,
-            gap = 14.dp,
+            gap = 12.dp,
             minTouch = 48.dp,
+            rowHeight = 58.dp,
             primaryButtonHeight = 56.dp,
             typeScale = 1.0f,
             heroGradient = false,
@@ -327,6 +346,7 @@ val ArenaSkin.metrics: ArenaMetrics
             gutter = 16.dp,
             gap = 12.dp,
             minTouch = 48.dp,
+            rowHeight = 56.dp,
             primaryButtonHeight = 56.dp,
             typeScale = 1.0f,
             heroGradient = true,
@@ -342,6 +362,7 @@ val ArenaSkin.metrics: ArenaMetrics
             gutter = 18.dp,
             gap = 12.dp,
             minTouch = 48.dp,
+            rowHeight = 56.dp,
             primaryButtonHeight = 56.dp,
             typeScale = 1.02f,
             heroGradient = true,
@@ -357,6 +378,7 @@ val ArenaSkin.metrics: ArenaMetrics
             gutter = 16.dp,
             gap = 12.dp,
             minTouch = 48.dp,
+            rowHeight = 56.dp,
             primaryButtonHeight = 56.dp,
             typeScale = 1.0f,
             heroGradient = true,
@@ -372,6 +394,7 @@ val ArenaSkin.metrics: ArenaMetrics
             gutter = 16.dp,
             gap = 14.dp,
             minTouch = 60.dp,
+            rowHeight = 68.dp,
             primaryButtonHeight = 68.dp,
             typeScale = 1.18f,
             heroGradient = false,
@@ -387,6 +410,7 @@ val ArenaSkin.metrics: ArenaMetrics
             gutter = 16.dp,
             gap = 12.dp,
             minTouch = 50.dp,
+            rowHeight = 58.dp,
             primaryButtonHeight = 58.dp,
             typeScale = 1.04f,
             heroGradient = true,
@@ -394,6 +418,11 @@ val ArenaSkin.metrics: ArenaMetrics
         )
     }
 
+/**
+ * 字号基准整体比 0.6 抬了一档：正文 17sp（iOS 正文的尺寸，也是支付宝默认正文的量级），
+ * 次要文字 15sp，说明文字 13sp。长辈皮肤在此基础上再乘 1.18，正文到 20sp，
+ * 达到工信部适老化规范对"大字"的要求。
+ */
 private fun arenaTypography(metrics: ArenaMetrics): Typography {
     val s = metrics.typeScale
     val heading = metrics.headingFamily
@@ -428,44 +457,44 @@ private fun arenaTypography(metrics: ArenaMetrics): Typography {
         titleSmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(15f),
-            lineHeight = sp(21f),
+            fontSize = sp(15.5f),
+            lineHeight = sp(22f),
         ),
         bodyLarge = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Normal,
-            fontSize = sp(16f),
-            lineHeight = sp(25f),
+            fontSize = sp(17f),
+            lineHeight = sp(26f),
         ),
         bodyMedium = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Normal,
-            fontSize = sp(14f),
-            lineHeight = sp(21f),
+            fontSize = sp(15f),
+            lineHeight = sp(22f),
         ),
         bodySmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Normal,
-            fontSize = sp(12.5f),
-            lineHeight = sp(18f),
+            fontSize = sp(13f),
+            lineHeight = sp(19f),
         ),
         labelLarge = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(15f),
-            lineHeight = sp(20f),
+            fontSize = sp(16f),
+            lineHeight = sp(22f),
         ),
         labelMedium = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(13f),
-            lineHeight = sp(17f),
+            fontSize = sp(13.5f),
+            lineHeight = sp(18f),
         ),
         labelSmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(11.5f),
-            lineHeight = sp(15f),
+            fontSize = sp(12f),
+            lineHeight = sp(16f),
         ),
     )
 }
