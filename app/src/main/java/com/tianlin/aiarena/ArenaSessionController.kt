@@ -166,15 +166,21 @@ class ArenaSessionController(
         return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt)
     }
 
+    /**
+     * @param captain 队长模式下负责整合的那位；null 表示关闭队长模式，各家平等辩论。
+     *   指定的队长这一轮没答上来时，由 [CaptainPolicy.forRound] 顺延给第一位参与者。
+     */
     fun startDebate(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
+        captain: ArenaService? = null,
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
         if (responses.size < 2) return false
         val debateIndex = history.count { it.kind == RoundKind.DEBATE } + 1
         val services = ArenaService.entries.filter { it in responses.keys }
+        val activeCaptain = CaptainPolicy.forRound(captain, services)
         val prompts = linkedMapOf<ArenaService, String>()
         var compressedCount = 0
         services.forEach { target ->
@@ -186,6 +192,7 @@ class ArenaSessionController(
                     debateIndex = debateIndex,
                     guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
                     quoteLimit = quoteLimit,
+                    asCaptain = target == activeCaptain,
                 )
             } ?: run {
                 sessionMessage = "${target.displayName} 上下文超过 ${PromptBudgetPolicy.budgetFor(target)} 字，请缩短原问题或开始新问题"
@@ -1280,6 +1287,14 @@ object QuestionPolicy {
 }
 
 object DebatePromptBuilder {
+    /**
+     * 观点讨论的 prompt。
+     *
+     * [asCaptain] 为 true 时换成"队长版"：不再是又一份平行观点，而是先替用户把几家的说法
+     * 收拢成共识 / 分歧，再给自己的判断。用户可能**只读这一条**，所以要求它能独立读懂。
+     * 参考 Chrome 扩展 AI 圆桌派 `captain-mode.js` 的思路，这里做成整条 prompt 的变体
+     * 而不是前缀拼接 —— 否则结尾"控制在 200 字"会和队长要写的整合内容自相矛盾。
+     */
     fun build(
         originalQuestion: String,
         target: ArenaService,
@@ -1287,22 +1302,42 @@ object DebatePromptBuilder {
         debateIndex: Int = 1,
         guidance: String = "",
         quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
+        asCaptain: Boolean = false,
     ): String {
         val others = PromptSections.otherResponses(target, responses, quoteLimit)
         val guidanceSection = guidance.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
             if (it.isBlank()) "" else "\n\n用户本轮补充要求：\n$it"
         }
-        return """
-            这是观点讨论第 $debateIndex 轮。
-
-            原始问题：
-            $originalQuestion
-
-            以下是其他 AI 的最新回答：
-            $others$guidanceSection
-
-            请逐一讨论这些观点：明确指出你认同和不认同的部分，给出理由，修正可能的错误或遗漏，并形成你这一轮更可靠的结论。不要只复述其他回答。总长度控制在 200 个汉字以内，最后单独给出一句综合结论。
-        """.trimIndent()
+        val opening = if (asCaptain) {
+            "你是这次多 AI 讨论的队长，这是观点讨论第 $debateIndex 轮。"
+        } else {
+            "这是观点讨论第 $debateIndex 轮。"
+        }
+        val closing = if (asCaptain) {
+            "请替用户把信息收拢，按这个顺序写：\n" +
+                "1. 先用 2-4 条要点写清大家的共识，以及分歧在哪、谁和谁不一样。\n" +
+                "2. 指出其中可能有错或被遗漏的地方，说明理由。\n" +
+                "3. 最后给出你作为队长的结论和建议。\n" +
+                "只依据上面真实出现的内容，不要替别人虚构没说过的观点。" +
+                "用户很可能只看你这一条，所以要能独立读懂，不要写「如上所述」「同上」这类话。" +
+                "总长度控制在 400 个汉字以内。"
+        } else {
+            "请逐一讨论这些观点：明确指出你认同和不认同的部分，给出理由，修正可能的错误或遗漏，并形成你这一轮更可靠的结论。不要只复述其他回答。总长度控制在 200 个汉字以内，最后单独给出一句综合结论。"
+        }
+        // 不能用 """…""".trimIndent()：$others / $guidanceSection 是顶格的多行文本，
+        // trimIndent 取的是所有行的公共最小缩进，被这些顶格行拉成 0，模板自己那 12 个空格
+        // 一个都去不掉，最后发出去的 prompt 每行都带前导空白（4 空格以上不少模型会当代码块）。
+        // 直接拼接，所见即所得。
+        return buildString {
+            append(opening)
+            append("\n\n原始问题：\n")
+            append(originalQuestion)
+            append("\n\n以下是其他 AI 的最新回答：\n")
+            append(others)
+            append(guidanceSection)
+            append("\n\n")
+            append(closing)
+        }
     }
 }
 
@@ -1329,25 +1364,24 @@ object DiscussionSummaryPromptBuilder {
         val extra = customInstruction.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
             if (it.isBlank()) "" else "\n\n用户对总结的额外要求：\n$it"
         }
-        return """
-            你是这场多 AI 讨论的主持人，请替普通用户做一份简明总结。
-
-            原始问题：
-            $originalQuestion
-
-            讨论轮次：
-            $roundOutline
-
-            各 AI 最新观点：
-            $viewpoints$extra
-
-            请按以下结构输出，总长度控制在 350 个汉字以内：
-            1. 一句话结论
-            2. 已形成的共识
-            3. 仍有分歧或需要核验的地方
-            4. 给用户的 2-4 条可执行建议
-            不要声称未被上述材料支持的事实。
-        """.trimIndent()
+        // 同 DebatePromptBuilder：插值进来的 $roundOutline / $viewpoints 顶格，
+        // trimIndent() 会失效，必须手拼。
+        return buildString {
+            append("你是这场多 AI 讨论的主持人，请替普通用户做一份简明总结。")
+            append("\n\n原始问题：\n")
+            append(originalQuestion)
+            append("\n\n讨论轮次：\n")
+            append(roundOutline)
+            append("\n\n各 AI 最新观点：\n")
+            append(viewpoints)
+            append(extra)
+            append("\n\n请按以下结构输出，总长度控制在 350 个汉字以内：\n")
+            append("1. 一句话结论\n")
+            append("2. 已形成的共识\n")
+            append("3. 仍有分歧或需要核验的地方\n")
+            append("4. 给用户的 2-4 条可执行建议\n")
+            append("不要声称未被上述材料支持的事实。")
+        }
     }
 }
 

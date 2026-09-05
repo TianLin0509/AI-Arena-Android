@@ -63,6 +63,8 @@ internal fun RoundStage(
     copyText: TextCopyRequest?,
     shareText: TextShareRequest?,
     offline: Boolean,
+    /** 队长模式下负责整合的那位；null = 关闭队长模式，各家平铺显示。 */
+    captain: ArenaService?,
     onNewQuestion: () -> Unit,
 ) {
     val colors = ArenaStyle.colors
@@ -70,6 +72,12 @@ internal fun RoundStage(
     val scope = rememberCoroutineScope()
     val activeServices = selectedServices.filter { sessionController.runs[it]?.requestId?.isNotBlank() == true }
     val trackedServices = activeServices.ifEmpty { selectedServices }
+    // 队长排最前：用户只想看一条时，那一条必须在第一屏。
+    val orderedServices = CaptainPolicy.order(selectedServices, captain)
+    // 只有队长真的整合完了才敢说"看第一条就够"——否则那句话是空头支票。
+    val captainRoundReady = captain != null &&
+        sessionController.currentRoundKind == RoundKind.DEBATE &&
+        sessionController.runs[captain]?.phase == ParticipantPhase.COMPLETE
     val phases = trackedServices.associateWith { sessionController.runs[it]?.phase ?: ParticipantPhase.IDLE }
     val settledCount = phases.values.count { it == ParticipantPhase.COMPLETE || it == ParticipantPhase.ERROR }
     val roundCompleted = phases.values.count { it == ParticipantPhase.COMPLETE }
@@ -206,21 +214,42 @@ internal fun RoundStage(
             }
 
             item(key = "results-title") {
-                Text(
-                    text = "各家的回答",
-                    color = colors.muted,
-                    style = MaterialTheme.typography.labelMedium,
+                Column(
                     modifier = Modifier.padding(start = 6.dp, top = 4.dp),
-                )
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(
+                        text = "各家的回答",
+                        color = colors.muted,
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                    if (captainRoundReady) {
+                        Text(
+                            text = "${captain?.displayName} 已经把大家的观点整合好了，看第一条就够。",
+                            color = colors.accent,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
             }
 
-            items(selectedServices, key = { "run-${it.name}" }) { service ->
+            items(orderedServices, key = { "run-${it.name}" }) { service ->
                 val status = pool.statuses[service] ?: ServiceStatus()
                 val run = sessionController.runs[service] ?: ParticipantRun()
+                val isCaptain = CaptainPolicy.isCaptain(service, captain)
                 ProviderResultCard(
                     service = service,
                     status = status,
                     run = run,
+                    isCaptain = isCaptain,
+                    captainIntegrated = captainRoundReady && isCaptain,
+                    // 队长整合过的那一轮，队友默认收得更短：用户要的是"只看队长那一条"，
+                    // 但仍留一眼能看出讲了什么，想细看点「展开全文」。
+                    collapsedLines = if (captainRoundReady && !isCaptain) {
+                        CaptainPolicy.TEAMMATE_COLLAPSED_LINES
+                    } else {
+                        CaptainPolicy.DEFAULT_COLLAPSED_LINES
+                    },
                     expanded = expandedAnswers[service.name] == true,
                     onExpandedChange = { expandedAnswers[service.name] = it },
                     onClick = { onOpenService(service) },
@@ -272,10 +301,11 @@ internal fun RoundStage(
                             }
                         },
                         onDebate = {
-                            if (sessionController.startDebate(answerMode, roundGuidance)) {
+                            if (sessionController.startDebate(answerMode, roundGuidance, captain)) {
                                 onRoundGuidanceChange("")
                             }
                         },
+                        captainName = captain?.displayName,
                     )
                 }
             }
@@ -331,7 +361,7 @@ internal fun RoundStage(
                             completedCount >= ArenaService.MIN_MEMBERS &&
                             !sessionController.isBusy,
                         onRetry = {
-                            if (sessionController.startSummary(usableServices, roundGuidance)) {
+                            if (sessionController.startSummary(CaptainPolicy.judgePreference(usableServices, captain), roundGuidance)) {
                                 onRoundGuidanceChange("")
                             }
                         },
@@ -352,7 +382,7 @@ internal fun RoundStage(
                             ArenaSecondaryButton(
                                 text = "重新总结",
                                 onClick = {
-                                    if (sessionController.startSummary(usableServices, roundGuidance)) {
+                                    if (sessionController.startSummary(CaptainPolicy.judgePreference(usableServices, captain), roundGuidance)) {
                                         onRoundGuidanceChange("")
                                     }
                                 },
@@ -363,7 +393,7 @@ internal fun RoundStage(
                             ArenaPrimaryButton(
                                 text = "讨论总结",
                                 onClick = {
-                                    if (sessionController.startSummary(usableServices, roundGuidance)) {
+                                    if (sessionController.startSummary(CaptainPolicy.judgePreference(usableServices, captain), roundGuidance)) {
                                         onRoundGuidanceChange("")
                                     }
                                 },
@@ -414,6 +444,7 @@ private fun NextRoundPanel(
     enabled: Boolean,
     onIterate: () -> Unit,
     onDebate: () -> Unit,
+    captainName: String?,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
@@ -424,7 +455,12 @@ private fun NextRoundPanel(
         ) {
             SectionTitle(text = "继续追问")
             Text(
-                text = "「独立迭代」把下面这句话原样发给每家 AI；「观点讨论」会把其他 AI 的观点转给对方，让它们互相评论。",
+                text = if (captainName != null) {
+                    "「观点讨论」会把大家的观点互相转达，并由队长 $captainName 汇总成一条，你看它那条就行。" +
+                        "「独立迭代」则把下面这句话原样发给每家 AI。"
+                } else {
+                    "「独立迭代」把下面这句话原样发给每家 AI；「观点讨论」会把其他 AI 的观点转给对方，让它们互相评论。"
+                },
                 color = colors.muted,
                 style = MaterialTheme.typography.bodySmall,
             )
@@ -485,6 +521,10 @@ private fun ProviderResultCard(
     service: ArenaService,
     status: ServiceStatus,
     run: ParticipantRun,
+    isCaptain: Boolean,
+    /** 队长且本轮整合已完成 —— 只有这时才敢在副标题上说"已整合"。 */
+    captainIntegrated: Boolean,
+    collapsedLines: Int,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onClick: () -> Unit,
@@ -510,7 +550,6 @@ private fun ProviderResultCard(
         },
         label = "result-border",
     )
-    val collapsedLines = 6
     val started = run.requestId.isNotBlank()
     val stalled = run.phase == ParticipantPhase.WAITING && run.detail.contains("迟迟没有回应")
     val failed = run.phase == ParticipantPhase.ERROR && started
@@ -527,14 +566,28 @@ private fun ProviderResultCard(
             ) {
                 BrandAvatar(service = service, size = 34.dp)
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        text = service.displayName,
-                        color = colors.ink,
-                        style = MaterialTheme.typography.titleMedium,
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = service.displayName,
+                            color = colors.ink,
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        if (isCaptain) {
+                            ArenaPill(
+                                text = "队长",
+                                foreground = colors.accent,
+                                background = colors.accentSoft,
+                                dot = false,
+                            )
+                        }
+                    }
                     Text(
                         text = when {
                             failed || stalled -> if (run.response.isNotBlank()) "只收到一部分回答" else "这次没有回答成功"
+                            captainIntegrated -> "已整合大家的观点"
                             started || run.detail != "等待开始" -> run.detail
                             else -> status.detail
                         },
