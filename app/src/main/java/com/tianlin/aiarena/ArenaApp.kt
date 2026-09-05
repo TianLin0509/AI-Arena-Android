@@ -81,7 +81,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -118,6 +120,8 @@ fun ArenaApp(
     stopSpeech: (() -> Unit)? = null,
     copyText: TextCopyRequest? = null,
     shareText: TextShareRequest? = null,
+    /** 用系统浏览器打开外链（下载新版 APK）。返回 false 表示没有可用浏览器。 */
+    openExternalUrl: ((String) -> Boolean)? = null,
     skin: ArenaSkin = ArenaSkin.default,
     onSkinChange: (ArenaSkin) -> Unit = {},
 ) {
@@ -133,6 +137,37 @@ fun ArenaApp(
     var crashReportGeneration by remember { mutableIntStateOf(0) }
     val crashReport = remember(context, crashReportGeneration) {
         runCatching { ArenaCrashReporter.latest(context) }.getOrNull()
+    }
+    // 应用内更新检查：自动一天最多一次，设置页手动点不限。结果只放内存，
+    // 下次冷启动到点了会再查。网络请求在 IO 线程，主线程只收结果。
+    var updateResult by remember { mutableStateOf(ArenaUpdateChecker.cachedResult(context)) }
+    var updateChecking by remember { mutableStateOf(false) }
+    var dismissedUpdateCode by remember { mutableIntStateOf(ArenaUpdateChecker.dismissedVersionCode(context)) }
+    val updateScope = rememberCoroutineScope()
+    val checkForUpdate: (Boolean) -> Unit = { manual ->
+        if (!updateChecking) {
+            updateChecking = true
+            updateScope.launch {
+                val result = withContext(Dispatchers.IO) { ArenaUpdateChecker.fetch(cacheInto = context) }
+                updateResult = result
+                updateChecking = false
+                if (!manual) ArenaUpdateChecker.markAutoChecked(context)
+            }
+        }
+    }
+    LaunchedEffect(Unit) {
+        if (ArenaUpdateChecker.shouldAutoCheck(context)) checkForUpdate(false)
+    }
+    val availableUpdate = (updateResult as? ArenaUpdateResult.Available)?.info
+    val installUpdate: (ArenaUpdateInfo) -> Unit = { info ->
+        // 打不开浏览器就退回下载页地址；至少让用户能复制链接
+        if (openExternalUrl?.invoke(info.apkUrl) != true) {
+            openExternalUrl?.invoke(ArenaUpdateChecker.DOWNLOAD_PAGE_URL)
+        }
+    }
+    val dismissUpdate: (ArenaUpdateInfo) -> Unit = { info ->
+        ArenaUpdateChecker.dismiss(context, info.versionCode)
+        dismissedUpdateCode = info.versionCode
     }
     var largeTextEnabled by rememberSaveable {
         mutableStateOf(accessibilityPreferences.isLargeTextEnabled())
@@ -300,6 +335,12 @@ fun ArenaApp(
                             ArenaCrashReporter.clear(context)
                             crashReportGeneration += 1
                         },
+                        updateResult = updateResult,
+                        updateChecking = updateChecking,
+                        bannerUpdate = availableUpdate?.takeIf { it.versionCode != dismissedUpdateCode },
+                        onCheckUpdate = { checkForUpdate(true) },
+                        onInstallUpdate = installUpdate,
+                        onDismissUpdate = dismissUpdate,
                     )
                 } else {
                     ProviderHeader(
@@ -341,6 +382,13 @@ private fun RoundtableRoot(
     onSkinChange: (ArenaSkin) -> Unit,
     crashReport: ArenaCrashReport?,
     onClearCrashReport: () -> Unit,
+    updateResult: ArenaUpdateResult?,
+    updateChecking: Boolean,
+    /** 首页横幅只展示未被「以后」掉的新版本；设置页始终展示。 */
+    bannerUpdate: ArenaUpdateInfo?,
+    onCheckUpdate: () -> Unit,
+    onInstallUpdate: (ArenaUpdateInfo) -> Unit,
+    onDismissUpdate: (ArenaUpdateInfo) -> Unit,
 ) {
     val usableCount = selectedServices.count {
         pool.statuses[it]?.state?.isUsable() == true
@@ -369,6 +417,12 @@ private fun RoundtableRoot(
             onSkinChange = onSkinChange,
             crashReport = crashReport,
             onClearCrashReport = onClearCrashReport,
+            updateResult = updateResult,
+            updateChecking = updateChecking,
+            bannerUpdate = bannerUpdate,
+            onCheckUpdate = onCheckUpdate,
+            onInstallUpdate = onInstallUpdate,
+            onDismissUpdate = onDismissUpdate,
         )
     } else {
         ConnectionGuide(
@@ -621,6 +675,12 @@ private fun DiscussionHome(
     onSkinChange: (ArenaSkin) -> Unit,
     crashReport: ArenaCrashReport?,
     onClearCrashReport: () -> Unit,
+    updateResult: ArenaUpdateResult?,
+    updateChecking: Boolean,
+    bannerUpdate: ArenaUpdateInfo?,
+    onCheckUpdate: () -> Unit,
+    onInstallUpdate: (ArenaUpdateInfo) -> Unit,
+    onDismissUpdate: (ArenaUpdateInfo) -> Unit,
 ) {
     var question by rememberSaveable {
         mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion })
@@ -747,6 +807,10 @@ private fun DiscussionHome(
                         }
                     }
                 },
+                updateResult = updateResult,
+                updateChecking = updateChecking,
+                onCheckUpdate = onCheckUpdate,
+                onInstallUpdate = onInstallUpdate,
                 largeTextEnabled = largeTextEnabled,
                 onLargeTextChange = onLargeTextChange,
                 speechState = speechState,
@@ -802,6 +866,9 @@ private fun DiscussionHome(
                     voiceInputActive = voiceInputState?.active == true,
                     voiceInputEnabled = voiceInputRequest != null,
                     onVoiceInput = { voiceInputRequest?.invoke() },
+                    availableUpdate = bannerUpdate,
+                    onInstallUpdate = onInstallUpdate,
+                    onDismissUpdate = onDismissUpdate,
                     onStart = {
                         expandedAnswers.clear()
                         if (sessionController.startInitial(question, usableServices, answerMode)) {
@@ -871,6 +938,9 @@ private fun AskHome(
     voiceInputEnabled: Boolean,
     onVoiceInput: () -> Unit,
     onStart: () -> Unit,
+    availableUpdate: ArenaUpdateInfo? = null,
+    onInstallUpdate: (ArenaUpdateInfo) -> Unit = {},
+    onDismissUpdate: (ArenaUpdateInfo) -> Unit = {},
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
@@ -987,6 +1057,45 @@ private fun AskHome(
                 .padding(horizontal = metrics.gutter, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(metrics.gap),
         ) {
+            if (availableUpdate != null) {
+                ArenaCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = colors.accentSoft,
+                    borderColor = colors.accent,
+                ) {
+                    Row(
+                        modifier = Modifier.padding(start = 14.dp, end = 6.dp, top = 10.dp, bottom = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = "新版本 v${availableUpdate.versionName} 可以安装",
+                                color = colors.accent,
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Text(
+                                text = availableUpdate.notes.ifBlank { "覆盖安装，已登录的 AI 不用重新登录" },
+                                color = colors.muted,
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        ArenaTextAction(
+                            text = "安装",
+                            onClick = { onInstallUpdate(availableUpdate) },
+                            contentDescriptionText = "下载并安装新版本",
+                        )
+                        ArenaTextAction(
+                            text = "以后",
+                            onClick = { onDismissUpdate(availableUpdate) },
+                            color = colors.muted,
+                            contentDescriptionText = "暂不更新",
+                        )
+                    }
+                }
+            }
             QuestionComposer(
                 question = question,
                 onQuestionChange = onQuestionChange,
@@ -2080,6 +2189,10 @@ private fun RoundtableSettingsPage(
     crashReport: ArenaCrashReport?,
     onClearCrashReport: () -> Unit,
     onShareCrashReport: ((ArenaCrashReport) -> Unit)?,
+    updateResult: ArenaUpdateResult?,
+    updateChecking: Boolean,
+    onCheckUpdate: () -> Unit,
+    onInstallUpdate: (ArenaUpdateInfo) -> Unit,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
     speechState: SpeechPlaybackState?,
@@ -2211,6 +2324,54 @@ private fun RoundtableSettingsPage(
                                     contentDescriptionText = "清除崩溃记录",
                                 )
                             }
+                        }
+                    }
+                }
+            }
+            item(key = "update") {
+                val available = (updateResult as? ArenaUpdateResult.Available)?.info
+                ArenaCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = if (available != null) colors.accentSoft else colors.surface,
+                    borderColor = if (available != null) colors.accent else colors.border,
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = if (available != null) "有新版本 v${available.versionName}" else "版本更新",
+                            color = if (available != null) colors.accent else colors.ink,
+                            style = MaterialTheme.typography.titleSmall,
+                        )
+                        Text(
+                            text = when (val result = updateResult) {
+                                null -> if (updateChecking) "正在检查…" else "当前 v${BuildConfig.VERSION_NAME}。新版本发布在自建站上，不经过应用商店。"
+                                is ArenaUpdateResult.Available -> listOfNotNull(
+                                    result.info.sizeLabel.takeIf { it.isNotBlank() }?.let { "大小 $it" },
+                                    result.info.releasedAt.takeIf { it.isNotBlank() }?.let { "发布于 $it" },
+                                    result.info.notes.takeIf { it.isNotBlank() },
+                                ).joinToString(" · ").ifBlank { "覆盖安装，已登录的 AI 不用重新登录" }
+                                is ArenaUpdateResult.UpToDate -> "已是最新版本 v${BuildConfig.VERSION_NAME}"
+                                is ArenaUpdateResult.Failed -> result.reason
+                            },
+                            color = colors.muted,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                            if (available != null) {
+                                ArenaTextAction(
+                                    text = "下载安装",
+                                    onClick = { onInstallUpdate(available) },
+                                    contentDescriptionText = "下载并安装新版本",
+                                )
+                            }
+                            ArenaTextAction(
+                                text = if (updateChecking) "检查中…" else "检查更新",
+                                onClick = onCheckUpdate,
+                                color = colors.muted,
+                                contentDescriptionText = "检查是否有新版本",
+                            )
                         }
                     }
                 }

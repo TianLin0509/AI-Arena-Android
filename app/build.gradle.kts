@@ -27,8 +27,8 @@ android {
         applicationId = "com.tianlin.aiarena"
         minSdk = 26
         targetSdk = 36
-        versionCode = 7
-        versionName = "0.5.2"
+        versionCode = 9
+        versionName = "0.6.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -103,6 +103,8 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    // JVM 单测里 android.jar 的 org.json 是桩（一调就抛 "not mocked"），拿真实现来跑解析测试。
+    testImplementation("org.json:json:20250107")
     androidTestImplementation("androidx.test:core:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test:runner:1.7.0")

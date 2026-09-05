@@ -2,6 +2,44 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.6.1] - 2026-09-04
+
+真机验证 0.6.0 时发现的两处：
+
+### Fixed
+
+- **看到新版本提示后重启 App，提示就没了**。检查结果原来只放内存，自动检查又是一天一次，
+  用户退出再进要等到明天才会再看到。现在成功拿到清单就缓存，启动时先按缓存显示，再按节奏刷新；
+  点过「以后」的版本号仍按记录不再在首页打扰。
+- 设置页更新卡片的标题和按钮都叫「检查更新」，有歧义（自动化点中了不可点的标题）。标题改为「版本更新」。
+
+### Verification
+
+- JVM 88/88 PASS，Lint 0 条问题。
+## [0.6.0] - 2026-09-04
+
+应用内自动检查更新 + 自建站发布渠道。这个 App 走不了应用商店（核心机制是驱动六家网页版，
+商店审核过不去），家人靠 APK 直装，于是「怎么知道有新版」是真正的痛点。
+
+### Added
+
+- **应用内更新检查**（`ArenaUpdateChecker`）。启动时最多一天自动查一次，设置页可随时手动查。
+  读自建站上的 `https://ai.lt-stockpartner.tech/android/version.json`，只比对 `versionCode`
+  （单调递增，不解析版本号字符串）。有新版本时首页出横幅（可点「以后」按版本号记住不再打扰），
+  设置页始终显示更新卡片；「安装」用系统浏览器打开 APK 直链，同签名覆盖安装，登录态保留。
+  只用 `HttpURLConnection` + `org.json`，不为一个请求引 OkHttp 把包撑大；`apkUrl` 强制 https。
+- **自建站下载页** `https://ai.lt-stockpartner.tech/android/`：备案域名 + 国内 ECS，微信里能打开
+  （微信内不能直接下 APK，页面上写明「右上角 → 在浏览器打开」）。带二维码、安装步骤、SHA-256。
+- 发布脚本 `C:/Users/lintian/.ecs_android_publish.py`（仓库外，与其它 `.ecs_*.py` 同一套约定）：
+  `aapt2` 读包内真实 versionCode/versionName、算 sha256、生成 version.json + 下载页，SFTP 到
+  stage 目录后原子换名上线，不动 caddy 进程；上线后回读 version.json 与 APK 的 Content-Length 校验。
+- JVM 单测加 `org.json:json` 真实现：`android.jar` 里的 org.json 是桩，一调就抛 "not mocked"，
+  此前 3 个「应抛异常」的用例其实是靠桩抛的异常假通过。
+
+### Verification
+
+- JVM 88/88 PASS（新增 `ArenaUpdateCheckerTest` 7 项），Lint 0 条问题。
+- 发布脚本 dry-run：versionCode/versionName 从包内读出、下载页零外链、二维码内联 SVG。
 ## [0.5.2] - 2026-09-04
 
 三个真机用出来的问题：答案被截、输入框被压住、历史打不开。

@@ -86,6 +86,7 @@ class MainActivity : ComponentActivity() {
                     stopSpeech = speechController::stop,
                     copyText = ::copyText,
                     shareText = ::shareText,
+                    openExternalUrl = ::openExternalUrl,
                     skin = skin,
                     onSkinChange = { next ->
                         skin = next
@@ -177,6 +178,19 @@ class MainActivity : ComponentActivity() {
         return try {
             clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
             true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** 用系统浏览器打开外链（下载新版 APK 用）。没有浏览器时返回 false，由界面自己提示。 */
+    fun openExternalUrl(url: String): Boolean {
+        if (!url.startsWith("https://")) return false
+        return try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
         } catch (_: Exception) {
             false
         }
