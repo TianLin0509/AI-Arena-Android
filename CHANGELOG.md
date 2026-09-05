@@ -2,6 +2,27 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.6.2] - 2026-09-04
+
+围绕一个问题：**升级之后登录态不能丢**。登录态存在 WebView 的 Cookie 库里，随 App 数据活着；
+只要包名、签名密钥、versionCode 递增三件事不变，覆盖升级就不会碰它。这版把能加的保障都加上。
+
+### Added
+
+- `android:hasFragileUserData="true"`：万一用户（或签名不一致时）不得不卸载，Android 10+ 会弹出
+  「是否保留应用数据」——选保留，重装后登录态还在。
+- 退后台时 `CookieManager.flush()`：WebView 的 Cookie 是异步落盘的，刚登录完就被系统杀进程，
+  登录态可能还没写到磁盘。此前代码里没有任何一处 flush。
+- 发布脚本加两道硬闸门（仓库外 `.ecs_android_publish.py`）：APK 的签名证书 SHA-256 必须等于
+  release 证书指纹（防止把 debug 签名或换了钥匙的包发出去——那会让所有已装用户被迫卸载重装）；
+  versionCode 必须大于线上正在发布的版本（防止发一个装不上的"降级"）。
+- 下载页明确写「直接覆盖安装，不要先卸载旧版，卸载会丢登录」。
+
+### Verification
+
+- 真机（API 34）从 code 9 覆盖升级到 code 10：WebView `Cookies` 库 md5 升级前后一致，
+  `firstInstallTime` 不变、`lastUpdateTime` 更新 —— 数据目录未被触碰。
+- 代码审计：全工程没有任何调用会清 Cookie（`removeAllCookies` / `clearCache` 等均不存在）。
 ## [0.6.1] - 2026-09-04
 
 真机验证 0.6.0 时发现的两处：

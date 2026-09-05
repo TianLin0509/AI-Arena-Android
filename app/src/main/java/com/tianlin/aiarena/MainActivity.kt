@@ -11,6 +11,7 @@ import android.os.Bundle
 import android.speech.RecognizerIntent
 import android.util.Base64
 import android.webkit.ValueCallback
+import android.webkit.CookieManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
@@ -110,6 +111,9 @@ class MainActivity : ComponentActivity() {
         // 退到后台时挂起全部 WebView：3-4 个聊天页各自的定时器、动画和轮询
         // 会持续耗电，也会加剧渲染进程被系统回收的概率。
         if (::webViewPool.isInitialized && !isChangingConfigurations) webViewPool.pauseAll()
+        // WebView 的 Cookie 是异步落盘的：刚登录完就被系统杀进程，登录态可能还没写到磁盘。
+        // 退后台这一刻强制刷一次，登录态就不会"莫名其妙没了"。
+        runCatching { CookieManager.getInstance().flush() }
     }
 
     override fun onDestroy() {
