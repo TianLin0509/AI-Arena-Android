@@ -503,9 +503,9 @@ internal fun RoundtableSettingsPage(
     }
 }
 
-/** 唯一允许的弹窗：只用于"清除 / 重启"这两个需要再确认一下的动作。 */
+/** 唯一允许的弹窗：只用于"清除 / 重启 / 放弃本轮"这几个需要再确认一下的动作。 */
 @Composable
-private fun ConfirmDialog(
+internal fun ConfirmDialog(
     title: String,
     text: String,
     confirmLabel: String,

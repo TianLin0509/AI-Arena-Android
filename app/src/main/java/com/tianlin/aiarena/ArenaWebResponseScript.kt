@@ -128,8 +128,13 @@ internal object ArenaWebResponseScript {
                   while (assistant && !String(assistant.className).includes('chat-content-item-assistant')) {
                     assistant = assistant.nextElementSibling;
                   }
-                  const finalBlocks = assistant ? Array.from(assistant.querySelectorAll('.markdown-container:not(.toolcall-content-text)')).filter(function(item) {
-                    return !item.closest('[class*=toolcall], [class*=thinking], [class*=thought]');
+                  // 2026-09 起 Kimi 把整条回答（含思考过程）都包在 .toolcall-rollup 里，
+                  // 原来按 [class*=toolcall] 一刀切会把真正的答案也排掉，抓不到一个字。
+                  // 思考块的特征是 .toolcall-container.thinking-container / .toolcall-flow / .toolcall-content，
+                  // 只排这些，rollup 外壳不算。
+                  const finalBlocks = assistant ? Array.from(assistant.querySelectorAll('.markdown-container')).filter(function(item) {
+                    if (item.classList.contains('toolcall-content-text')) return false;
+                    return !item.closest('.toolcall-container, .thinking-container, .toolcall-flow, .toolcall-content, [class*=thinking], [class*=thought]');
                   }) : [];
                   // finalBlocks 已经限定在本轮那条 assistant 节点内部，整段拼接是安全的。
                   // 原来这里 .pop() 只取最后一块，Kimi 把回答拆成多个 markdown-container 时

@@ -57,6 +57,10 @@ class ArenaSessionController(
     var sessionServices by mutableStateOf(ArenaService.defaultMembers)
         private set
 
+    /** 当前这一轮实际负责整合的队长；null = 这一轮没开队长模式（或还没开轮）。 */
+    var currentRoundCaptain by mutableStateOf<ArenaService?>(null)
+        private set
+
     var storageWarning by mutableStateOf<String?>(null)
         private set
 
@@ -89,6 +93,8 @@ class ArenaSessionController(
     private var requestSequence = 0L
     private var sessionId = ""
     private var lastRoundPrompts: Map<ArenaService, String> = emptyMap()
+    /** 各家网页里这条讨论对应的对话地址；打开历史会话时用它把网页切回去。 */
+    private val conversationUrls = mutableMapOf<ArenaService, String>()
     private var currentRoundContextNotice = ""
     private val persistRunnable = Runnable { persistNow() }
 
@@ -133,6 +139,7 @@ class ArenaSessionController(
         history.clear()
         summary = DiscussionSummary()
         lastRoundPrompts = emptyMap()
+        conversationUrls.clear()
         currentRoundContextNotice = ""
         roundNumber = 0
         originalQuestion = normalizedQuestion
@@ -201,7 +208,7 @@ class ArenaSessionController(
             prompts[target] = budgeted.text
             if (budgeted.compressed) compressedCount += 1
         }
-        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, guidance)
+        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, guidance, captain = activeCaptain)
         if (started && compressedCount > 0) {
             currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
             sessionMessage += " · $currentRoundContextNotice"
@@ -334,7 +341,11 @@ class ArenaSessionController(
             if (!run.phase.isTerminal()) {
                 runs[service] = run.copy(
                     phase = ParticipantPhase.ERROR,
-                    detail = "已停止等待；网页可能仍在生成",
+                    detail = if (run.phase == ParticipantPhase.QUEUED) {
+                        "已停止，这一家还没来得及发送"
+                    } else {
+                        "已停止等待；网页可能仍在生成"
+                    },
                 )
             }
         }
@@ -360,6 +371,7 @@ class ArenaSessionController(
         recoveryExecution = null
         stage = SessionStage.IDLE
         currentRoundKind = null
+        currentRoundCaptain = null
         currentAnswerMode = AnswerMode.PARALLEL
         roundNumber = 0
         originalQuestion = ""
@@ -367,6 +379,7 @@ class ArenaSessionController(
         history.clear()
         summary = DiscussionSummary()
         lastRoundPrompts = emptyMap()
+        conversationUrls.clear()
         currentRoundContextNotice = ""
         sessionServices = ArenaService.defaultMembers
         storageWarning = null
@@ -412,6 +425,7 @@ class ArenaSessionController(
         persistGeneration += 1
         applySnapshot(snapshot, recovered = false)
         repository.setActiveSession(snapshot.id)
+        reopenConversations()
         schedulePersist()
         return if (interrupted) RestoreOutcome.OK_AFTER_STOP else RestoreOutcome.OK
     }
@@ -422,6 +436,7 @@ class ArenaSessionController(
         prompts: Map<ArenaService, String>,
         answerMode: AnswerMode,
         guidance: String,
+        captain: ArenaService? = null,
     ): Boolean {
         if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
 
@@ -432,6 +447,7 @@ class ArenaSessionController(
         currentRoundContextNotice = ""
         roundNumber += 1
         currentRoundKind = kind
+        currentRoundCaptain = captain
         currentAnswerMode = answerMode
         stage = when (kind) {
             RoundKind.INITIAL -> SessionStage.INITIAL
@@ -441,14 +457,6 @@ class ArenaSessionController(
         sessionMessage = when (answerMode) {
             AnswerMode.PARALLEL -> "正在快速发送第 $roundNumber 轮，${services.size} 家将并行生成"
             AnswerMode.SERIAL -> "正在串行执行第 $roundNumber 轮"
-        }
-
-        ArenaService.entries.forEach { service ->
-            runs[service] = if (service in services) {
-                ParticipantRun(ParticipantPhase.IDLE, detail = "等待发送")
-            } else {
-                ParticipantRun(ParticipantPhase.IDLE, detail = "本轮未参与")
-            }
         }
 
         val dispatchOrder = when (answerMode) {
@@ -465,16 +473,92 @@ class ArenaSessionController(
             prompts = prompts,
             guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
             startedAtMillis = System.currentTimeMillis(),
+            requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
+            captain = captain,
         )
+        // 点下按钮的这一刻，所有参与者一起进入"已排队"：网页池只能逐家发送，
+        // 以前排在后面的成员要等前面发完才有动静，用户以为只有第一家收到了命令。
+        ArenaService.entries.forEach { service ->
+            runs[service] = if (service in services) {
+                ParticipantRun(
+                    phase = ParticipantPhase.QUEUED,
+                    requestId = execution.requestIds.getValue(service),
+                    detail = queuedDetail(execution, service),
+                )
+            } else {
+                ParticipantRun(ParticipantPhase.IDLE, detail = "本轮未参与")
+            }
+        }
         lastRoundPrompts = prompts.mapValues { (_, prompt) -> prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS) }
         activeExecution = execution
         pool.setProtectedServices(services.toSet())
         schedulePersist()
-        when (answerMode) {
-            AnswerMode.PARALLEL -> dispatchParallel(execution)
-            AnswerMode.SERIAL -> dispatchSerialNext(execution)
+        val dispatch = {
+            when (answerMode) {
+                AnswerMode.PARALLEL -> dispatchParallel(execution)
+                AnswerMode.SERIAL -> dispatchSerialNext(execution)
+            }
+        }
+        if (kind == RoundKind.INITIAL) {
+            // 新问题必须发进干净的新对话，否则 AI 带着上一题的上下文作答
+            prepareFreshConversations(execution, dispatch)
+        } else {
+            dispatch()
         }
         return true
+    }
+
+    /** 排队中的成员显示自己排在第几位，让"还没轮到"和"卡住了"能区分开。 */
+    private fun queuedDetail(execution: RoundExecution, service: ArenaService): String {
+        val position = execution.dispatchOrder.indexOf(service) + 1
+        return when {
+            position <= 1 -> "已收到，马上发送"
+            execution.answerMode == AnswerMode.SERIAL -> "已收到，等上一家答完再发"
+            else -> "已收到，排第 $position 位发送"
+        }
+    }
+
+    /**
+     * 让每家网页先回到新对话，都就绪（或超时）后再开始发送。
+     * 页面加载互不影响，所以是同时发起、一起等，不会把新问题的启动时间乘以成员数。
+     */
+    private fun prepareFreshConversations(execution: RoundExecution, then: () -> Unit) {
+        val pending = execution.services.toMutableSet()
+        var finished = false
+        val proceed = {
+            if (!finished && isActive(execution)) {
+                finished = true
+                execution.services.forEach { service ->
+                    val run = runs.getValue(service)
+                    if (run.phase == ParticipantPhase.QUEUED) {
+                        runs[service] = run.copy(detail = queuedDetail(execution, service))
+                    }
+                }
+                then()
+            }
+        }
+        execution.services.forEach { service ->
+            runs[service] = runs.getValue(service).copy(detail = "已收到，正在打开新对话…")
+            pool.openFreshConversation(service) {
+                if (!isActive(execution)) return@openFreshConversation
+                pending.remove(service)
+                if (pending.isEmpty()) proceed()
+            }
+        }
+        // 网页池自己有加载超时；这里再兜一层，防止某个回调彻底丢失把整轮卡死
+        handler.postDelayed({ proceed() }, FRESH_CONVERSATION_TIMEOUT_MILLIS)
+    }
+
+    private fun rememberConversationUrl(service: ArenaService) {
+        val url = pool.conversationUrl(service)
+        if (url.isNotBlank()) conversationUrls[service] = url
+    }
+
+    /** 把各家网页切回这条讨论当时的对话。返回切了几家。 */
+    private fun reopenConversations(): Int {
+        val targets = conversationUrls.filterKeys { it in sessionServices }
+        targets.forEach { (service, url) -> pool.openConversation(service, url) { } }
+        return targets.size
     }
 
     private fun startRecovery(
@@ -717,7 +801,7 @@ class ArenaSessionController(
         onSendFinished: (Boolean) -> Unit,
     ) {
         if (!isActive(execution)) return
-        val requestId = buildRequestId(execution, service)
+        val requestId = execution.requestIds.getValue(service)
         runs[service] = ParticipantRun(
             phase = ParticipantPhase.SENDING,
             requestId = requestId,
@@ -757,6 +841,7 @@ class ArenaSessionController(
                     requestId = requestId,
                     detail = "等待回答",
                 )
+                rememberConversationUrl(service)
                 startPolling(execution, service, requestId)
             } else {
                 runs[service] = ParticipantRun(
@@ -911,6 +996,7 @@ class ArenaSessionController(
     ) {
         if (!isActive(execution)) return
         runs[service] = terminalRun
+        if (terminalRun.phase == ParticipantPhase.COMPLETE) rememberConversationUrl(service)
         schedulePersist()
         pollStates.remove(service)
         if (execution.answerMode == AnswerMode.SERIAL) {
@@ -938,6 +1024,7 @@ class ArenaSessionController(
             results = results,
             startedAtMillis = execution.startedAtMillis,
             finishedAtMillis = System.currentTimeMillis(),
+            captain = execution.captain,
         )
         while (history.size > ArenaLimits.MAX_HISTORY_ROUNDS) history.removeAt(0)
         val completed = results.values.count { it.phase == ParticipantPhase.COMPLETE }
@@ -1069,6 +1156,8 @@ class ArenaSessionController(
             history = history.toList(),
             summary = summary,
             lastRoundPrompts = lastRoundPrompts,
+            conversationUrls = conversationUrls.toMap(),
+            currentRoundCaptain = currentRoundCaptain,
             updatedAtMillis = System.currentTimeMillis(),
         )
     }
@@ -1125,6 +1214,7 @@ class ArenaSessionController(
         originalQuestion = snapshot.originalQuestion
         roundNumber = maxOf(snapshot.roundNumber, snapshot.history.maxOfOrNull { it.number } ?: 0)
         currentRoundKind = snapshot.currentRoundKind ?: snapshot.history.lastOrNull()?.kind
+        currentRoundCaptain = snapshot.currentRoundCaptain ?: snapshot.history.lastOrNull()?.captain
         currentAnswerMode = snapshot.currentAnswerMode
         sessionServices = snapshot.services.distinct().let { services ->
             if (services.size in ArenaService.MIN_MEMBERS..ArenaService.MAX_MEMBERS) services else ArenaService.defaultMembers
@@ -1136,6 +1226,8 @@ class ArenaSessionController(
         }
         summary = recoverSummary(snapshot.summary)
         lastRoundPrompts = snapshot.lastRoundPrompts
+        conversationUrls.clear()
+        conversationUrls.putAll(snapshot.conversationUrls)
         currentRoundContextNotice = ""
         stage = if (originalQuestion.isBlank()) SessionStage.IDLE else SessionStage.READY
         sessionMessage = if (recovered) {
@@ -1145,11 +1237,16 @@ class ArenaSessionController(
         }
         storageWarning = null
         refreshRecentSessions()
-        if (recovered) schedulePersist(immediate = true)
+        if (recovered) {
+            // 冷启动恢复：网页此时还是站点首页，接着讨论会发进一条空对话里；切回当时那条
+            reopenConversations()
+            schedulePersist(immediate = true)
+        }
     }
 
     private fun recoverRun(run: ParticipantRun): ParticipantRun =
-        if (run.phase == ParticipantPhase.SENDING ||
+        if (run.phase == ParticipantPhase.QUEUED ||
+            run.phase == ParticipantPhase.SENDING ||
             run.phase == ParticipantPhase.WAITING ||
             run.phase == ParticipantPhase.STREAMING
         ) {
@@ -1189,9 +1286,9 @@ class ArenaSessionController(
         }
         .toMap()
 
-    private fun buildRequestId(execution: RoundExecution, service: ArenaService): String {
+    private fun buildRequestId(kind: RoundKind, number: Int, service: ArenaService): String {
         requestSequence += 1
-        return "${execution.kind.name.lowercase()}_${execution.number}_${requestSequence}_${service.name.lowercase()}_${System.currentTimeMillis()}"
+        return "${kind.name.lowercase()}_${number}_${requestSequence}_${service.name.lowercase()}_${System.currentTimeMillis()}"
     }
 
     private fun isActive(execution: RoundExecution): Boolean =
@@ -1220,6 +1317,9 @@ class ArenaSessionController(
         val prompts: Map<ArenaService, String>,
         val guidance: String,
         val startedAtMillis: Long,
+        /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示"已排队"。 */
+        val requestIds: Map<ArenaService, String>,
+        val captain: ArenaService? = null,
         var nextDispatchIndex: Int = 0,
         var dispatchComplete: Boolean = false,
     )
@@ -1266,6 +1366,8 @@ class ArenaSessionController(
 
         /** 单家发送的端到端上限，比 WebView 池自身的看门狗更宽，只做最后兜底。 */
         const val SEND_HARD_TIMEOUT_MILLIS = 60_000L
+        /** 新问题前等各家网页开好新对话的上限；超时就直接发，发不进去会走原有的失败路径。 */
+        const val FRESH_CONVERSATION_TIMEOUT_MILLIS = 25_000L
 
         /** 超过这个秒数还一个字都没读到，就把文案换成可操作的排查提示。 */
         const val STALL_HINT_SECONDS = 75L

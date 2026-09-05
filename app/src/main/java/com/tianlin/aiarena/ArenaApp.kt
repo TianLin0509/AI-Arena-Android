@@ -111,6 +111,11 @@ fun ArenaApp(
         network.start()
         onDispose { network.stop() }
     }
+    // 网络恢复后把当时没加载出来的网页重载一遍：家人看到"网络没有连上"消失，
+    // 接着点「重发」就能直接发，不用先去「打开网页」手动刷新。
+    LaunchedEffect(network.isOnline) {
+        if (network.isOnline) pool.reloadFailed()
+    }
     // 只在启动时读一次；清除后用这个计数触发重读。
     var crashReportGeneration by remember { mutableIntStateOf(0) }
     val crashReport = remember(context, crashReportGeneration) {
@@ -1062,13 +1067,15 @@ internal fun RunStatusPill(phase: ParticipantPhase) {
     val colors = ArenaStyle.colors
     val (background, foreground, label) = when (phase) {
         ParticipantPhase.IDLE -> Triple(colors.surfaceAlt, colors.muted, "等待")
+        ParticipantPhase.QUEUED -> Triple(colors.accentSoft, colors.accent, "已排队")
         ParticipantPhase.SENDING -> Triple(colors.accentSoft, colors.accent, "发送中")
         ParticipantPhase.WAITING -> Triple(colors.accentSoft, colors.accent, "等待回答")
         ParticipantPhase.STREAMING -> Triple(colors.accentSoft, colors.accent, "回答中")
         ParticipantPhase.COMPLETE -> Triple(colors.successSoft, colors.success, "完成")
         ParticipantPhase.ERROR -> Triple(colors.errorSoft, colors.error, "没成功")
     }
-    val pulsing = phase == ParticipantPhase.SENDING ||
+    val pulsing = phase == ParticipantPhase.QUEUED ||
+        phase == ParticipantPhase.SENDING ||
         phase == ParticipantPhase.WAITING ||
         phase == ParticipantPhase.STREAMING
     ArenaPill(text = label, foreground = foreground, background = background, pulsing = pulsing)

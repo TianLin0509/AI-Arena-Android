@@ -162,6 +162,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         return targets.size
     }
 
+    /**
+     * 只重载"上次没加载出来"的网页（多半是当时没网）。网络恢复时由界面层调用，
+     * 不动正在自动化的那一页，也不动加载正常的页面。返回重载了几家。
+     */
+    fun reloadFailed(): Int {
+        if (destroyed) return 0
+        val failed = webViews.keys.filter { service ->
+            service != automationService && statuses[service]?.state == ConnectionState.ERROR
+        }
+        failed.forEach { service -> webViews[service]?.reload() }
+        return failed.size
+    }
+
     fun canGoBack(service: ArenaService): Boolean = webViews[service]?.canGoBack() == true
 
     fun goBack(service: ArenaService): Boolean {
@@ -174,6 +187,73 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** 由控制器在开轮/收轮时告知，哪些成员的 WebView 现在不能回收。 */
     override fun setProtectedServices(services: Set<ArenaService>) {
         protectedServices = services
+    }
+
+    // -----------------------------------------------------------------------
+    // 对话级导航：新问题开新对话 / 历史会话切回当时的对话
+    // -----------------------------------------------------------------------
+
+    /**
+     * 自上次由我们发起的页面加载以来，这个网页里有没有发出过消息。
+     * 站点在第一条消息后用 pushState 换地址，不会触发 onPageStarted，所以只能自己记。
+     */
+    private val sentSinceLoad = mutableSetOf<ArenaService>()
+
+    /** 等某个 WebView 完成一次由我们发起的加载；onPageFinished 时兑现。 */
+    private val pendingLoads = mutableMapOf<ArenaService, (Boolean) -> Unit>()
+
+    override fun conversationUrl(service: ArenaService): String =
+        webViews[service]?.url.orEmpty().takeIf { it.startsWith("https://") }.orEmpty()
+
+    override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) {
+        if (destroyed) return callback(false)
+        val webView = ensureWebView(service) ?: return callback(false)
+        val current = webView.url.orEmpty()
+        // 还没发过消息、且就停在站点根地址：已经是干净的新对话，别再白等一次加载
+        if (service !in sentSinceLoad && isRootUrl(service, current)) return callback(true)
+        navigate(service, webView, service.url, callback)
+    }
+
+    override fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) {
+        if (destroyed || !url.startsWith("https://")) return callback(false)
+        val webView = ensureWebView(service) ?: return callback(false)
+        if (webView.url == url) return callback(true)
+        navigate(service, webView, url, callback)
+    }
+
+    private fun navigate(service: ArenaService, webView: WebView, url: String, callback: (Boolean) -> Unit) {
+        // 自动化进行中不能换页面：会把正在收的回答和在途的 JS 回调一起弄丢
+        if (automationService == service) return callback(false)
+        pendingLoads.remove(service)?.invoke(false)
+        var settled = false
+        val timeout = Runnable {
+            if (settled) return@Runnable
+            settled = true
+            pendingLoads.remove(service)
+            callback(false)
+        }
+        pendingLoads[service] = { ok ->
+            if (!settled) {
+                settled = true
+                handler.removeCallbacks(timeout)
+                callback(ok)
+            }
+        }
+        handler.postDelayed(timeout, NAVIGATION_TIMEOUT_MS)
+        sentSinceLoad.remove(service)
+        webView.loadUrl(url)
+    }
+
+    /** 站点根地址（含尾斜杠差异）就算"新对话"页。 */
+    private fun isRootUrl(service: ArenaService, url: String): Boolean {
+        fun norm(value: String) = value.substringBefore('?').substringBefore('#').trimEnd('/')
+        return norm(url) == norm(service.url)
+    }
+
+    private fun settlePendingLoad(service: ArenaService, ok: Boolean) {
+        val pending = pendingLoads.remove(service) ?: return
+        // 单页应用在 onPageFinished 之后还要跑一会儿脚本才会把输入框画出来；留一点余量
+        handler.postDelayed({ pending(ok) }, NAVIGATION_SETTLE_MS)
     }
 
     fun probeAll() {
@@ -197,9 +277,32 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         prompt: String,
         requestId: String,
         callback: (SendOutcome) -> Unit,
+    ) = sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = false)
+
+    private fun sendPromptInternal(
+        service: ArenaService,
+        prompt: String,
+        requestId: String,
+        callback: (SendOutcome) -> Unit,
+        reloadedOnce: Boolean,
     ) {
         if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn) {
             callback(SendOutcome(false, requestId, "${service.displayName} 尚未登录"))
+            return
+        }
+        // 页面上次没加载出来（多半是当时没网）：先重新加载再发。往错误页里注入脚本必然
+        // "找不到输入框"，用户联网后点「重发」会白点一次（2026-09-05 断网实测）。只重试一次，
+        // 重载后还是错误页就如实报"网页打不开"。
+        val failedPage = webViews[service]?.takeIf { statuses[service]?.state == ConnectionState.ERROR }
+        if (failedPage != null && !reloadedOnce) {
+            val target = failedPage.url?.takeIf { it.startsWith("https://") } ?: service.url
+            navigate(service, failedPage, target) { ok ->
+                if (ok) {
+                    sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = true)
+                } else {
+                    callback(SendOutcome(false, requestId, "${service.displayName} 网页打不开，请确认网络正常后再试"))
+                }
+            }
             return
         }
         val fullPrompt = prompt.trim()
@@ -359,6 +462,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
     ) {
         webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId), null)
+        sentSinceLoad += service
         finishSend(SendOutcome(true, requestId, "已发送"), callback)
     }
 
@@ -490,6 +594,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         pendingBackgroundProbes.remove(service)
         confirmedSignedIn.remove(service)
         explicitLoginProbeCounts.remove(service)
+        sentSinceLoad.remove(service)
+        pendingLoads.remove(service)?.invoke(false)
         statuses[service] = ServiceStatus()
         container.removeView(webView)
         webView.stopLoading()
@@ -577,6 +683,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     this@ArenaWebViewPool.handler.postDelayed({ probe(service) }, 500)
                     this@ArenaWebViewPool.handler.postDelayed({ probe(service) }, 1_800)
                     this@ArenaWebViewPool.handler.postDelayed({ probe(service) }, 3_500)
+                    settlePendingLoad(service, ok = true)
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -595,6 +702,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         detail = error.description?.toString().orEmpty().ifBlank { "页面加载失败" },
                         url = request.url.toString(),
                     )
+                    pendingLoads.remove(service)?.invoke(false)
                 }
 
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -606,6 +714,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     )
                     webViews.remove(service)
                     confirmedSignedIn.remove(service)
+                    sentSinceLoad.remove(service)
+                    pendingLoads.remove(service)?.invoke(false)
                     container.removeView(view)
                     view.destroy()
                     // 这个 WebView 上所有在途的 JS 回调都不会再回来。
@@ -935,6 +1045,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (inserted && normalizedInput.length > 0 && (!transportProbe || normalizedInput.includes(transportProbe))) {
                     // execCommand already emitted the editor's native input event.
                     needsSyntheticInput = false;
+                  } else if (inserted) {
+                    // Lexical（Kimi 新版输入框）之类的编辑器把 insertText 异步落到 DOM：这一刻读出来是空的
+                    // 不代表没插进去。以前这里立刻用 textContent 硬塞一份再派发 input 事件，结果用户气泡里
+                    // 同一个问题出现两遍。改成稍后核对，真没有再兜底。
+                    needsSyntheticInput = false;
+                    setTimeout(function() {
+                      const nowText = String(input.innerText || input.textContent || '').replace(/\s+/g, ' ').trim();
+                      if (nowText.length > 0) return;
+                      input.textContent = text;
+                      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+                    }, 180);
                   } else {
                     input.textContent = text;
                   }
@@ -1261,5 +1382,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val AUTOMATION_QUEUE_INTERVAL_MS = 200L
         private const val AUTOMATION_QUEUE_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
+        /** 开新对话 / 切历史对话的整页加载上限；超过就放弃等待，直接尝试发送。 */
+        private const val NAVIGATION_TIMEOUT_MS = 20_000L
+        /** onPageFinished 之后再等一会儿，让单页应用把输入框画出来。 */
+        private const val NAVIGATION_SETTLE_MS = 900L
     }
 }

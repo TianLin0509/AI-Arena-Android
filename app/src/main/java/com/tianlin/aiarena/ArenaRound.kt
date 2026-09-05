@@ -28,6 +28,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -70,20 +75,37 @@ internal fun RoundStage(
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
     val scope = rememberCoroutineScope()
+    var confirmNewQuestion by remember { mutableStateOf(false) }
+    if (confirmNewQuestion) {
+        ConfirmDialog(
+            title = "放弃这一轮，开始新问题？",
+            text = "还在等 AI 回答。现在开始新问题会停止等待，已经收到的回答会保留在历史里。",
+            confirmLabel = "开始新问题",
+            onConfirm = {
+                confirmNewQuestion = false
+                onNewQuestion()
+            },
+            onDismiss = { confirmNewQuestion = false },
+        )
+    }
     val activeServices = selectedServices.filter { sessionController.runs[it]?.requestId?.isNotBlank() == true }
     val trackedServices = activeServices.ifEmpty { selectedServices }
     // 队长排最前：用户只想看一条时，那一条必须在第一屏。
     val orderedServices = CaptainPolicy.order(selectedServices, captain)
     // 只有队长真的整合完了才敢说"看第一条就够"——否则那句话是空头支票。
+    // 还要求"这一轮确实是它整合的"：用户中途开关队长模式、或换了队长，旧一轮的回答并没有整合过，
+    // 不能拿现在的设置去给以前的回答贴标签（真机实测踩过：恢复的旧辩论轮被误标"已整合"）。
     val captainRoundReady = captain != null &&
         sessionController.currentRoundKind == RoundKind.DEBATE &&
+        sessionController.currentRoundCaptain == captain &&
         sessionController.runs[captain]?.phase == ParticipantPhase.COMPLETE
     val phases = trackedServices.associateWith { sessionController.runs[it]?.phase ?: ParticipantPhase.IDLE }
     val settledCount = phases.values.count { it == ParticipantPhase.COMPLETE || it == ParticipantPhase.ERROR }
     val roundCompleted = phases.values.count { it == ParticipantPhase.COMPLETE }
     val roundFailed = phases.values.count { it == ParticipantPhase.ERROR }
     val waitingNames = phases.filterValues {
-        it == ParticipantPhase.SENDING || it == ParticipantPhase.WAITING || it == ParticipantPhase.STREAMING || it == ParticipantPhase.IDLE
+        it == ParticipantPhase.QUEUED || it == ParticipantPhase.SENDING || it == ParticipantPhase.WAITING ||
+            it == ParticipantPhase.STREAMING || it == ParticipantPhase.IDLE
     }.keys.map { it.shortName }
     val roundRunning = sessionStage == SessionStage.INITIAL ||
         sessionStage == SessionStage.ITERATION ||
@@ -126,18 +148,33 @@ internal fun RoundStage(
                     .padding(start = metrics.gutter, end = metrics.gutter, top = 16.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                ArenaHeading(
-                    text = sessionController.currentRoundKind?.displayName ?: "AI 圆桌",
-                    style = MaterialTheme.typography.titleLarge,
-                    maxLines = 1,
-                )
-                Text(
-                    text = narration,
-                    color = colors.onHeroMuted,
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        ArenaHeading(
+                            text = sessionController.currentRoundKind?.displayName ?: "AI 圆桌",
+                            style = MaterialTheme.typography.titleLarge,
+                            maxLines = 1,
+                        )
+                        Text(
+                            text = narration,
+                            color = colors.onHeroMuted,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    // 「新问题」是最常用的动作，放在结果页顶部随手可点；正在等回答时先确认一下
+                    ArenaSecondaryButton(
+                        text = "新问题",
+                        onClick = { if (busy) confirmNewQuestion = true else onNewQuestion() },
+                        modifier = Modifier.semantics { contentDescription = "开始新问题" },
+                        leading = { ArenaIcon(R.drawable.ic_add, tint = colors.accent, size = 20.dp) },
+                    )
+                }
                 if (busy) {
                     ArenaProgressBar(
                         progress = if (roundRunning && trackedServices.isNotEmpty()) {
@@ -171,7 +208,13 @@ internal fun RoundStage(
                     ArenaNotice(
                         tone = NoticeTone.WARNING,
                         title = "网络没有连上",
-                        text = "AI 的回答需要联网。请打开 Wi-Fi 或手机流量，连上后再点「重发」。",
+                        // 轮次还在跑时「重发」是灰的（一次只跑一条自动化），得先「停止等待」。
+                        // 断网实测：缓存过的网页会把问题"发出去"然后一直等，家人若不知道要先停就会卡住。
+                        text = if (roundRunning) {
+                            "AI 的回答需要联网。请打开 Wi-Fi 或手机流量，连上后先点「停止等待」，再对没成功的 AI 点「重发」。"
+                        } else {
+                            "AI 的回答需要联网。请打开 Wi-Fi 或手机流量，连上后再点「重发」。"
+                        },
                     )
                 }
             }
@@ -281,7 +324,8 @@ internal fun RoundStage(
                             run.detail.contains("发送失败") ||
                             run.detail.contains("重发失败") ||
                             run.detail.contains("尚未登录") ||
-                            run.detail.contains("注入失败")
+                            run.detail.contains("注入失败") ||
+                            run.detail.contains("还没来得及发送")
                         ),
                     onRetrySend = { sessionController.retrySend(service) },
                     onRetryExtraction = { sessionController.retryExtraction(service) },
@@ -538,7 +582,8 @@ private fun ProviderResultCard(
     onSkip: () -> Unit,
 ) {
     val colors = ArenaStyle.colors
-    val active = run.phase == ParticipantPhase.SENDING ||
+    val active = run.phase == ParticipantPhase.QUEUED ||
+        run.phase == ParticipantPhase.SENDING ||
         run.phase == ParticipantPhase.WAITING ||
         run.phase == ParticipantPhase.STREAMING
     val accentBorder by animateColorAsState(
@@ -586,7 +631,8 @@ private fun ProviderResultCard(
                     }
                     Text(
                         text = when {
-                            failed || stalled -> if (run.response.isNotBlank()) "只收到一部分回答" else "这次没有回答成功"
+                            stalled -> if (run.response.isNotBlank()) "回答了一部分，后面一直没动静" else "等了很久还没有回答"
+                            failed -> if (run.response.isNotBlank()) "只收到一部分回答" else "这次没有回答成功"
                             captainIntegrated -> "已整合大家的观点"
                             started || run.detail != "等待开始" -> run.detail
                             else -> status.detail

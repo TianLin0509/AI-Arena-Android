@@ -52,6 +52,11 @@ object ArenaErrorHelp {
                 next = "点「重发」再问一次就好。",
                 primary = Action.RESEND,
             )
+            d.contains("还没来得及发送") -> Advice(
+                what = "你停止了这一轮，$serviceName 还没来得及收到问题。",
+                next = "点「重发」就会发给它；不需要的话点「跳过」。",
+                primary = Action.RESEND,
+            )
             d.contains("已停止") -> Advice(
                 what = "你停止了等待，这一家的回答没有收完。",
                 next = "网页那边可能还在生成：先点「重新提取」；没有内容再点「重发」。",
@@ -138,7 +143,7 @@ object RoundNarration {
         val kindLabel = kind?.displayName ?: "回答"
         if (busy) {
             return when {
-                completed == 0 && waitingNames.size == total -> "已经发给 $total 位 AI，正在等它们回答…"
+                completed == 0 && waitingNames.size == total -> "问题已交给 $total 位 AI，正在等回答…"
                 waitingNames.size == 1 -> "$completed 位已回答，还在等${waitingNames.first()}…"
                 waitingNames.isNotEmpty() -> "$completed 位已回答，还在等${waitingNames.joinToString("、")}…"
                 else -> "正在整理回答…"

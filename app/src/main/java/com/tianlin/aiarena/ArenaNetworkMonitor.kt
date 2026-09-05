@@ -33,7 +33,10 @@ class ArenaNetworkMonitor(context: Context) {
         }
 
         override fun onLost(network: Network) {
-            isOnline = currentlyOnline()
+            // 默认网络没了就是没网：这里不能再去问 activeNetwork——系统在 onLost 那一刻往往还把
+            // 刚断掉的那条网络当成"当前网络"报回来，问出来永远是"有网"，提示条就永远不出现
+            // （2026-09-05 模拟器 svc data disable 实测）。若有新的默认网络，onAvailable 会再置回 true。
+            isOnline = false
         }
 
         override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {

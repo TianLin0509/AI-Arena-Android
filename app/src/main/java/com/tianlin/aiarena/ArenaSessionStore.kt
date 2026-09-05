@@ -20,6 +20,13 @@ data class ArenaSessionSnapshot(
     val history: List<RoundRecord>,
     val summary: DiscussionSummary,
     val lastRoundPrompts: Map<ArenaService, String> = emptyMap(),
+    /**
+     * 各家网页里这条讨论对应的对话地址。打开历史会话时把每家网页切回去，
+     * 后续「观点讨论」才是接着当时那条对话说，而不是发进不知哪一条里。
+     */
+    val conversationUrls: Map<ArenaService, String> = emptyMap(),
+    /** 当前这一轮的队长（轮次进行中还没进 history 时也要知道）。 */
+    val currentRoundCaptain: ArenaService? = null,
     val updatedAtMillis: Long,
 )
 
@@ -214,6 +221,11 @@ internal object ArenaSessionJson {
         .put("lastRoundPrompts", JSONObject().also { prompts ->
             snapshot.lastRoundPrompts.forEach { (service, prompt) -> prompts.put(service.name, prompt) }
         })
+        // 可选字段：老版本读到会忽略，新版本读不到就当空
+        .put("conversationUrls", JSONObject().also { urls ->
+            snapshot.conversationUrls.forEach { (service, url) -> urls.put(service.name, url) }
+        })
+        .put("currentRoundCaptain", snapshot.currentRoundCaptain?.name ?: JSONObject.NULL)
         .put("updatedAtMillis", snapshot.updatedAtMillis)
 
     /** 只认识到 [SCHEMA_VERSION] 为止的文件；更高版本宁可当作不可读，也不要静默丢字段。 */
@@ -250,9 +262,19 @@ internal object ArenaSessionJson {
                     }
                 }.toMap()
             }.orEmpty(),
+            conversationUrls = json.optJSONObject("conversationUrls")?.let { urls ->
+                ArenaService.entries.mapNotNull { service ->
+                    urls.optString(service.name).takeIf { it.startsWith("https://") }?.let { url ->
+                        service to url.take(MAX_CONVERSATION_URL_CHARS)
+                    }
+                }.toMap()
+            }.orEmpty(),
+            currentRoundCaptain = json.optString("currentRoundCaptain").enumOrNull<ArenaService>(),
             updatedAtMillis = json.optLong("updatedAtMillis"),
         )
     }
+
+    private const val MAX_CONVERSATION_URL_CHARS = 2_000
 
     private fun encodeRuns(runs: Map<ArenaService, ParticipantRun>): JSONObject = JSONObject().also { json ->
         ArenaService.entries.forEach { service -> json.put(service.name, encodeRun(runs[service] ?: ParticipantRun())) }
@@ -283,6 +305,7 @@ internal object ArenaSessionJson {
         .put("results", encodeRuns(round.results))
         .put("startedAtMillis", round.startedAtMillis)
         .put("finishedAtMillis", round.finishedAtMillis)
+        .put("captain", round.captain?.name ?: JSONObject.NULL)
 
     private fun decodeRound(json: JSONObject): RoundRecord = RoundRecord(
         number = json.optInt("number"),
@@ -294,6 +317,7 @@ internal object ArenaSessionJson {
         },
         startedAtMillis = json.optLong("startedAtMillis"),
         finishedAtMillis = json.optLong("finishedAtMillis"),
+        captain = json.optString("captain").enumOrNull<ArenaService>(),
     )
 
     private fun encodeSummary(summary: DiscussionSummary): JSONObject = JSONObject()

@@ -120,6 +120,14 @@ object LoginTrustPolicy {
 
 enum class ParticipantPhase {
     IDLE,
+    /**
+     * 本轮已经把它算上、请求号已分配，只是还没轮到它发送。
+     *
+     * 网页池同一时刻只能驱动一个页面，所谓"并行"其实是逐家发送；此前排在后面的成员
+     * 在轮到自己之前一直是 IDLE，卡片上什么都不显示，用户以为"只有第一家收到了命令"。
+     * 有了这个状态，点下「开始讨论」的那一刻三家一起动起来。
+     */
+    QUEUED,
     SENDING,
     WAITING,
     STREAMING,
@@ -175,6 +183,8 @@ data class RoundRecord(
     val results: Map<ArenaService, ParticipantRun>,
     val startedAtMillis: Long,
     val finishedAtMillis: Long,
+    /** 这一轮实际负责整合的队长；null = 当时没开队长模式。界面靠它判断能不能说"看第一条就够"。 */
+    val captain: ArenaService? = null,
 )
 
 data class DiscussionSummary(
@@ -230,6 +240,21 @@ interface ArenaGateway {
      * 把正在生成的回答一起带走。控制器用这个接口把当前参与者标成受保护。
      */
     fun setProtectedServices(services: Set<ArenaService>) = Unit
+
+    /**
+     * 让该成员的网页回到"新对话"状态，再回调。
+     *
+     * 用户开始一个新问题时，如果网页还停在上一个问题的对话里，新问题会被接到旧对话后面，
+     * AI 带着上一题的上下文作答（用户实测反馈："AI 们还在上一个问题的老页面在问"）。
+     * 网页已经是干净的新对话时应立即回调 true，不做多余的加载。
+     */
+    fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) = callback(true)
+
+    /** 打开某条历史对话的站点地址（各站把每条对话映射成不同 URL），加载完成后回调。 */
+    fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) = callback(true)
+
+    /** 该成员网页当前的地址；发出第一条消息后站点通常会换成这条对话专属的地址。 */
+    fun conversationUrl(service: ArenaService): String = ""
 }
 
 data class ControllerTiming(

@@ -29,6 +29,7 @@ class ArenaGuidanceTest {
             "net::ERR_INTERNET_DISCONNECTED",
             "页面加载失败",
             "已跳过本轮",
+            "已停止，这一家还没来得及发送",
             "完全没见过的原因",
         )
         details.forEach { detail ->
@@ -95,7 +96,7 @@ class ArenaGuidanceTest {
             busy = true, kind = RoundKind.INITIAL, roundNumber = 1,
             total = 3, completed = 0, failed = 0, waitingNames = listOf("A", "B", "C"),
         )
-        assertEquals("已经发给 3 位 AI，正在等它们回答…", text)
+        assertEquals("问题已交给 3 位 AI，正在等回答…", text)
     }
 
     @Test
