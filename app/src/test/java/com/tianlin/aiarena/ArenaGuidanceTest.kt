@@ -46,7 +46,8 @@ class ArenaGuidanceTest {
     fun loginProblemPointsToLogin() {
         val advice = ArenaErrorHelp.explain("DeepSeek 尚未登录", "DeepSeek")
         assertEquals(ArenaErrorHelp.Action.LOGIN, advice.primary)
-        assertTrue(advice.next.contains("打开网页"))
+        // 0.10 起按钮叫「跳转网页登录」，建议文案要和按钮上的字一致
+        assertTrue(advice.next.contains("跳转网页登录"))
     }
 
     @Test

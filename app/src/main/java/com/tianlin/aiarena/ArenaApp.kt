@@ -1012,6 +1012,22 @@ private fun navColors(): NavigationBarItemColors {
 internal fun formatRecentTime(value: Long): String =
     if (value <= 0L) "时间未知" else SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(value))
 
+/** 提问时间的人话写法：今天 / 昨天 只给时刻，今年给月日，更早给年月日。 */
+internal fun formatAskedTime(value: Long, now: Long = System.currentTimeMillis()): String {
+    if (value <= 0L) return "时间未知"
+    val day = SimpleDateFormat("yyyyMMdd", Locale.CHINA)
+    val clock = SimpleDateFormat("HH:mm", Locale.CHINA).format(Date(value))
+    val askedDay = day.format(Date(value))
+    val today = day.format(Date(now))
+    val yesterday = day.format(Date(now - 86_400_000L))
+    return when {
+        askedDay == today -> "今天 $clock"
+        askedDay == yesterday -> "昨天 $clock"
+        askedDay.take(4) == today.take(4) -> SimpleDateFormat("M月d日 HH:mm", Locale.CHINA).format(Date(value))
+        else -> SimpleDateFormat("yyyy年M月d日 HH:mm", Locale.CHINA).format(Date(value))
+    }
+}
+
 internal fun statusLabel(state: ConnectionState): String = when (state) {
     ConnectionState.NOT_LOADED -> "未打开"
     ConnectionState.LOADING -> "加载中"

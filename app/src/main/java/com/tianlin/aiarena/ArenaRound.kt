@@ -240,6 +240,13 @@ internal fun RoundStage(
                             maxLines = 4,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        if (sessionController.askedAtMillis > 0L) {
+                            Text(
+                                text = "${formatAskedTime(sessionController.askedAtMillis)} 提问",
+                                color = colors.muted,
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
                     }
                 }
             }
@@ -652,6 +659,8 @@ private fun ProviderResultCard(
     val started = run.requestId.isNotBlank()
     val stalled = run.phase == ParticipantPhase.WAITING && run.detail.contains("迟迟没有回应")
     val failed = run.phase == ParticipantPhase.ERROR && started
+    // 千问这类站点会弹滑块 / 验证码，App 只能等；不明说的话家人会以为卡住了（用户反馈 2026-09-06）
+    val securityChallenge = run.phase == ParticipantPhase.WAITING && run.detail.contains("安全验证")
 
     ArenaCard(modifier = Modifier.fillMaxWidth(), borderColor = accentBorder) {
         Column {
@@ -764,6 +773,20 @@ private fun ProviderResultCard(
                 }
             }
 
+            if (securityChallenge) {
+                ArenaNotice(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    tone = NoticeTone.WARNING,
+                    title = "${service.shortName} 要你做一次安全验证",
+                    text = "点「跳转网页去验证」，在它的网页里按提示完成滑块或验证码。做完回到这里会自动继续；" +
+                        "要是一直没动静，再点「重新提取」。",
+                    actionLabel = "跳转网页去验证",
+                    onAction = onClick,
+                    secondaryLabel = "重新提取",
+                    onSecondary = onRetryExtraction,
+                    actionContentDescription = "跳转到 ${service.displayName} 网页完成安全验证",
+                )
+            }
             if (failed || stalled) {
                 val advice = ArenaErrorHelp.explain(run.detail, service.displayName)
                 ErrorAdviceBox(

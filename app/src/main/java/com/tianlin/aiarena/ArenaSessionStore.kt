@@ -12,6 +12,8 @@ import org.json.JSONObject
 data class ArenaSessionSnapshot(
     val id: String,
     val originalQuestion: String,
+    /** 这个问题是什么时候提的（毫秒）。老文件没有这个字段时从会话 id 里的时间戳推回来。 */
+    val askedAtMillis: Long = 0L,
     val roundNumber: Int,
     val currentRoundKind: RoundKind?,
     val currentAnswerMode: AnswerMode,
@@ -34,6 +36,7 @@ data class RecentArenaSession(
     val id: String,
     val title: String,
     val updatedAtMillis: Long,
+    val askedAtMillis: Long = 0L,
     val roundCount: Int,
     val serviceCount: Int,
 )
@@ -122,6 +125,7 @@ class ArenaSessionStore internal constructor(
                             id = id,
                             title = item.optString("title").take(MAX_TITLE_CHARACTERS),
                             updatedAtMillis = item.optLong("updatedAtMillis"),
+                            askedAtMillis = item.optLong("askedAtMillis").takeIf { it > 0L } ?: sessionIdTimestamp(id),
                             roundCount = item.optInt("roundCount"),
                             serviceCount = item.optInt("serviceCount"),
                         ),
@@ -158,6 +162,7 @@ class ArenaSessionStore internal constructor(
                     .put("id", item.id)
                     .put("title", item.title)
                     .put("updatedAtMillis", item.updatedAtMillis)
+                    .put("askedAtMillis", item.askedAtMillis)
                     .put("roundCount", item.roundCount)
                     .put("serviceCount", item.serviceCount),
             )
@@ -189,6 +194,7 @@ class ArenaSessionStore internal constructor(
         id = id,
         title = originalQuestion.lineSequence().firstOrNull().orEmpty().trim().take(MAX_TITLE_CHARACTERS),
         updatedAtMillis = updatedAtMillis,
+        askedAtMillis = askedAtMillis.takeIf { it > 0L } ?: sessionIdTimestamp(id),
         roundCount = roundNumber,
         serviceCount = services.size,
     )
@@ -206,11 +212,16 @@ class ArenaSessionStore internal constructor(
     }
 }
 
+/** 会话 id 形如 `session_<毫秒>_<随机>`：没有记录提问时间的老会话就拿这个时间戳当提问时间。 */
+internal fun sessionIdTimestamp(id: String): Long =
+    Regex("^session_(\\d{10,})_").find(id)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+
 internal object ArenaSessionJson {
     fun encode(snapshot: ArenaSessionSnapshot): JSONObject = JSONObject()
         .put("version", 1)
         .put("id", snapshot.id)
         .put("originalQuestion", snapshot.originalQuestion)
+        .put("askedAtMillis", snapshot.askedAtMillis)
         .put("roundNumber", snapshot.roundNumber)
         .put("currentRoundKind", snapshot.currentRoundKind?.name ?: JSONObject.NULL)
         .put("currentAnswerMode", snapshot.currentAnswerMode.name)
@@ -248,6 +259,7 @@ internal object ArenaSessionJson {
         return ArenaSessionSnapshot(
             id = json.getString("id"),
             originalQuestion = json.optString("originalQuestion").take(ArenaLimits.MAX_QUESTION_CHARS),
+            askedAtMillis = json.optLong("askedAtMillis").takeIf { it > 0L } ?: sessionIdTimestamp(json.getString("id")),
             roundNumber = json.optInt("roundNumber").coerceAtLeast(0),
             currentRoundKind = json.optString("currentRoundKind").enumOrNull<RoundKind>(),
             currentAnswerMode = json.optString("currentAnswerMode").enumOrNull<AnswerMode>() ?: AnswerMode.PARALLEL,

@@ -142,7 +142,7 @@ internal fun RoundtableHistoryPage(
                             if (index > 0) ArenaRowDivider()
                             ArenaRow(
                                 title = session.title.ifBlank { "未命名问题" },
-                                detail = "${formatRecentTime(session.updatedAtMillis)} · " +
+                                detail = "${formatAskedTime(session.askedAtMillis)} 提问 · " +
                                     "${session.roundCount} 轮 · ${session.serviceCount} 家",
                                 trailingText = "继续",
                                 trailingColor = colors.accent,

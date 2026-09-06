@@ -34,12 +34,12 @@ object ArenaErrorHelp {
             )
             d.contains("尚未登录") || d.contains("需要在网页中登录") || d.contains("待登录") -> Advice(
                 what = "$serviceName 还没有登录，所以问题发不出去。",
-                next = "点「打开网页」登录（和平时用它一样），回来再点「重发」。",
+                next = "点「跳转网页登录」登录（和平时用它一样），回来再点「重发」。",
                 primary = Action.LOGIN,
             )
             d.contains("安全验证") -> Advice(
                 what = "$serviceName 要求做一次安全验证（滑块或验证码）。",
-                next = "点「打开网页」完成验证，再回来点「重新提取」。",
+                next = "点「跳转网页」完成验证，再回来点「重新提取」。",
                 primary = Action.OPEN_PAGE,
             )
             d.contains("网页进程已退出") || d.contains("进程") -> Advice(

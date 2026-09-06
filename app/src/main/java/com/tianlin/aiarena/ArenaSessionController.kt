@@ -39,6 +39,10 @@ class ArenaSessionController(
     var originalQuestion by mutableStateOf("")
         private set
 
+    /** 这个问题是什么时候提的；家里长辈想一眼知道每个问题的时间（用户反馈 2026-09-06）。 */
+    var askedAtMillis by mutableStateOf(0L)
+        private set
+
     var sessionMessage by mutableStateOf("等待开始")
         private set
 
@@ -143,6 +147,7 @@ class ArenaSessionController(
         currentRoundContextNotice = ""
         roundNumber = 0
         originalQuestion = normalizedQuestion
+        askedAtMillis = System.currentTimeMillis()
         return startRound(
             kind = RoundKind.INITIAL,
             services = selected,
@@ -370,6 +375,7 @@ class ArenaSessionController(
         summaryExecution = null
         recoveryExecution = null
         stage = SessionStage.IDLE
+        askedAtMillis = 0L
         currentRoundKind = null
         currentRoundCaptain = null
         currentAnswerMode = AnswerMode.PARALLEL
@@ -1161,6 +1167,7 @@ class ArenaSessionController(
         return ArenaSessionSnapshot(
             id = sessionId,
             originalQuestion = originalQuestion,
+            askedAtMillis = askedAtMillis,
             roundNumber = roundNumber,
             currentRoundKind = currentRoundKind,
             currentAnswerMode = currentAnswerMode,
@@ -1225,6 +1232,7 @@ class ArenaSessionController(
         recoveryExecution = null
         sessionId = snapshot.id
         originalQuestion = snapshot.originalQuestion
+        askedAtMillis = snapshot.askedAtMillis
         roundNumber = maxOf(snapshot.roundNumber, snapshot.history.maxOfOrNull { it.number } ?: 0)
         currentRoundKind = snapshot.currentRoundKind ?: snapshot.history.lastOrNull()?.kind
         currentRoundCaptain = snapshot.currentRoundCaptain ?: snapshot.history.lastOrNull()?.captain
