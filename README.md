@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.11.1`（`versionCode 16`）
+当前版本：`v0.11.2`（`versionCode 17`）
 
 面向国内 Android 用户的多 AI 圆桌工具。应用本身无需注册账号、没有自建后端；用户只需在内嵌的 AI 官网完成一次登录，之后由 App 复用本机 WebView 登录状态，汇总多家回答并支持后续讨论。
 
@@ -93,7 +93,6 @@
 - 观点讨论：每家收到其他成员的最新观点，可附加用户本轮讨论要求。
 - 队长总结：选一位 AI 当队长、选深度（简明 / 标准 / 深入），它拿到几家的完整回答后整合成一条。
 - 结果页总览卡 + 底部分段切换；每家显示模型 / 思考模式小字与「已深度思考」标签。
-- 交叉核验卡：提示参与成员数、共识、分歧和需要继续核实的内容，不生成虚假置信度。
 - 单家补救：重发、重新提取或跳过，不要求整轮重跑。
 - 本地历史：最近 20 个会话，支持冷启动恢复和损坏索引自愈。
 - 语音输入、大字模式、六套界面风格。

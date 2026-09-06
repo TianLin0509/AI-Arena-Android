@@ -431,11 +431,6 @@ internal fun RoundStage(
                         DiscussionSummaryCard(
                             summary = summary,
                             judge = summary.judge,
-                            trustSignal = DiscussionTrustPolicy.analyze(
-                                question = sessionController.originalQuestion,
-                                summary = summary.text,
-                                providerCount = completedCount,
-                            ),
                             onCopy = copyText?.let { copy ->
                                 {
                                     val prepared = ShareTextPolicy.discussionSummary(
@@ -1506,7 +1501,6 @@ private fun ErrorAdviceBox(
 private fun DiscussionSummaryCard(
     summary: DiscussionSummary,
     judge: ArenaService?,
-    trustSignal: DiscussionTrustSignal,
     onCopy: (() -> Unit)?,
     onShare: (() -> Unit)?,
     retryEnabled: Boolean,
@@ -1561,8 +1555,8 @@ private fun DiscussionSummaryCard(
                     actionContentDescription = judge?.let { "跳转到 ${it.displayName} 网页" },
                 )
             }
+            // 用户反馈（2026-09-06）：交叉核验卡没必要，只要原汁原味的队长回答
             if (summary.text.isNotBlank()) {
-                if (!placeholder) TrustSignalPanel(trustSignal, summary.depth)
                 FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -1638,74 +1632,5 @@ private fun DiscussionSummaryCard(
                 )
             }
         }
-    }
-}
-
-@Composable
-private fun TrustSignalPanel(signal: DiscussionTrustSignal, depth: SummaryDepth) {
-    val colors = ArenaStyle.colors
-    val metrics = ArenaStyle.metrics
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(metrics.controlCorner))
-            .background(colors.surface)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text(
-            text = "交叉核验",
-            color = colors.accent,
-            style = MaterialTheme.typography.labelLarge,
-            fontWeight = FontWeight.Bold,
-        )
-        // 「简明」档本来就不要求写共识 / 分歧两段，不能拿这两个标签去挑它的毛病
-        val chips = buildList {
-            add(Triple("${signal.providerCount} 家观点", true, colors.accent))
-            if (depth != SummaryDepth.BRIEF) {
-                add(
-                    Triple(
-                        if (signal.consensusReviewed) "共识已提炼" else "未标出共识",
-                        signal.consensusReviewed,
-                        colors.success,
-                    ),
-                )
-                add(
-                    Triple(
-                        if (signal.differencesReviewed) "分歧已检查" else "未标出分歧",
-                        signal.differencesReviewed,
-                        colors.success,
-                    ),
-                )
-            } else {
-                add(Triple("简明总结", true, colors.accent))
-            }
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            chips.forEach { (label, ok, tint) ->
-                Surface(
-                    modifier = Modifier.weight(1f),
-                    color = if (ok) colors.card else colors.warningSoft,
-                    shape = RoundedCornerShape(metrics.chipCorner),
-                ) {
-                    Text(
-                        text = label,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 8.dp),
-                        color = if (ok) tint else colors.warning,
-                        style = MaterialTheme.typography.labelSmall,
-                        textAlign = TextAlign.Center,
-                        maxLines = 2,
-                    )
-                }
-            }
-        }
-        Text(
-            text = "待核验提醒：${signal.verificationReminderCount} 处 · ${signal.domainCaution}",
-            color = if (signal.verificationReminderCount > 0) colors.warning else colors.muted,
-            style = MaterialTheme.typography.bodyMedium,
-        )
     }
 }
