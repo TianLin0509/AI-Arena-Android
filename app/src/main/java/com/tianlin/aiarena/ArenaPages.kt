@@ -174,8 +174,6 @@ internal fun RoundtableSettingsPage(
     onInstallUpdate: (ArenaUpdateInfo) -> Unit,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
-    speechState: SpeechPlaybackState?,
-    stopSpeech: (() -> Unit)?,
     skin: ArenaSkin,
     answerMode: AnswerMode,
     onAnswerModeChange: (AnswerMode) -> Unit,
@@ -252,24 +250,6 @@ internal fun RoundtableSettingsPage(
                         checked = largeTextEnabled,
                         onCheckedChange = onLargeTextChange,
                         contentDescriptionText = if (largeTextEnabled) "关闭大字模式" else "开启大字模式",
-                    )
-                    ArenaRowDivider()
-                    ArenaRow(
-                        title = "朗读",
-                        detail = speechState?.detail ?: "朗读：不可用",
-                        chevron = false,
-                        trailing = if (speechState?.activeKey != null && stopSpeech != null) {
-                            {
-                                ArenaTextAction(
-                                    text = "停止朗读",
-                                    onClick = stopSpeech,
-                                    color = colors.error,
-                                    contentDescriptionText = "停止朗读",
-                                )
-                            }
-                        } else {
-                            null
-                        },
                     )
                 }
             }

@@ -122,6 +122,8 @@ internal object ArenaMarkdownScript {
             if (tag === 'A') {
               const inner = arenaInline(child).trim();
               if (!inner) continue;
+              // DeepSeek 联网搜索的引用是文字为 "-1" / "3" 这类短数字的链接，按角标处理，别输出 [-1](https://…)
+              if (/^[-–]?[0-9]{1,3}$/.test(inner)) { out += arenaSuperscript(inner.replace(/[-–]/g, '')); continue; }
               const href = child.getAttribute('href') || '';
               out += /^https?:/i.test(href) ? ('[' + inner + '](' + href + ')') : inner;
               continue;

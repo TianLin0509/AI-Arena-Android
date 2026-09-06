@@ -67,25 +67,6 @@ class VoiceInputPolicyTest {
     }
 
     @Test
-    fun speechTextIsNormalizedAndChunkedWithoutLoss() {
-        val raw = "# 标题\n\n**第一句**。" + "甲".repeat(80) + "，" + "乙".repeat(80) + "。结束。"
-        val chunks = SpeechTextPolicy.chunks(raw, maxCharacters = 100)
-
-        assertTrue(chunks.size >= 2)
-        assertTrue(chunks.all { it.length <= 100 })
-        assertFalse(chunks.joinToString("").contains('#'))
-        assertFalse(chunks.joinToString("").contains('*'))
-        assertTrue(chunks.joinToString("").contains("第一句"))
-        assertTrue(chunks.joinToString("").endsWith("结束。"))
-    }
-
-    @Test
-    fun emptySpeechTextProducesNoChunks() {
-        assertTrue(SpeechTextPolicy.chunks("   ").isEmpty())
-        assertTrue(SpeechTextPolicy.chunks("内容", maxCharacters = 0).isEmpty())
-    }
-
-    @Test
     fun shareTextContainsQuestionAndSummaryAndIsBounded() {
         val normal = ShareTextPolicy.discussionSummary("原问题", "总结结论")
         assertTrue(normal.text.contains("原问题"))

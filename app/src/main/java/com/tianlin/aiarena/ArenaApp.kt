@@ -85,9 +85,6 @@ fun ArenaApp(
     debugInitialQuestion: String = "",
     voiceInputState: VoiceInputState? = null,
     voiceInputRequest: VoiceInputRequest? = null,
-    speechState: SpeechPlaybackState? = null,
-    speechPlaybackRequest: SpeechPlaybackRequest? = null,
-    stopSpeech: (() -> Unit)? = null,
     copyText: TextCopyRequest? = null,
     shareText: TextShareRequest? = null,
     /** 用系统浏览器打开外链（下载新版 APK）。返回 false 表示没有可用浏览器。 */
@@ -245,9 +242,6 @@ fun ArenaApp(
         pool.setTextZoomPercent(TextScalePolicy.webViewTextZoom(largeTextEnabled))
     }
 
-    LaunchedEffect(selectedServiceName) {
-        if (selectedServiceName != null) stopSpeech?.invoke()
-    }
 
     DisposableEffect(sessionController) {
         onDispose { sessionController.destroy() }
@@ -370,9 +364,6 @@ fun ArenaApp(
                         voiceInputRequest = voiceInputRequest,
                         largeTextEnabled = largeTextEnabled,
                         onLargeTextChange = { largeTextEnabled = it },
-                        speechState = speechState,
-                        speechPlaybackRequest = speechPlaybackRequest,
-                        stopSpeech = stopSpeech,
                         copyText = copyText,
                         shareText = shareText,
                         skin = skin,
@@ -430,9 +421,6 @@ private fun RoundtableRoot(
     voiceInputRequest: VoiceInputRequest?,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
-    speechState: SpeechPlaybackState?,
-    speechPlaybackRequest: SpeechPlaybackRequest?,
-    stopSpeech: (() -> Unit)?,
     copyText: TextCopyRequest?,
     shareText: TextShareRequest?,
     skin: ArenaSkin,
@@ -475,9 +463,6 @@ private fun RoundtableRoot(
             voiceInputRequest = voiceInputRequest,
             largeTextEnabled = largeTextEnabled,
             onLargeTextChange = onLargeTextChange,
-            speechState = speechState,
-            speechPlaybackRequest = speechPlaybackRequest,
-            stopSpeech = stopSpeech,
             copyText = copyText,
             shareText = shareText,
             skin = skin,
@@ -535,9 +520,6 @@ private fun DiscussionHome(
     voiceInputRequest: VoiceInputRequest?,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
-    speechState: SpeechPlaybackState?,
-    speechPlaybackRequest: SpeechPlaybackRequest?,
-    stopSpeech: (() -> Unit)?,
     copyText: TextCopyRequest?,
     shareText: TextShareRequest?,
     skin: ArenaSkin,
@@ -645,7 +627,6 @@ private fun DiscussionHome(
 
     /** 回到干净的提问页：结果页「开始新问题」、设置页「清除卡住的讨论」、崩溃提示「重新开始」共用。 */
     val startFresh: () -> Unit = {
-        stopSpeech?.invoke()
         sessionController.reset()
         question = ""
         roundGuidance = ""
@@ -653,7 +634,6 @@ private fun DiscussionHome(
     }
 
     val restoreRecentSession: (String) -> Unit = { sessionId ->
-        stopSpeech?.invoke()
         val outcome = sessionController.restoreSession(sessionId)
         if (outcome == RestoreOutcome.OK || outcome == RestoreOutcome.OK_AFTER_STOP) {
             question = sessionController.originalQuestion
@@ -702,8 +682,6 @@ private fun DiscussionHome(
                 onInstallUpdate = onInstallUpdate,
                 largeTextEnabled = largeTextEnabled,
                 onLargeTextChange = onLargeTextChange,
-                speechState = speechState,
-                stopSpeech = stopSpeech,
                 skin = skin,
                 answerMode = answerMode,
                 onAnswerModeChange = { mode ->
@@ -825,9 +803,6 @@ private fun DiscussionHome(
                     expandedAnswers = expandedAnswers,
                     onOpenService = onOpenService,
                     snackbarHostState = snackbarHostState,
-                    speechState = speechState,
-                    speechPlaybackRequest = speechPlaybackRequest,
-                    stopSpeech = stopSpeech,
                     copyText = copyText,
                     shareText = shareText,
                     offline = offline,

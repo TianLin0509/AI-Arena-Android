@@ -203,13 +203,25 @@ data class SendOutcome(
 
 data class ResponseSnapshot(
     val found: Boolean,
+    /** 流式期间给用户看的进度文本：宽松抓取，混进思考过程也没关系，只要让人知道 AI 在动。 */
     val text: String,
     val streaming: Boolean,
     val detail: String = "",
     val truncated: Boolean = false,
     val originalLength: Int = text.length,
     val securityChallenge: Boolean = false,
-)
+    /**
+     * 严格抓取的"正式回答"（排除思考过程 / 工具调用 / 搜索结果），回答结束后以它为准。
+     * 站点没有可辨认的正式回答容器时与 [text] 相同。
+     */
+    val finalText: String = text,
+    /** 站点只有"停止按钮"这种弱的结束信号（千问 / 元宝 / 智谱）：控制器要多等两轮再判完成。 */
+    val weakDoneSignal: Boolean = false,
+) {
+    /** 回答已结束时该存下来的文本：优先正式回答，严格抓取抓空了才退回进度文本，宁可多抓不抓空。 */
+    val settledText: String
+        get() = finalText.ifBlank { text }
+}
 
 interface ArenaGateway {
     fun sendPrompt(

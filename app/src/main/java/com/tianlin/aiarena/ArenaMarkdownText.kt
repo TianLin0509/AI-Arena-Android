@@ -198,7 +198,7 @@ private fun TableRow(
     }
 }
 
-/** 行内片段 → AnnotatedString。链接只上色不可点：要看原文有「原网页」入口。 */
+/** 行内片段 → AnnotatedString。链接只上色不可点：要看原文有「跳转网页」入口。 */
 private fun annotate(source: String, colors: ArenaPalette): AnnotatedString = buildAnnotatedString {
     ArenaMarkdown.inline(source).forEach { span ->
         val decoration = when {

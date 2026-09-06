@@ -667,20 +667,21 @@ class ArenaSessionController(
             }
             execution.consecutiveReadErrors = 0
             if (snapshot.found && snapshot.text.isNotBlank()) {
-                if (snapshot.text == execution.lastText) execution.stableCount += 1 else {
-                    execution.lastText = snapshot.text
+                val shownText = if (snapshot.streaming) snapshot.text else snapshot.settledText
+                if (shownText == execution.lastText) execution.stableCount += 1 else {
+                    execution.lastText = shownText
                     execution.stableCount = 0
                 }
                 val updated = runs.getValue(execution.service).copy(
                     phase = if (snapshot.streaming) ParticipantPhase.STREAMING else ParticipantPhase.WAITING,
-                    response = snapshot.text,
+                    response = shownText,
                     detail = if (snapshot.streaming) "正在补全回答" else "正在确认补救结果",
                     responseTruncated = snapshot.truncated,
                     originalResponseLength = snapshot.originalLength,
                 )
                 runs[execution.service] = updated
                 schedulePersist()
-                if (!snapshot.streaming && execution.stableCount >= timing.requiredStablePolls) {
+                if (!snapshot.streaming && execution.stableCount >= requiredStablePolls(snapshot)) {
                     finishRecovery(
                         execution,
                         updated.copy(
@@ -912,22 +913,26 @@ class ArenaSessionController(
             }
             state.consecutiveReadErrors = 0
             if (snapshot.found && snapshot.text.isNotBlank()) {
-                if (snapshot.text == state.lastText) {
+                // 流式期间显示宽松抓到的进度文本（可能混着思考过程，只是让人看到 AI 在动）；
+                // 站点说"已结束"之后改看严格抓取的正式回答，稳定两次才算完成，存下的也是它。
+                // 用户反馈：DeepSeek 一直把思考过程当回答存下来，真正的回答反而没抓到。
+                val shownText = if (snapshot.streaming) snapshot.text else snapshot.settledText
+                if (shownText == state.lastText) {
                     state.stableCount += 1
                 } else {
-                    state.lastText = snapshot.text
+                    state.lastText = shownText
                     state.stableCount = 0
                 }
                 val lengthLabel = responseLengthLabel(snapshot)
                 runs[service] = runs.getValue(service).copy(
                     phase = if (snapshot.streaming) ParticipantPhase.STREAMING else ParticipantPhase.WAITING,
-                    response = snapshot.text,
+                    response = shownText,
                     detail = if (snapshot.streaming) "正在回答 · $lengthLabel" else "正在确认回答完成",
                     responseTruncated = snapshot.truncated,
                     originalResponseLength = snapshot.originalLength,
                 )
                 schedulePersist()
-                if (!snapshot.streaming && state.stableCount >= timing.requiredStablePolls) {
+                if (!snapshot.streaming && state.stableCount >= requiredStablePolls(snapshot)) {
                     markTerminal(
                         execution,
                         service,
@@ -957,9 +962,16 @@ class ArenaSessionController(
      * 弹了验证码、或者发送根本没进去。让用户干等 5 分钟再看到"超时"是最差的体验，
      * 所以过了阈值就把文案换成可操作的提示，而不是继续只报秒数。
      */
+    /**
+     * 判"回答完成"需要文本连续稳定几轮。站点能给出明确的结束信号（消息操作栏展开）时用默认值；
+     * 只有"停止按钮"这种弱信号的站点多等两轮（共 6 秒），免得 AI 中途停顿思考时把半截当成整条。
+     */
+    private fun requiredStablePolls(snapshot: ResponseSnapshot): Int =
+        if (snapshot.weakDoneSignal) timing.requiredStablePolls + 2 else timing.requiredStablePolls
+
     private fun stalledWaitDetail(waitedSeconds: Long): String = when {
         waitedSeconds < STALL_HINT_SECONDS -> "等待回答 · ${waitedSeconds}秒"
-        else -> "等待回答 · ${waitedSeconds}秒 · 迟迟没有回应，可点「原网页」看看是否需要登录或完成验证"
+        else -> "等待回答 · ${waitedSeconds}秒 · 迟迟没有回应，可点「跳转网页」看看是否需要登录或完成验证"
     }
 
     private fun handleReadFailure(
@@ -1085,17 +1097,18 @@ class ArenaSessionController(
             }
             execution.consecutiveReadErrors = 0
             if (snapshot.found && snapshot.text.isNotBlank()) {
-                if (snapshot.text == execution.lastText) execution.stableCount += 1 else {
-                    execution.lastText = snapshot.text
+                val shownText = if (snapshot.streaming) snapshot.text else snapshot.settledText
+                if (shownText == execution.lastText) execution.stableCount += 1 else {
+                    execution.lastText = shownText
                     execution.stableCount = 0
                 }
                 summary = summary.copy(
                     phase = if (snapshot.streaming) ParticipantPhase.STREAMING else ParticipantPhase.WAITING,
-                    text = snapshot.text,
-                    detail = if (snapshot.streaming) "正在总结 · ${snapshot.text.length} 字" else "正在确认总结完成",
+                    text = shownText,
+                    detail = if (snapshot.streaming) "正在总结 · ${shownText.length} 字" else "正在确认总结完成",
                 )
                 schedulePersist()
-                if (!snapshot.streaming && execution.stableCount >= timing.requiredStablePolls) {
+                if (!snapshot.streaming && execution.stableCount >= requiredStablePolls(snapshot)) {
                     summary = summary.copy(
                         phase = ParticipantPhase.COMPLETE,
                         text = snapshot.text,

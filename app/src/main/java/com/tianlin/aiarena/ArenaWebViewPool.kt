@@ -333,10 +333,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 val payload = JSONObject(decodeJsValue(raw))
                 val rawText = payload.optString("text", "")
                 val originalLength = payload.optInt("originalLength", rawText.length)
+                val finalText = payload.optString("finalText", rawText)
                 callback(
                     ResponseSnapshot(
                         found = payload.optBoolean("found", false),
                         text = rawText.take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
+                        finalText = finalText.take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
+                        weakDoneSignal = payload.optBoolean("weakDoneSignal", false),
                         streaming = payload.optBoolean("streaming", false),
                         detail = payload.optString("error", ""),
                         truncated = payload.optBoolean("truncated", false) ||

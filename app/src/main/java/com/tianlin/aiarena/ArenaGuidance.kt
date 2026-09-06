@@ -187,9 +187,17 @@ class ArenaGuidePreferences(context: Context) {
         preferences.edit { putString(KEY_ANSWER_MODE, mode.name) }
     }
 
+    /** 「继续追问」里"可以先写要求"的提示：用户点过「知道了」或自己写过要求之后就不再出现。 */
+    fun hasSeenRoundGuidanceHint(): Boolean = preferences.getBoolean(KEY_ROUND_GUIDANCE_HINT_SEEN, false)
+
+    fun markRoundGuidanceHintSeen() {
+        preferences.edit { putBoolean(KEY_ROUND_GUIDANCE_HINT_SEEN, true) }
+    }
+
     private companion object {
         const val KEY_ONBOARDING_SEEN = "onboarding_seen_v7"
         const val KEY_CRASH_ACK = "crash_acknowledged"
         const val KEY_ANSWER_MODE = "answer_mode"
+        const val KEY_ROUND_GUIDANCE_HINT_SEEN = "round_guidance_hint_seen"
     }
 }

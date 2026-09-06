@@ -28,7 +28,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var webViewPool: ArenaWebViewPool
     private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
     private val voiceInputState: VoiceInputState by viewModels()
-    private lateinit var speechController: ArenaSpeechController
     private val imagePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val callback = pendingFileCallback
         pendingFileCallback = null
@@ -61,7 +60,6 @@ class MainActivity : ComponentActivity() {
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         webViewPool = ArenaWebViewPool(this)
         skinPreferences = ArenaSkinPreferences(applicationContext)
-        speechController = ArenaSpeechController(applicationContext)
         val debugInitialQuestion = if (BuildConfig.DEBUG) {
             val encoded = intent.getStringExtra(DEBUG_PREFILL_BASE64_EXTRA)
             if (encoded.isNullOrBlank()) {
@@ -82,9 +80,6 @@ class MainActivity : ComponentActivity() {
                     debugInitialQuestion = debugInitialQuestion,
                     voiceInputState = voiceInputState,
                     voiceInputRequest = ::requestVoiceInput,
-                    speechState = speechController.state,
-                    speechPlaybackRequest = speechController::toggle,
-                    stopSpeech = speechController::stop,
                     copyText = ::copyText,
                     shareText = ::shareText,
                     openExternalUrl = ::openExternalUrl,
@@ -123,7 +118,6 @@ class MainActivity : ComponentActivity() {
             pendingFileCallback = null
         }
         if (::webViewPool.isInitialized) webViewPool.destroy()
-        if (::speechController.isInitialized) speechController.shutdown()
         super.onDestroy()
     }
 
@@ -141,17 +135,6 @@ class MainActivity : ComponentActivity() {
         }
         if (!transcript.isNullOrBlank() && voiceInputState.active) {
             voiceInputState.finish(VoiceInputOutcome.Success(transcript))
-        }
-        val ttsEncoded = intent.getStringExtra(DEBUG_TTS_TEXT_BASE64_EXTRA)
-        val ttsText = if (ttsEncoded.isNullOrBlank()) {
-            intent.getStringExtra(DEBUG_TTS_TEXT_EXTRA)
-        } else {
-            runCatching {
-                String(Base64.decode(ttsEncoded, Base64.NO_WRAP), Charsets.UTF_8)
-            }.getOrNull()
-        }
-        if (!ttsText.isNullOrBlank() && ::speechController.isInitialized) {
-            speechController.toggle("debug:tts", ttsText)
         }
     }
 
@@ -236,7 +219,5 @@ class MainActivity : ComponentActivity() {
         const val DEBUG_PREFILL_BASE64_EXTRA = "com.tianlin.aiarena.DEBUG_PREFILL_QUESTION_BASE64"
         const val DEBUG_VOICE_RESULT_EXTRA = "com.tianlin.aiarena.DEBUG_VOICE_RESULT"
         const val DEBUG_VOICE_RESULT_BASE64_EXTRA = "com.tianlin.aiarena.DEBUG_VOICE_RESULT_BASE64"
-        const val DEBUG_TTS_TEXT_EXTRA = "com.tianlin.aiarena.DEBUG_TTS_TEXT"
-        const val DEBUG_TTS_TEXT_BASE64_EXTRA = "com.tianlin.aiarena.DEBUG_TTS_TEXT_BASE64"
     }
 }

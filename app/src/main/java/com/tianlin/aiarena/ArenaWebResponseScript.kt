@@ -44,6 +44,29 @@ internal object ArenaWebResponseScript {
           });
           return kept.length ? kept : nodes;
         };
+        /**
+         * "消息操作栏已经真的显示出来"：豆包在生成期间就把 message-action-bar 渲染在 DOM 里，
+         * 只是高度 0、里面没有按钮，回答结束才展开（2026-09-05 实测：只看存在与否会在 AI 停顿时
+         * 提前判完成，把"老年人"三个字当成整条回答存下来）。
+         */
+        const barVisible = function(bar) {
+          if (!bar) return false;
+          try {
+            const rect = bar.getBoundingClientRect();
+            const style = window.getComputedStyle(bar);
+            if (rect.height <= 2 || style.display === 'none' || style.visibility === 'hidden') return false;
+            return bar.querySelectorAll('button, [role=button], svg').length > 0;
+          } catch (_) { return false; }
+        };
+        /** 元素此刻真的画在屏幕上（有尺寸、没被 display/visibility 藏起来）。 */
+        const isVisible = function(el) {
+          if (!el) return false;
+          try {
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 2 && rect.height > 2 && style.display !== 'none' && style.visibility !== 'hidden';
+          } catch (_) { return false; }
+        };
         /** 去掉被别的候选包住的节点，避免同一段内容被算两遍。 */
         const topLevelOnly = function(nodes) {
           return nodes.filter(function(node) {
@@ -84,21 +107,40 @@ internal object ArenaWebResponseScript {
                 const user = tagged || items.filter(function(row) {
                   return !row.querySelector('.ds-markdown') && clean(row.innerText || row.textContent || '').length > 0;
                 }).pop();
-                let element = null;
+                // 2026-09 的 DeepSeek 页面：深度思考的内容也是 .ds-markdown，只是包在 .ds-think-content 里；
+                // 正式回答带 .ds-assistant-message-main-content。原来取行内第一个 .ds-markdown，
+                // 开了深度思考就永远抓到思考过程，真正的回答一个字都没存（用户反馈 2026-09-05）。
+                let answerRow = null;
                 if (user && items.includes(user)) {
                   const index = items.indexOf(user);
-                  const answerRow = items.slice(index + 1).find(function(row) { return !!row.querySelector('.ds-markdown'); });
-                  element = answerRow && (answerRow.querySelector('.ds-markdown') || answerRow);
+                  answerRow = items.slice(index + 1).find(function(row) { return !!row.querySelector('.ds-markdown'); }) || null;
                 }
-                if (!element) {
+                if (!answerRow) {
                   const picked = pickSelector(['.ds-markdown', '[class*=assistant-message]', '[class*=bot-message]', '.markdown-body', '.prose']);
                   const scoped = scopeAfterTag(picked.nodes, tagged || null, Number(state.assistantBaseline || 0));
-                  element = scoped.nodes.filter(function(row) {
+                  const lastNode = scoped.nodes.filter(function(row) {
                     return clean(row.innerText || row.textContent || '').length > 0;
                   }).pop() || null;
+                  answerRow = lastNode ? (lastNode.closest('.ds-message') || lastNode.parentElement || lastNode) : null;
                 }
-                text = element ? arenaToMarkdown(element) : '';
-                streaming = !!document.querySelector('.ds-loading, [class*=generating], button[class*=stop]');
+                if (answerRow) {
+                  const mains = Array.from(answerRow.querySelectorAll('.ds-markdown.ds-assistant-message-main-content'));
+                  const nonThink = Array.from(answerRow.querySelectorAll('.ds-markdown')).filter(function(node) {
+                    return !node.closest('.ds-think-content, [class*=think]');
+                  });
+                  const finalNodes = mains.length ? mains : topLevelOnly(nonThink);
+                  finalText = clean(finalNodes.map(function(node) { return arenaToMarkdown(node); })
+                    .filter(function(part) { return part.length > 0; }).join('\n\n'));
+                  // 进度文本：正式回答还没开始时拿思考过程凑数，让人知道它在动
+                  const anyMarkdown = Array.from(answerRow.querySelectorAll('.ds-markdown'));
+                  text = finalText || (anyMarkdown.length ? arenaToMarkdown(anyMarkdown[anyMarkdown.length - 1]) : '');
+                  // 回答结束的明确信号：这条消息下面出现了复制 / 重新生成那排操作按钮
+                  // 操作栏容器就是这些图标按钮的父节点；不用 :has()，老 WebView 不认，一抛错整段都读不到
+                  const actionButton = answerRow.querySelector('.ds-button--iconLabelTertiary, .ds-button--icon');
+                  const actionBar = !!actionButton && barVisible(actionButton.parentElement || actionButton);
+                  const stopButton = !!document.querySelector('.ds-loading, [class*=generating], button[class*=stop]');
+                  streaming = stopButton || !actionBar;
+                }
             """.trimIndent()
             ArenaService.DOUBAO -> """
                 const rows = Array.from(document.querySelectorAll('[class*=v_list_row][data-observe-row]'));
@@ -112,9 +154,16 @@ internal object ArenaWebResponseScript {
                   const answerRow = rows.slice(index + 1).find(function(row) {
                     return !row.querySelector('[class*=bg-g-send]');
                   });
-                  const element = answerRow && (answerRow.querySelector('.md-box-root') || answerRow);
-                  text = element ? arenaToMarkdown(element) : '';
-                  streaming = !!answerRow && !answerRow.querySelector('[class*=message-action-bar]');
+                  // 深度思考 / 联网搜索会多出别的容器，正式回答只认不在思考容器里的 .md-box-root，多块按顺序拼
+                  const boxes = answerRow ? Array.from(answerRow.querySelectorAll('.md-box-root')) : [];
+                  const answerBoxes = topLevelOnly(boxes.filter(function(box) {
+                    return !box.closest('[class*=think], [class*=thought], [class*=reason], [class*=search-result]');
+                  }));
+                  finalText = clean(answerBoxes.map(function(box) { return arenaToMarkdown(box); })
+                    .filter(function(part) { return part.length > 0; }).join('\n\n'));
+                  const progressNode = boxes.length ? boxes[boxes.length - 1] : answerRow;
+                  text = finalText || (progressNode ? arenaToMarkdown(progressNode) : '');
+                  streaming = !!answerRow && !barVisible(answerRow.querySelector('[class*=message-action-bar]'));
                 }
             """.trimIndent()
             ArenaService.KIMI -> """
@@ -145,8 +194,11 @@ internal object ArenaWebResponseScript {
                   const parts = blocks.map(function(item) {
                     return arenaToMarkdown(item);
                   }).filter(function(part) { return part.length > 0; });
-                  text = parts.join('\n\n');
-                  streaming = !!assistant && !assistant.querySelector('.segment-assistant-actions');
+                  finalText = clean(parts.join('\n\n'));
+                  // 正式回答还没开始（还在思考）时，用最后一个 markdown 块当进度文本
+                  const anyBlocks = assistant ? Array.from(assistant.querySelectorAll('.markdown-container')) : [];
+                  text = finalText || (anyBlocks.length ? arenaToMarkdown(anyBlocks[anyBlocks.length - 1]) : '');
+                  streaming = !!assistant && !barVisible(assistant.querySelector('.segment-assistant-actions'));
                 }
             """.trimIndent()
             ArenaService.QWEN -> """
@@ -175,24 +227,61 @@ internal object ArenaWebResponseScript {
                 // 把千问思考过程中的半截答案当作最终答案存下来。
                 if (networkAnswer.length === 0) {
                   streaming = !!document.querySelector('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating]');
+                  weakDoneSignal = true;
                 }
                 if (securityChallenge && !text) {
                   throw new Error('千问触发安全验证，请打开千问网页完成验证后重试');
                 }
             """.trimIndent()
             ArenaService.YUANBAO -> """
-                const picked = pickSelector(['[class*=hyc-content-md]', '[class*=hyc-common-markdown]', '[class*=assistant] [class*=content]']);
+                // 2026-09 的元宝页面：一条回答 = .agent-chat__list__item--ai 里的 .agent-chat__conv--ai__speech_show。
+                // 原来按内部 hyc-content-md 小块拼接，加粗片段各自成段（真机实测 235 字被拆成 7 段）；改为整块转换。
+                const picked = pickSelector(['.agent-chat__conv--ai__speech_show', '[class*=hyc-content-md]', '[class*=hyc-common-markdown]', '[class*=assistant] [class*=content]']);
                 const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
-                streaming = !!document.querySelector('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating]');
+                // 深度搜索 / 思考过程 / 来源列表不算正式回答：在副本上摘掉再转 Markdown，页面本身不动
+                const auxYuanbao = '[class*=think], [class*=thought], [class*=reason], [class*=process], [class*=deep-search], [class*=timeline], [class*=sources], [class*=search-result]';
+                const stripAux = function(node) {
+                  try {
+                    const clone = node.cloneNode(true);
+                    Array.from(clone.querySelectorAll(auxYuanbao)).forEach(function(el) { if (el.parentNode) el.parentNode.removeChild(el); });
+                    return clone;
+                  } catch (_) { return node; }
+                };
+                const speechNodes = scoped.nodes.filter(function(node) {
+                  try { return node.matches('.agent-chat__conv--ai__speech_show'); } catch (_) { return false; }
+                });
+                if (speechNodes.length) {
+                  const speech = speechNodes[speechNodes.length - 1];
+                  // 开头那行"已处理 / 已完成 / 已搜索…"是状态标签，不是回答
+                  const dropStatus = function(value) {
+                    return clean(String(value || '').replace(/^(已处理|已完成|已搜索[^\n]*|已思考[^\n]*|已联网搜索[^\n]*)\s*\n+/, ''));
+                  };
+                  finalText = dropStatus(arenaToMarkdown(stripAux(speech)));
+                  text = finalText || dropStatus(arenaToMarkdown(speech)) || text;
+                }
+                // 结束信号（采样验证）：生成期间输入区有 "Stop Answering" 控件、该条回答的 toolbar 隐藏；结束后反过来
+                const aiItems = Array.from(document.querySelectorAll('.agent-chat__list__item--ai'));
+                const lastItem = aiItems.length ? aiItems[aiItems.length - 1] : null;
+                const stopVisible = Array.from(document.querySelectorAll('[aria-label="Stop Answering"], [aria-label*="停止"], button[class*=stop]')).some(isVisible);
+                const toolbarVisible = !!lastItem && isVisible(lastItem.querySelector('.agent-chat__conv--ai__toolbar'));
+                streaming = stopVisible || (!!lastItem && !toolbarVisible);
             """.trimIndent()
             ArenaService.ZHIPU -> """
-                const picked = pickSelector(['[class*=assistant] [class*=markdown]', '[class*=assistant] [class*=content]', '[data-role=assistant]', '[class*=answer] [class*=markdown]', '[class*=markdown-body]']);
+                // 2026-09 的智谱页面：一条回答 = .answer 里的 .answer-content（前面的"AI生成"标签不在其中）
+                const picked = pickSelector(['.answer .answer-content', '[class*=assistant] [class*=markdown]', '[class*=assistant] [class*=content]', '[data-role=assistant]', '[class*=answer] [class*=markdown]', '[class*=markdown-body]']);
                 const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
-                streaming = !!document.querySelector('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating], [class*=typing]');
+                // 结束信号：回答下面的 .interact 操作区显示出来；生成期间若有停止按钮也算还在生成
+                const answers = Array.from(document.querySelectorAll('.answer'));
+                const lastAnswer = answers.length ? answers[answers.length - 1] : null;
+                const stopVisible = Array.from(document.querySelectorAll('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating], [class*=typing]')).some(isVisible);
+                const interactVisible = !!lastAnswer && isVisible(lastAnswer.querySelector('.interact'));
+                streaming = stopVisible || (!!lastAnswer && !interactVisible);
+                // .interact 的时序没在真机上采样过，先按弱信号多等两轮
+                weakDoneSignal = true;
             """.trimIndent()
         }
         return """
@@ -202,7 +291,11 @@ internal object ArenaWebResponseScript {
               ${ArenaMarkdownScript.helper}
               $scopeHelper
               let text = '';
+              // finalText：严格抓取的正式回答（排除思考过程），回答结束后以它为准；留空表示与 text 相同
+              let finalText = '';
               let streaming = false;
+              // 站点只给得出"停止按钮"这种弱信号时置 true，控制器会多等两轮再判完成
+              let weakDoneSignal = false;
               let securityChallenge = false;
               try {
                 $serviceBody
@@ -215,7 +308,13 @@ internal object ArenaWebResponseScript {
                   if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) cut -= 1;
                   text = text.slice(0, cut);
                 }
-                return JSON.stringify({ found: text.length > 0, text, streaming, truncated, originalLength, securityChallenge });
+                if (finalText.length > ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS}) {
+                  let cutFinal = ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS};
+                  const unit = finalText.charCodeAt(cutFinal - 1);
+                  if (unit >= 0xD800 && unit <= 0xDBFF) cutFinal -= 1;
+                  finalText = finalText.slice(0, cutFinal);
+                }
+                return JSON.stringify({ found: text.length > 0, text, finalText: finalText || text, streaming, weakDoneSignal, truncated, originalLength, securityChallenge });
               } catch (error) {
                 return JSON.stringify({ found: false, text: '', streaming: false, truncated: false, originalLength: 0, securityChallenge, error: String(error && error.message || error) });
               }

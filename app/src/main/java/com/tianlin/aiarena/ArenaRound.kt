@@ -1,5 +1,6 @@
 package com.tianlin.aiarena
 
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -62,9 +63,6 @@ internal fun RoundStage(
     expandedAnswers: MutableMap<String, Boolean>,
     onOpenService: (ArenaService) -> Unit,
     snackbarHostState: SnackbarHostState,
-    speechState: SpeechPlaybackState?,
-    speechPlaybackRequest: SpeechPlaybackRequest?,
-    stopSpeech: (() -> Unit)?,
     copyText: TextCopyRequest?,
     shareText: TextShareRequest?,
     offline: Boolean,
@@ -296,10 +294,6 @@ internal fun RoundStage(
                     expanded = expandedAnswers[service.name] == true,
                     onExpandedChange = { expandedAnswers[service.name] = it },
                     onClick = { onOpenService(service) },
-                    isSpeaking = speechState?.activeKey == "answer:${service.name}",
-                    onSpeechToggle = speechPlaybackRequest?.let { request ->
-                        { request("answer:${service.name}", run.response) }
-                    },
                     onCopy = copyText?.let { copy ->
                         {
                             val prepared = ShareTextPolicy.discussionSummary(
@@ -363,15 +357,6 @@ internal fun RoundStage(
                             summary = sessionController.summary.text,
                             providerCount = completedCount,
                         ),
-                        isSpeaking = speechState?.activeKey == "summary:${sessionController.summary.requestId}",
-                        onSpeechToggle = speechPlaybackRequest?.let { request ->
-                            {
-                                request(
-                                    "summary:${sessionController.summary.requestId}",
-                                    sessionController.summary.text,
-                                )
-                            }
-                        },
                         onCopy = copyText?.let { copy ->
                             {
                                 val prepared = ShareTextPolicy.discussionSummary(
@@ -481,6 +466,35 @@ internal fun RoundStage(
     }
 }
 
+private val GUIDANCE_EXAMPLES = listOf("说得再简单些", "重点比较优缺点", "给出具体做法")
+
+@Composable
+private fun GuidanceChip(
+    text: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = ArenaStyle.colors
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.semantics { contentDescription = "填入要求：$text" },
+        shape = RoundedCornerShape(50),
+        color = colors.surface,
+        contentColor = colors.accent,
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
 @Composable
 private fun NextRoundPanel(
     guidance: String,
@@ -492,12 +506,32 @@ private fun NextRoundPanel(
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
+    val context = LocalContext.current
+    val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
+    // 很多人不知道「观点讨论」前可以先写自己的要求（直接点也能跑）。第一次到这里给一条提示，
+    // 用户点「知道了」或自己写过要求之后就不再打扰（用户反馈 2026-09-05）。
+    var hintSeen by remember { mutableStateOf(guidePreferences.hasSeenRoundGuidanceHint()) }
+    val dismissHint = {
+        if (!hintSeen) {
+            hintSeen = true
+            guidePreferences.markRoundGuidanceHintSeen()
+        }
+    }
     ArenaCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             SectionTitle(text = "继续追问")
+            if (!hintSeen) {
+                ArenaNotice(
+                    tone = NoticeTone.INFO,
+                    title = "可以先提要求，再让它们讨论",
+                    text = "在下面写一句你的要求（比如「说得再简单些」），AI 讨论时会照着做。不写也能直接点「观点讨论」。",
+                    actionLabel = "知道了",
+                    onAction = dismissHint,
+                )
+            }
             Text(
                 text = if (captainName != null) {
                     "「观点讨论」会把大家的观点互相转达，并由队长 $captainName 汇总成一条，你看它那条就行。" +
@@ -510,14 +544,17 @@ private fun NextRoundPanel(
             )
             OutlinedTextField(
                 value = guidance,
-                onValueChange = { onGuidanceChange(it.take(ArenaLimits.MAX_GUIDANCE_CHARS)) },
+                onValueChange = {
+                    onGuidanceChange(it.take(ArenaLimits.MAX_GUIDANCE_CHARS))
+                    if (it.isNotBlank()) dismissHint()
+                },
                 enabled = enabled,
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 84.dp),
                 placeholder = {
                     Text(
-                        text = "想补充什么？独立迭代必填，观点讨论可不填",
+                        text = "你的要求（选填），例如：说得再简单些 / 重点比较优缺点",
                         color = colors.muted,
                         style = MaterialTheme.typography.bodyMedium,
                     )
@@ -537,6 +574,25 @@ private fun NextRoundPanel(
                 ),
                 maxLines = 4,
             )
+            // 三个现成的要求：点一下就填进去，长辈不用自己想措辞
+            if (guidance.isBlank()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    GUIDANCE_EXAMPLES.forEach { example ->
+                        GuidanceChip(
+                            text = example,
+                            enabled = enabled,
+                            onClick = {
+                                onGuidanceChange(example)
+                                dismissHint()
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                }
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -572,8 +628,6 @@ private fun ProviderResultCard(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onClick: () -> Unit,
-    isSpeaking: Boolean,
-    onSpeechToggle: (() -> Unit)?,
     onCopy: (() -> Unit)?,
     recoveryEnabled: Boolean,
     canReextract: Boolean,
@@ -673,7 +727,7 @@ private fun ProviderResultCard(
                     if (run.responseTruncated) {
                         Text(
                             text = "原回答约 ${run.originalResponseLength} 字，这里只保留了前 " +
-                                "${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS} 字；完整内容点「原网页」看。",
+                                "${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS} 字；完整内容点「跳转网页」看。",
                             color = colors.warning,
                             style = MaterialTheme.typography.bodySmall,
                         )
@@ -699,23 +753,12 @@ private fun ProviderResultCard(
                                 contentDescriptionText = "复制 ${service.displayName} 的回答",
                             )
                         }
-                        if (onSpeechToggle != null) {
-                            ArenaTextAction(
-                                text = if (isSpeaking) "停止" else "朗读",
-                                onClick = onSpeechToggle,
-                                contentDescriptionText = if (isSpeaking) {
-                                    "停止朗读"
-                                } else {
-                                    "朗读 ${service.displayName} 的回答"
-                                },
-                            )
-                        }
                         Spacer(Modifier.weight(1f))
                         ArenaTextAction(
-                            text = "原网页",
+                            text = "跳转网页",
                             onClick = onClick,
                             color = colors.muted,
-                            contentDescriptionText = "打开 ${service.displayName} 原网页",
+                            contentDescriptionText = "跳转到 ${service.displayName} 网页",
                         )
                     }
                 }
@@ -814,64 +857,67 @@ private fun ErrorAdviceBox(
             )
         } else {
             val primary = advice.primary
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            // 主动作独占一行、其余动作另起一行：以前挤在一行按权重分宽度，手机上「重新提取」会被裁成"重新"，
+            // 用户根本猜不出那是什么（2026-09-05 用户反馈）。
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 when (primary) {
                     ArenaErrorHelp.Action.LOGIN, ArenaErrorHelp.Action.OPEN_PAGE -> ArenaSecondaryButton(
-                        text = if (primary == ArenaErrorHelp.Action.LOGIN) "打开网页登录" else "打开网页",
+                        text = if (primary == ArenaErrorHelp.Action.LOGIN) "跳转网页登录" else "跳转网页",
                         onClick = onOpenPage,
-                        modifier = Modifier.weight(1.4f),
+                        modifier = Modifier.fillMaxWidth(),
                     )
                     ArenaErrorHelp.Action.REEXTRACT -> ArenaSecondaryButton(
                         text = "重新提取",
                         onClick = onRetryExtraction,
                         enabled = recoveryEnabled && canReextract,
-                        modifier = Modifier.weight(1.4f),
+                        modifier = Modifier.fillMaxWidth(),
                     )
                     else -> ArenaSecondaryButton(
                         text = "重发",
                         onClick = onRetrySend,
                         enabled = recoveryEnabled,
-                        modifier = Modifier.weight(1.2f),
+                        modifier = Modifier.fillMaxWidth(),
                     )
                 }
-                if (primary != ArenaErrorHelp.Action.RESEND && primary != ArenaErrorHelp.Action.NONE) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    if (primary != ArenaErrorHelp.Action.RESEND && primary != ArenaErrorHelp.Action.NONE) {
+                        ArenaTextAction(
+                            text = "重发",
+                            onClick = onRetrySend,
+                            enabled = recoveryEnabled,
+                            contentDescriptionText = "重新发送给 ${service.displayName}",
+                        )
+                    }
+                    if (primary != ArenaErrorHelp.Action.REEXTRACT && canReextract) {
+                        ArenaTextAction(
+                            text = "重新提取",
+                            onClick = onRetryExtraction,
+                            enabled = recoveryEnabled,
+                            contentDescriptionText = "重新提取 ${service.displayName} 的回答",
+                        )
+                    }
+                    if (primary == ArenaErrorHelp.Action.NONE || primary == ArenaErrorHelp.Action.RESEND ||
+                        primary == ArenaErrorHelp.Action.REEXTRACT
+                    ) {
+                        ArenaTextAction(
+                            text = "跳转网页",
+                            onClick = onOpenPage,
+                            contentDescriptionText = "跳转到 ${service.displayName} 网页",
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
                     ArenaTextAction(
-                        text = "重发",
-                        onClick = onRetrySend,
+                        text = "跳过",
+                        onClick = onSkip,
                         enabled = recoveryEnabled,
-                        modifier = Modifier.weight(1f),
-                        contentDescriptionText = "重新发送给 ${service.displayName}",
+                        color = colors.muted,
+                        contentDescriptionText = "跳过 ${service.displayName}",
                     )
                 }
-                if (primary == ArenaErrorHelp.Action.NONE) {
-                    ArenaTextAction(
-                        text = "打开网页",
-                        onClick = onOpenPage,
-                        modifier = Modifier.weight(1f),
-                        contentDescriptionText = "打开 ${service.displayName} 原网页",
-                    )
-                }
-                if (primary != ArenaErrorHelp.Action.REEXTRACT && canReextract) {
-                    ArenaTextAction(
-                        text = "重新提取",
-                        onClick = onRetryExtraction,
-                        enabled = recoveryEnabled,
-                        modifier = Modifier.weight(1.1f),
-                        contentDescriptionText = "重新提取 ${service.displayName} 的回答",
-                    )
-                }
-                ArenaTextAction(
-                    text = "跳过",
-                    onClick = onSkip,
-                    enabled = recoveryEnabled,
-                    modifier = Modifier.weight(0.9f),
-                    color = colors.muted,
-                    contentDescriptionText = "跳过 ${service.displayName}",
-                )
             }
         }
     }
@@ -881,8 +927,6 @@ private fun ErrorAdviceBox(
 private fun DiscussionSummaryCard(
     summary: DiscussionSummary,
     trustSignal: DiscussionTrustSignal,
-    isSpeaking: Boolean,
-    onSpeechToggle: (() -> Unit)?,
     onCopy: (() -> Unit)?,
     onShare: (() -> Unit)?,
     retryEnabled: Boolean,
@@ -939,14 +983,6 @@ private fun DiscussionSummaryCard(
                             onClick = onShare,
                             modifier = Modifier.weight(1f),
                             contentDescriptionText = "分享讨论总结",
-                        )
-                    }
-                    if (onSpeechToggle != null) {
-                        ArenaTextAction(
-                            text = if (isSpeaking) "停止" else "朗读",
-                            onClick = onSpeechToggle,
-                            modifier = Modifier.weight(1f),
-                            contentDescriptionText = if (isSpeaking) "停止朗读" else "朗读讨论总结",
                         )
                     }
                 }
