@@ -87,6 +87,8 @@ data class ServiceStatus(
     val state: ConnectionState = ConnectionState.NOT_LOADED,
     val detail: String = "尚未打开",
     val url: String = "",
+    /** 网页里读到的"当前模型 / 思考模式"；读不到就是空的，界面显示"模式 未知"，绝不猜。 */
+    val modeReading: AiModeReading = AiModeReading(),
 )
 
 data class LoginTrustDecision(
@@ -142,6 +144,10 @@ data class ParticipantRun(
     val detail: String = "等待开始",
     val responseTruncated: Boolean = false,
     val originalResponseLength: Int = response.length,
+    /** 回答期间从网页读到的模型 / 模式小字（例如 "Instant · 深度思考 关"）；空 = 读不到。 */
+    val modeLabel: String = "",
+    /** 这条回答里出现过思考过程块：站点自己承认"这次深度思考了"，比开关状态更可信。 */
+    val thinkingUsed: Boolean = false,
 )
 
 enum class AnswerMode(val displayName: String, val description: String) {
@@ -193,7 +199,47 @@ data class DiscussionSummary(
     val requestId: String = "",
     val text: String = "",
     val detail: String = "尚未总结",
+    /** 这份总结是按哪个深度做的；老文件没有这个字段时按「标准」。 */
+    val depth: SummaryDepth = SummaryDepth.STANDARD,
 )
+
+/**
+ * 「队长总结」的深度。家人反馈旧的"队长总结"比较浅——根因是它塞在观点讨论轮里、限 400 字、
+ * 只引用别家回答的片段。现在总结独立成一步，按深度换 prompt 与篇幅，喂的是完整回答。
+ */
+enum class SummaryDepth(
+    val displayName: String,
+    /** 分段控件下面的一句话说明。 */
+    val caption: String,
+    /** 给队长的篇幅上限（汉字）。 */
+    val maxChars: Int,
+    /** 结果页上的白话解释。 */
+    val explanation: String,
+) {
+    BRIEF(
+        displayName = "简明",
+        caption = "只要结论",
+        maxChars = 200,
+        explanation = "一句话结论，几家各一句点评，再给最该做的一件事。约 200 字，最快。",
+    ),
+    STANDARD(
+        displayName = "标准",
+        caption = "共识与分歧",
+        maxChars = 500,
+        explanation = "结论、共识、分歧、建议四段；分歧处写明谁说了什么、更信哪个。约 500 字。",
+    ),
+    DEEP(
+        displayName = "深入",
+        caption = "逐条核对",
+        maxChars = 1200,
+        explanation = "先逐条核对几家提到的数字和事实，再给结论、依据与风险、分步做法。约 1200 字，要等久一些。",
+    ),
+    ;
+
+    companion object {
+        fun fromName(value: String?): SummaryDepth = entries.firstOrNull { it.name == value } ?: STANDARD
+    }
+}
 
 data class SendOutcome(
     val success: Boolean,
@@ -217,6 +263,10 @@ data class ResponseSnapshot(
     val finalText: String = text,
     /** 站点只有"停止按钮"这种弱的结束信号（千问 / 元宝 / 智谱）：控制器要多等两轮再判完成。 */
     val weakDoneSignal: Boolean = false,
+    /** 读回答时顺手读到的模型 / 模式小字；空 = 读不到。 */
+    val modeLabel: String = "",
+    /** 这条回答里出现过思考过程块。 */
+    val thinkingUsed: Boolean = false,
 ) {
     /** 回答已结束时该存下来的文本：优先正式回答，严格抓取抓空了才退回进度文本，宁可多抓不抓空。 */
     val settledText: String

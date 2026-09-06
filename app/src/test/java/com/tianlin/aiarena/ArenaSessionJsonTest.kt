@@ -2,6 +2,7 @@ package com.tianlin.aiarena
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -99,5 +100,50 @@ class ArenaSessionJsonTest {
         )
 
         assertEquals(mapOf(ArenaService.KIMI to "https://www.kimi.com/chat/ok"), decoded.conversationUrls)
+    }
+
+    // ---------- 0.11：总结深度、回答期间的模式小字与思考痕迹 ----------
+
+    @Test
+    fun summaryDepthAndModeFieldsSurviveRoundTrip() {
+        val original = snapshot().copy(
+            summary = DiscussionSummary(
+                phase = ParticipantPhase.COMPLETE,
+                judge = ArenaService.KIMI,
+                text = "总结",
+                depth = SummaryDepth.DEEP,
+            ),
+            runs = mapOf(
+                ArenaService.DEEPSEEK to ParticipantRun(
+                    phase = ParticipantPhase.COMPLETE,
+                    requestId = "r",
+                    response = "答",
+                    modeLabel = "Instant · 深度思考 开",
+                    thinkingUsed = true,
+                ),
+            ),
+        )
+
+        val decoded = ArenaSessionJson.decode(JSONObject(ArenaSessionJson.encode(original).toString()))
+
+        assertEquals(SummaryDepth.DEEP, decoded.summary.depth)
+        assertEquals("Instant · 深度思考 开", decoded.runs.getValue(ArenaService.DEEPSEEK).modeLabel)
+        assertTrue(decoded.runs.getValue(ArenaService.DEEPSEEK).thinkingUsed)
+    }
+
+    @Test
+    fun filesWithoutDepthOrModeFieldsDefaultToStandardAndUnknown() {
+        // 0.10 及更早写出的文件：总结按「标准」算，模式小字为空（界面写"未知"），不能报错
+        val json = ArenaSessionJson.encode(snapshot()).apply {
+            getJSONObject("summary").remove("depth")
+            getJSONObject("runs").getJSONObject("DEEPSEEK").remove("modeLabel")
+            getJSONObject("runs").getJSONObject("DEEPSEEK").remove("thinkingUsed")
+        }
+
+        val decoded = ArenaSessionJson.decode(JSONObject(json.toString()))
+
+        assertEquals(SummaryDepth.STANDARD, decoded.summary.depth)
+        assertEquals("", decoded.runs.getValue(ArenaService.DEEPSEEK).modeLabel)
+        assertFalse(decoded.runs.getValue(ArenaService.DEEPSEEK).thinkingUsed)
     }
 }

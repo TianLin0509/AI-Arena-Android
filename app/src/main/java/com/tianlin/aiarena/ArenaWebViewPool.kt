@@ -346,6 +346,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                             originalLength > ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS,
                         originalLength = originalLength,
                         securityChallenge = payload.optBoolean("securityChallenge", false),
+                        modeLabel = AiModePolicy.label(AiModePolicy.parse(payload.optJSONObject("mode"))),
+                        thinkingUsed = payload.optBoolean("thinkingUsed", false),
                     ),
                 )
             } catch (error: Exception) {
@@ -840,7 +842,37 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     else -> "后台检查中，打开网页可确认"
                 },
                 url = webView.url.orEmpty(),
+                // 模式小字由下面的探针单独更新；这里先沿用上一次的，免得每次登录探测都闪成"未知"
+                modeReading = statuses[service]?.modeReading ?: AiModeReading(),
             )
+            if (state == ConnectionState.SIGNED_IN) evaluateMode(service, webView, onComplete) else onComplete()
+        }
+    }
+
+    /**
+     * 读一次网页上的"当前模型 / 思考模式"（只读，不点任何开关），写进状态栏小字。
+     * 各站页面改版这些文字就会变，所以它是锦上添花：读不到不影响提问，也绝不猜。
+     */
+    private fun evaluateMode(service: ArenaService, webView: WebView, onComplete: () -> Unit) {
+        var consumed = false
+        val timeout = Runnable {
+            if (consumed) return@Runnable
+            consumed = true
+            onComplete()
+        }
+        handler.postDelayed(timeout, MODE_PROBE_TIMEOUT_MS)
+        webView.evaluateJavascript(ArenaWebModeScript.build(service)) { raw ->
+            if (consumed) return@evaluateJavascript
+            consumed = true
+            handler.removeCallbacks(timeout)
+            if (!destroyed && webViews[service] === webView) {
+                val reading = try {
+                    AiModePolicy.parse(JSONObject(decodeJsValue(raw)))
+                } catch (_: Exception) {
+                    AiModeReading()
+                }
+                statuses[service] = (statuses[service] ?: ServiceStatus()).copy(modeReading = reading)
+            }
             onComplete()
         }
     }
@@ -1385,6 +1417,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val AUTOMATION_QUEUE_INTERVAL_MS = 200L
         private const val AUTOMATION_QUEUE_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
+        private const val MODE_PROBE_TIMEOUT_MS = 4_000L
         /** 开新对话 / 切历史对话的整页加载上限；超过就放弃等待，直接尝试发送。 */
         private const val NAVIGATION_TIMEOUT_MS = 20_000L
         /** onPageFinished 之后再等一会儿，让单页应用把输入框画出来。 */

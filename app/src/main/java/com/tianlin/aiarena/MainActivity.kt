@@ -192,7 +192,7 @@ class MainActivity : ComponentActivity() {
             putExtra(Intent.EXTRA_TEXT, text)
         }
         return try {
-            startActivity(Intent.createChooser(sendIntent, "分享讨论总结"))
+            startActivity(Intent.createChooser(sendIntent, "分享总结"))
             true
         } catch (_: ActivityNotFoundException) {
             false

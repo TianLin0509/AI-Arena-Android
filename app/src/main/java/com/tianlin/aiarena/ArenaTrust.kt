@@ -38,7 +38,8 @@ object DiscussionTrustPolicy {
         }
         return DiscussionTrustSignal(
             providerCount = providerCount.coerceAtLeast(0),
-            consensusReviewed = normalized.contains("共识"),
+            // 「深入」总结按 prompt 写的是"几家一致 / 有分歧"，没有"共识"两个字，也算把共识核过了
+            consensusReviewed = normalized.contains("共识") || normalized.contains("一致"),
             differencesReviewed = normalized.contains("分歧") || normalized.contains("不同"),
             verificationReminderCount = verificationLines,
             domainCaution = domainCaution,
@@ -117,7 +118,7 @@ object QuestionLengthPolicy {
         if (question.length <= limit) return null
         val tightest = services.minByOrNull(PromptBudgetPolicy::budgetFor)
         val who = tightest?.displayName?.let { "（${it}的上下文最紧）" }.orEmpty()
-        return "问题较长，初始回答可以发送，但「观点讨论」和「讨论总结」可能因超出上下文而失败$who。" +
+        return "问题较长，初始回答可以发送，但「观点讨论」和「队长总结」可能因超出上下文而失败$who。" +
             "建议压到 $limit 字以内。"
     }
 }

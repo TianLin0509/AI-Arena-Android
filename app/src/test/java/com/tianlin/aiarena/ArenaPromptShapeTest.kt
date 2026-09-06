@@ -29,38 +29,38 @@ class ArenaPromptShapeTest {
 
     @Test
     fun debatePromptHasNoStrayIndent() {
-        listOf(true, false).forEach { asCaptain ->
-            val prompt = DebatePromptBuilder.build(
-                originalQuestion = "父母血压 145/92 需要吃药吗？",
-                target = ArenaService.DEEPSEEK,
-                responses = responses,
-                debateIndex = 1,
-                guidance = "顺便说说饮食",
-                asCaptain = asCaptain,
-            )
-            assertNoIndentedLines("debate(asCaptain=$asCaptain)", prompt)
-        }
+        val prompt = DebatePromptBuilder.build(
+            originalQuestion = "父母血压 145/92 需要吃药吗？",
+            target = ArenaService.DEEPSEEK,
+            responses = responses,
+            debateIndex = 1,
+            guidance = "顺便说说饮食",
+        )
+        assertNoIndentedLines("debate", prompt)
     }
 
     @Test
-    fun summaryPromptHasNoStrayIndent() {
-        val prompt = DiscussionSummaryPromptBuilder.build(
-            originalQuestion = "父母血压 145/92 需要吃药吗？",
-            history = listOf(
-                RoundRecord(
-                    number = 1,
-                    kind = RoundKind.INITIAL,
-                    answerMode = AnswerMode.PARALLEL,
-                    guidance = "",
-                    results = emptyMap(),
-                    startedAtMillis = 0,
-                    finishedAtMillis = 1,
+    fun summaryPromptHasNoStrayIndentAtAnyDepth() {
+        SummaryDepth.entries.forEach { depth ->
+            val prompt = DiscussionSummaryPromptBuilder.build(
+                originalQuestion = "父母血压 145/92 需要吃药吗？",
+                history = listOf(
+                    RoundRecord(
+                        number = 1,
+                        kind = RoundKind.INITIAL,
+                        answerMode = AnswerMode.PARALLEL,
+                        guidance = "",
+                        results = emptyMap(),
+                        startedAtMillis = 0,
+                        finishedAtMillis = 1,
+                    ),
                 ),
-            ),
-            responses = responses,
-            customInstruction = "讲通俗一点",
-        )
-        assertNoIndentedLines("summary", prompt)
+                responses = responses,
+                customInstruction = "讲通俗一点",
+                depth = depth,
+            )
+            assertNoIndentedLines("summary($depth)", prompt)
+        }
     }
 
     @Test
@@ -74,12 +74,11 @@ class ArenaPromptShapeTest {
     }
 
     @Test
-    fun captainPromptStartsByNamingTheRole() {
-        val prompt = DebatePromptBuilder.build(
+    fun summaryPromptStartsByNamingTheCaptain() {
+        val prompt = DiscussionSummaryPromptBuilder.build(
             originalQuestion = "问题",
-            target = ArenaService.DEEPSEEK,
+            history = emptyList(),
             responses = responses,
-            asCaptain = true,
         )
         assertTrue(prompt.lines().first().contains("队长"))
     }

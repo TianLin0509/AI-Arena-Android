@@ -67,6 +67,18 @@ internal object ArenaWebResponseScript {
             return rect.width > 2 && rect.height > 2 && style.display !== 'none' && style.visibility !== 'hidden';
           } catch (_) { return false; }
         };
+        /**
+         * 这条回答里是否真有思考过程：思考容器存在且有一段像样的文字（> 20 字）。
+         * 只看"存在"会误报——有些站点空的思考外壳一直在 DOM 里。
+         */
+        const thinkingIn = function(scope, selector) {
+          if (!scope) return false;
+          try {
+            return Array.from(scope.querySelectorAll(selector)).some(function(el) {
+              return clean(el.innerText || el.textContent || '').length > 20;
+            });
+          } catch (_) { return false; }
+        };
         /** 去掉被别的候选包住的节点，避免同一段内容被算两遍。 */
         const topLevelOnly = function(nodes) {
           return nodes.filter(function(node) {
@@ -124,6 +136,7 @@ internal object ArenaWebResponseScript {
                   answerRow = lastNode ? (lastNode.closest('.ds-message') || lastNode.parentElement || lastNode) : null;
                 }
                 if (answerRow) {
+                  thinkingUsed = thinkingIn(answerRow, '.ds-think-content, [class*=think]');
                   const mains = Array.from(answerRow.querySelectorAll('.ds-markdown.ds-assistant-message-main-content'));
                   const nonThink = Array.from(answerRow.querySelectorAll('.ds-markdown')).filter(function(node) {
                     return !node.closest('.ds-think-content, [class*=think]');
@@ -156,6 +169,7 @@ internal object ArenaWebResponseScript {
                   });
                   // 深度思考 / 联网搜索会多出别的容器，正式回答只认不在思考容器里的 .md-box-root，多块按顺序拼
                   const boxes = answerRow ? Array.from(answerRow.querySelectorAll('.md-box-root')) : [];
+                  thinkingUsed = thinkingIn(answerRow, '[class*=think], [class*=thought], [class*=reason]');
                   const answerBoxes = topLevelOnly(boxes.filter(function(box) {
                     return !box.closest('[class*=think], [class*=thought], [class*=reason], [class*=search-result]');
                   }));
@@ -177,6 +191,7 @@ internal object ArenaWebResponseScript {
                   while (assistant && !String(assistant.className).includes('chat-content-item-assistant')) {
                     assistant = assistant.nextElementSibling;
                   }
+                  thinkingUsed = thinkingIn(assistant, '.thinking-container, [class*=thinking], [class*=thought]');
                   // 2026-09 起 Kimi 把整条回答（含思考过程）都包在 .toolcall-rollup 里，
                   // 原来按 [class*=toolcall] 一刀切会把真正的答案也排掉，抓不到一个字。
                   // 思考块的特征是 .toolcall-container.thinking-container / .toolcall-flow / .toolcall-content，
@@ -222,6 +237,9 @@ internal object ArenaWebResponseScript {
                 const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 if (!text) text = collectText(scoped, ['.qk-md-paragraph'], picked.selector, scoped.anchored);
+                const qwLast = picked.nodes.length ? picked.nodes[picked.nodes.length - 1] : null;
+                const qwRow = qwLast ? (qwLast.closest('[class*=message-card-wrap], [class*=answer], [class*=assistant]') || qwLast.parentElement) : null;
+                thinkingUsed = thinkingIn(qwRow, '[class*=think], [class*=thought], [class*=reason]');
                 // SSE 已经建了 record 但还没解析出内容时，networkRecord 存在而 answer 为空。
                 // 此时 streaming 必须回落到 DOM 探测，否则会被当成"已经稳定"提前判完成，
                 // 把千问思考过程中的半截答案当作最终答案存下来。
@@ -264,6 +282,7 @@ internal object ArenaWebResponseScript {
                 // 结束信号（采样验证）：生成期间输入区有 "Stop Answering" 控件、该条回答的 toolbar 隐藏；结束后反过来
                 const aiItems = Array.from(document.querySelectorAll('.agent-chat__list__item--ai'));
                 const lastItem = aiItems.length ? aiItems[aiItems.length - 1] : null;
+                thinkingUsed = thinkingIn(lastItem, '[class*=think], [class*=thought], [class*=reason], [class*=deep-search]');
                 const stopVisible = Array.from(document.querySelectorAll('[aria-label="Stop Answering"], [aria-label*="停止"], button[class*=stop]')).some(isVisible);
                 const toolbarVisible = !!lastItem && isVisible(lastItem.querySelector('.agent-chat__conv--ai__toolbar'));
                 streaming = stopVisible || (!!lastItem && !toolbarVisible);
@@ -277,6 +296,7 @@ internal object ArenaWebResponseScript {
                 // 结束信号：回答下面的 .interact 操作区显示出来；生成期间若有停止按钮也算还在生成
                 const answers = Array.from(document.querySelectorAll('.answer'));
                 const lastAnswer = answers.length ? answers[answers.length - 1] : null;
+                thinkingUsed = thinkingIn(lastAnswer ? (lastAnswer.closest('.conversation') || lastAnswer.parentElement || lastAnswer) : null, '[class*=think], [class*=thought], [class*=reason]');
                 const stopVisible = Array.from(document.querySelectorAll('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating], [class*=typing]')).some(isVisible);
                 const interactVisible = !!lastAnswer && isVisible(lastAnswer.querySelector('.interact'));
                 streaming = stopVisible || (!!lastAnswer && !interactVisible);
@@ -297,7 +317,15 @@ internal object ArenaWebResponseScript {
               // 站点只给得出"停止按钮"这种弱信号时置 true，控制器会多等两轮再判完成
               let weakDoneSignal = false;
               let securityChallenge = false;
+              // 这条回答里出现过思考过程块：站点自己承认"这次深度思考了"
+              let thinkingUsed = false;
+              // 当前模型 / 思考模式（只读）；读不到就全空，绝不猜
+              const mode = { model: '', thinking: '', search: '', extra: '' };
               try {
+                try {
+                  ${ArenaWebModeScript.helpers}
+                  ${ArenaWebModeScript.body(service)}
+                } catch (_) {}
                 $serviceBody
                 const originalLength = text.length;
                 let truncated = originalLength > ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS};
@@ -314,7 +342,7 @@ internal object ArenaWebResponseScript {
                   if (unit >= 0xD800 && unit <= 0xDBFF) cutFinal -= 1;
                   finalText = finalText.slice(0, cutFinal);
                 }
-                return JSON.stringify({ found: text.length > 0, text, finalText: finalText || text, streaming, weakDoneSignal, truncated, originalLength, securityChallenge });
+                return JSON.stringify({ found: text.length > 0, text, finalText: finalText || text, streaming, weakDoneSignal, truncated, originalLength, securityChallenge, mode, thinkingUsed });
               } catch (error) {
                 return JSON.stringify({ found: false, text: '', streaming: false, truncated: false, originalLength: 0, securityChallenge, error: String(error && error.message || error) });
               }

@@ -299,6 +299,8 @@ internal object ArenaSessionJson {
         .put("detail", run.detail)
         .put("responseTruncated", run.responseTruncated)
         .put("originalResponseLength", run.originalResponseLength)
+        .put("modeLabel", run.modeLabel)
+        .put("thinkingUsed", run.thinkingUsed)
 
     private fun decodeRun(json: JSONObject): ParticipantRun = ParticipantRun(
         phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
@@ -307,6 +309,8 @@ internal object ArenaSessionJson {
         detail = json.optString("detail").take(200),
         responseTruncated = json.optBoolean("responseTruncated"),
         originalResponseLength = json.optInt("originalResponseLength"),
+        modeLabel = json.optString("modeLabel").take(80),
+        thinkingUsed = json.optBoolean("thinkingUsed"),
     )
 
     private fun encodeRound(round: RoundRecord): JSONObject = JSONObject()
@@ -338,6 +342,7 @@ internal object ArenaSessionJson {
         .put("requestId", summary.requestId)
         .put("text", summary.text)
         .put("detail", summary.detail)
+        .put("depth", summary.depth.name)
 
     private fun decodeSummary(json: JSONObject): DiscussionSummary = DiscussionSummary(
         phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
@@ -345,6 +350,7 @@ internal object ArenaSessionJson {
         requestId = json.optString("requestId"),
         text = json.optString("text").take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
         detail = json.optString("detail").take(200),
+        depth = SummaryDepth.fromName(json.optString("depth")),
     )
 
     private inline fun <reified T : Enum<T>> String.enumOrNull(): T? =

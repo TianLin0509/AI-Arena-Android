@@ -545,26 +545,14 @@ private fun DiscussionHome(
         mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion })
     }
     var answerModeName by rememberSaveable { mutableStateOf(guidePreferences.loadAnswerMode().name) }
-    // 队长模式的状态放在这里：辩论、总结、结果页和设置页都挂在 DiscussionHome 下面，
-    // 放这一层就不用把队长层层透传过 ArenaApp / RoundtableRoot。
+    // 队长与总结深度的记忆：结果页「队长总结」用它记住上次的选择。
     val captainPreferences = remember(context) { ArenaCaptainPreferences(context) }
-    var captainEnabled by rememberSaveable { mutableStateOf(captainPreferences.isEnabled()) }
-    var captainStoredName by rememberSaveable { mutableStateOf(captainPreferences.loadCaptain()?.name) }
     var roundGuidance by rememberSaveable { mutableStateOf("") }
     val expandedAnswers = remember { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
     val answerMode = AnswerMode.fromName(answerModeName)
     val usableServices = selectedServices.filter {
         pool.statuses[it]?.state?.isUsable() == true
-    }
-    // 关掉队长模式就是 null，全流程自动退回"各家平等辩论"的老行为。
-    val captain = if (captainEnabled) {
-        CaptainPolicy.resolve(
-            stored = ArenaService.fromName(captainStoredName),
-            members = selectedServices,
-        )
-    } else {
-        null
     }
     val loginNeededServices = selectedServices.filter {
         when (pool.statuses[it]?.state ?: ConnectionState.NOT_LOADED) {
@@ -688,16 +676,6 @@ private fun DiscussionHome(
                     answerModeName = mode.name
                     guidePreferences.saveAnswerMode(mode)
                 },
-                captainEnabled = captainEnabled,
-                captain = captain,
-                onCaptainEnabledChange = { enabled ->
-                    captainEnabled = enabled
-                    captainPreferences.setEnabled(enabled)
-                },
-                onCaptainChange = { service ->
-                    captainStoredName = service?.name
-                    captainPreferences.saveCaptain(service)
-                },
                 onBack = { onPageChange(RoundtablePage.HOME) },
                 onAppearance = { onPageChange(RoundtablePage.APPEARANCE) },
                 onMembers = {
@@ -793,7 +771,6 @@ private fun DiscussionHome(
                     pool = pool,
                     sessionController = sessionController,
                     selectedServices = selectedServices,
-                    usableServices = usableServices,
                     usableCount = usableCount,
                     completedCount = completedCount,
                     sessionStage = sessionStage,
@@ -806,7 +783,7 @@ private fun DiscussionHome(
                     copyText = copyText,
                     shareText = shareText,
                     offline = offline,
-                    captain = captain,
+                    captainPreferences = captainPreferences,
                     onNewQuestion = startFresh,
                 )
             }

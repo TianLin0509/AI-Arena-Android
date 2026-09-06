@@ -73,8 +73,11 @@ class DebatePromptBuilderTest {
             customInstruction = "只给三条建议",
         )
 
-        assertTrue(prompt.contains("一句话结论"))
-        assertTrue(prompt.contains("仍有分歧或需要核验"))
+        // 0.11 默认「标准」深度：结论 / 共识 / 分歧 / 建议 四段
+        assertTrue(prompt.contains("结论"))
+        assertTrue(prompt.contains("共识"))
+        assertTrue(prompt.contains("分歧"))
+        assertTrue(prompt.contains("建议"))
         assertTrue(prompt.contains("观点A"))
         assertTrue(prompt.contains("观点B"))
         assertTrue(prompt.contains("只给三条建议"))

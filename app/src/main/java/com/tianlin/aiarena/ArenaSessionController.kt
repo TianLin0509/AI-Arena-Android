@@ -61,10 +61,6 @@ class ArenaSessionController(
     var sessionServices by mutableStateOf(ArenaService.defaultMembers)
         private set
 
-    /** 当前这一轮实际负责整合的队长；null = 这一轮没开队长模式（或还没开轮）。 */
-    var currentRoundCaptain by mutableStateOf<ArenaService?>(null)
-        private set
-
     var storageWarning by mutableStateOf<String?>(null)
         private set
 
@@ -178,21 +174,16 @@ class ArenaSessionController(
         return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt)
     }
 
-    /**
-     * @param captain 队长模式下负责整合的那位；null 表示关闭队长模式，各家平等辩论。
-     *   指定的队长这一轮没答上来时，由 [CaptainPolicy.forRound] 顺延给第一位参与者。
-     */
+    /** 观点讨论：把其他 AI 的回答转给每一家让它们互相评论。各家平等；把大家收拢成一条的活交给「队长总结」。 */
     fun startDebate(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
-        captain: ArenaService? = null,
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
         if (responses.size < 2) return false
         val debateIndex = history.count { it.kind == RoundKind.DEBATE } + 1
         val services = ArenaService.entries.filter { it in responses.keys }
-        val activeCaptain = CaptainPolicy.forRound(captain, services)
         val prompts = linkedMapOf<ArenaService, String>()
         var compressedCount = 0
         services.forEach { target ->
@@ -204,7 +195,6 @@ class ArenaSessionController(
                     debateIndex = debateIndex,
                     guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
                     quoteLimit = quoteLimit,
-                    asCaptain = target == activeCaptain,
                 )
             } ?: run {
                 sessionMessage = "${target.displayName} 上下文超过 ${PromptBudgetPolicy.budgetFor(target)} 字，请缩短原问题或开始新问题"
@@ -213,7 +203,7 @@ class ArenaSessionController(
             prompts[target] = budgeted.text
             if (budgeted.compressed) compressedCount += 1
         }
-        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, guidance, captain = activeCaptain)
+        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, guidance)
         if (started && compressedCount > 0) {
             currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
             sessionMessage += " · $currentRoundContextNotice"
@@ -221,9 +211,15 @@ class ArenaSessionController(
         return started
     }
 
+    /**
+     * 「队长总结」：[preferredServices] 里第一位答完了的成员当队长（界面按用户选的队长排在最前），
+     * 按 [depth] 选 prompt。喂给队长的是几家的**完整回答**（上限 [ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS]），
+     * 只有超出该站上下文预算时才逐步压缩引用——家人反馈旧总结"浅"，一半原因就是只引用了片段。
+     */
     fun startSummary(
         preferredServices: List<ArenaService>,
         customInstruction: String = "",
+        depth: SummaryDepth = SummaryDepth.STANDARD,
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
@@ -231,13 +227,17 @@ class ArenaSessionController(
         val judge = preferredServices.firstOrNull { it in responses.keys }
             ?: ArenaService.entries.firstOrNull { it in responses.keys }
             ?: return false
-        val budgetedPrompt = PromptBudgetPolicy.fit(judge) { quoteLimit ->
+        val budgetedPrompt = PromptBudgetPolicy.fit(
+            judge,
+            initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS,
+        ) { quoteLimit ->
             DiscussionSummaryPromptBuilder.build(
                 originalQuestion = originalQuestion,
                 history = history.toList(),
                 responses = responses,
                 customInstruction = customInstruction,
                 quoteLimit = quoteLimit,
+                depth = depth,
             )
         } ?: run {
             sessionMessage = "总结上下文超过 ${PromptBudgetPolicy.budgetFor(judge)} 字，请缩短原问题"
@@ -259,9 +259,11 @@ class ArenaSessionController(
             phase = ParticipantPhase.SENDING,
             judge = judge,
             requestId = requestId,
-            detail = "正在请 ${judge.displayName} 总结",
+            detail = "正在请 ${judge.displayName} 做${depth.displayName}总结",
+            depth = depth,
         )
-        sessionMessage = "正在生成讨论总结" + if (budgetedPrompt.compressed) " · 已压缩引用回答" else ""
+        sessionMessage = "正在请 ${judge.displayName} 做${depth.displayName}总结" +
+            if (budgetedPrompt.compressed) " · 已压缩引用回答" else ""
         schedulePersist()
         pool.sendPrompt(judge, prompt, requestId) { outcome ->
             if (!isSummaryActive(execution)) return@sendPrompt
@@ -272,7 +274,7 @@ class ArenaSessionController(
             } else {
                 summary = summary.copy(phase = ParticipantPhase.ERROR, detail = outcome.detail)
                 summaryExecution = null
-                sessionMessage = "讨论总结失败"
+                sessionMessage = "队长总结失败"
                 schedulePersist()
             }
         }
@@ -377,7 +379,6 @@ class ArenaSessionController(
         stage = SessionStage.IDLE
         askedAtMillis = 0L
         currentRoundKind = null
-        currentRoundCaptain = null
         currentAnswerMode = AnswerMode.PARALLEL
         roundNumber = 0
         originalQuestion = ""
@@ -442,7 +443,6 @@ class ArenaSessionController(
         prompts: Map<ArenaService, String>,
         answerMode: AnswerMode,
         guidance: String,
-        captain: ArenaService? = null,
     ): Boolean {
         if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
 
@@ -453,7 +453,6 @@ class ArenaSessionController(
         currentRoundContextNotice = ""
         roundNumber += 1
         currentRoundKind = kind
-        currentRoundCaptain = captain
         currentAnswerMode = answerMode
         stage = when (kind) {
             RoundKind.INITIAL -> SessionStage.INITIAL
@@ -480,7 +479,6 @@ class ArenaSessionController(
             guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
             startedAtMillis = System.currentTimeMillis(),
             requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
-            captain = captain,
         )
         // 点下按钮的这一刻，所有参与者一起进入"已排队"：网页池只能逐家发送，
         // 以前排在后面的成员要等前面发完才有动静，用户以为只有第一家收到了命令。
@@ -678,12 +676,15 @@ class ArenaSessionController(
                     execution.lastText = shownText
                     execution.stableCount = 0
                 }
-                val updated = runs.getValue(execution.service).copy(
+                val current = runs.getValue(execution.service)
+                val updated = current.copy(
                     phase = if (snapshot.streaming) ParticipantPhase.STREAMING else ParticipantPhase.WAITING,
                     response = shownText,
                     detail = if (snapshot.streaming) "正在补全回答" else "正在确认补救结果",
                     responseTruncated = snapshot.truncated,
                     originalResponseLength = snapshot.originalLength,
+                    modeLabel = snapshot.modeLabel.ifBlank { current.modeLabel },
+                    thinkingUsed = current.thinkingUsed || snapshot.thinkingUsed,
                 )
                 runs[execution.service] = updated
                 schedulePersist()
@@ -930,12 +931,16 @@ class ArenaSessionController(
                     state.stableCount = 0
                 }
                 val lengthLabel = responseLengthLabel(snapshot)
-                runs[service] = runs.getValue(service).copy(
+                val current = runs.getValue(service)
+                runs[service] = current.copy(
                     phase = if (snapshot.streaming) ParticipantPhase.STREAMING else ParticipantPhase.WAITING,
                     response = shownText,
                     detail = if (snapshot.streaming) "正在回答 · $lengthLabel" else "正在确认回答完成",
                     responseTruncated = snapshot.truncated,
                     originalResponseLength = snapshot.originalLength,
+                    // 模式小字：读到就更新，没读到沿用；思考痕迹一旦出现过就记住
+                    modeLabel = snapshot.modeLabel.ifBlank { current.modeLabel },
+                    thinkingUsed = current.thinkingUsed || snapshot.thinkingUsed,
                 )
                 schedulePersist()
                 if (!snapshot.streaming && state.stableCount >= requiredStablePolls(snapshot)) {
@@ -1042,7 +1047,6 @@ class ArenaSessionController(
             results = results,
             startedAtMillis = execution.startedAtMillis,
             finishedAtMillis = System.currentTimeMillis(),
-            captain = execution.captain,
         )
         while (history.size > ArenaLimits.MAX_HISTORY_ROUNDS) history.removeAt(0)
         val completed = results.values.count { it.phase == ParticipantPhase.COMPLETE }
@@ -1072,7 +1076,7 @@ class ArenaSessionController(
                 },
             )
             summaryExecution = null
-            sessionMessage = "讨论总结超时"
+            sessionMessage = "队长总结超时"
             schedulePersist()
             return
         }
@@ -1117,11 +1121,12 @@ class ArenaSessionController(
                 if (!snapshot.streaming && execution.stableCount >= requiredStablePolls(snapshot)) {
                     summary = summary.copy(
                         phase = ParticipantPhase.COMPLETE,
-                        text = snapshot.text,
-                        detail = "总结完成 · ${snapshot.originalLength} 字",
+                        // 与各家回答一致：结束后以严格抓取的正式回答为准，别把思考过程当总结存下来
+                        text = snapshot.settledText,
+                        detail = "总结完成 · ${snapshot.settledText.length} 字",
                     )
                     summaryExecution = null
-                    sessionMessage = "讨论总结完成 · ${execution.judge.displayName}"
+                    sessionMessage = "队长总结完成 · ${execution.judge.displayName}"
                     schedulePersist(immediate = true)
                     return@readResponse
                 }
@@ -1177,7 +1182,6 @@ class ArenaSessionController(
             summary = summary,
             lastRoundPrompts = lastRoundPrompts,
             conversationUrls = conversationUrls.toMap(),
-            currentRoundCaptain = currentRoundCaptain,
             updatedAtMillis = System.currentTimeMillis(),
         )
     }
@@ -1235,7 +1239,6 @@ class ArenaSessionController(
         askedAtMillis = snapshot.askedAtMillis
         roundNumber = maxOf(snapshot.roundNumber, snapshot.history.maxOfOrNull { it.number } ?: 0)
         currentRoundKind = snapshot.currentRoundKind ?: snapshot.history.lastOrNull()?.kind
-        currentRoundCaptain = snapshot.currentRoundCaptain ?: snapshot.history.lastOrNull()?.captain
         currentAnswerMode = snapshot.currentAnswerMode
         sessionServices = snapshot.services.distinct().let { services ->
             if (services.size in ArenaService.MIN_MEMBERS..ArenaService.MAX_MEMBERS) services else ArenaService.defaultMembers
@@ -1340,7 +1343,6 @@ class ArenaSessionController(
         val startedAtMillis: Long,
         /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示"已排队"。 */
         val requestIds: Map<ArenaService, String>,
-        val captain: ArenaService? = null,
         var nextDispatchIndex: Int = 0,
         var dispatchComplete: Boolean = false,
     )
@@ -1411,12 +1413,8 @@ object QuestionPolicy {
 
 object DebatePromptBuilder {
     /**
-     * 观点讨论的 prompt。
-     *
-     * [asCaptain] 为 true 时换成"队长版"：不再是又一份平行观点，而是先替用户把几家的说法
-     * 收拢成共识 / 分歧，再给自己的判断。用户可能**只读这一条**，所以要求它能独立读懂。
-     * 参考 Chrome 扩展 AI 圆桌派 `captain-mode.js` 的思路，这里做成整条 prompt 的变体
-     * 而不是前缀拼接 —— 否则结尾"控制在 200 字"会和队长要写的整合内容自相矛盾。
+     * 观点讨论的 prompt：把其他 AI 的回答转给它，让它逐条评论。
+     * 各家平等（0.11 起不再有"队长版"——把大家收拢成一条的活交给了「队长总结」）。
      */
     fun build(
         originalQuestion: String,
@@ -1425,28 +1423,13 @@ object DebatePromptBuilder {
         debateIndex: Int = 1,
         guidance: String = "",
         quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
-        asCaptain: Boolean = false,
     ): String {
         val others = PromptSections.otherResponses(target, responses, quoteLimit)
         val guidanceSection = guidance.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
             if (it.isBlank()) "" else "\n\n用户本轮补充要求：\n$it"
         }
-        val opening = if (asCaptain) {
-            "你是这次多 AI 讨论的队长，这是观点讨论第 $debateIndex 轮。"
-        } else {
-            "这是观点讨论第 $debateIndex 轮。"
-        }
-        val closing = if (asCaptain) {
-            "请替用户把信息收拢，按这个顺序写：\n" +
-                "1. 先用 2-4 条要点写清大家的共识，以及分歧在哪、谁和谁不一样。\n" +
-                "2. 指出其中可能有错或被遗漏的地方，说明理由。\n" +
-                "3. 最后给出你作为队长的结论和建议。\n" +
-                "只依据上面真实出现的内容，不要替别人虚构没说过的观点。" +
-                "用户很可能只看你这一条，所以要能独立读懂，不要写「如上所述」「同上」这类话。" +
-                "总长度控制在 400 个汉字以内。"
-        } else {
-            "请逐一讨论这些观点：明确指出你认同和不认同的部分，给出理由，修正可能的错误或遗漏，并形成你这一轮更可靠的结论。不要只复述其他回答。总长度控制在 200 个汉字以内，最后单独给出一句综合结论。"
-        }
+        val opening = "这是观点讨论第 $debateIndex 轮。"
+        val closing = "请逐一讨论这些观点：明确指出你认同和不认同的部分，给出理由，修正可能的错误或遗漏，并形成你这一轮更可靠的结论。不要只复述其他回答。总长度控制在 200 个汉字以内，最后单独给出一句综合结论。"
         // 不能用 """…""".trimIndent()：$others / $guidanceSection 是顶格的多行文本，
         // trimIndent 取的是所有行的公共最小缩进，被这些顶格行拉成 0，模板自己那 12 个空格
         // 一个都去不掉，最后发出去的 prompt 每行都带前导空白（4 空格以上不少模型会当代码块）。
@@ -1465,15 +1448,21 @@ object DebatePromptBuilder {
 }
 
 object DiscussionSummaryPromptBuilder {
+    /**
+     * 「队长总结」的 prompt。三档深度只换"怎么写"那一段，其余（原问题、轮次、完整回答、白话要求）相同。
+     * 篇幅上限跟 [SummaryDepth.maxChars] 走；喂进来的回答由控制器按完整长度给，只在超预算时压缩。
+     */
     fun build(
         originalQuestion: String,
         history: List<RoundRecord>,
         responses: Map<ArenaService, String>,
         customInstruction: String = "",
         quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
+        depth: SummaryDepth = SummaryDepth.STANDARD,
     ): String {
+        val names = responses.keys.joinToString("、") { it.displayName }
         val viewpoints = responses.entries.joinToString("\n\n") { (service, response) ->
-            "【${service.displayName} 的最新观点】\n${response.take(quoteLimit.coerceAtLeast(0))}"
+            "【${service.displayName} 的完整回答】\n${response.take(quoteLimit.coerceAtLeast(0))}"
         }
         val roundOutline = history.joinToString("\n") { round ->
             buildString {
@@ -1487,23 +1476,42 @@ object DiscussionSummaryPromptBuilder {
         val extra = customInstruction.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
             if (it.isBlank()) "" else "\n\n用户对总结的额外要求：\n$it"
         }
+        val structure = when (depth) {
+            SummaryDepth.BRIEF ->
+                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
+                    "1. 一句话结论。\n" +
+                    "2. ${responses.size} 家各一句话点评：谁说得最靠谱、谁有明显漏洞。\n" +
+                    "3. 最该做的一件事。"
+            SummaryDepth.STANDARD ->
+                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
+                    "1. 结论：用 2-3 句话给出最终答案。\n" +
+                    "2. 共识：几家都同意的要点。\n" +
+                    "3. 分歧：写明谁说了什么、你更倾向哪个、为什么。\n" +
+                    "4. 建议：给用户的 2-4 条可执行建议，以及哪些地方需要再核实。"
+            SummaryDepth.DEEP ->
+                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
+                    "1. 事实核对：把几份回答里出现的关键事实（数字、时间、政策、名称、药物剂量）列出来，" +
+                    "逐条标注「几家一致 / 有分歧 / 只有一家提到」，分歧处写明各自怎么说、你更相信哪个、为什么。\n" +
+                    "2. 结论：用 2-3 句话给出你的最终答案。\n" +
+                    "3. 依据与风险：结论依据什么；哪些地方可能因人而异、可能过时、或需要向医生 / 官方核实。\n" +
+                    "4. 怎么做：分步骤的行动清单，每步一行。"
+        }
         // 同 DebatePromptBuilder：插值进来的 $roundOutline / $viewpoints 顶格，
         // trimIndent() 会失效，必须手拼。
         return buildString {
-            append("你是这场多 AI 讨论的主持人，请替普通用户做一份简明总结。")
+            append("你是这次多 AI 讨论的队长，请替一位普通家庭用户做一份${depth.displayName}总结。")
+            append("下面是同一个问题的 ${responses.size} 份完整回答（来自 $names）。")
             append("\n\n原始问题：\n")
             append(originalQuestion)
             append("\n\n讨论轮次：\n")
             append(roundOutline)
-            append("\n\n各 AI 最新观点：\n")
+            append("\n\n各 AI 的完整回答：\n")
             append(viewpoints)
             append(extra)
-            append("\n\n请按以下结构输出，总长度控制在 350 个汉字以内：\n")
-            append("1. 一句话结论\n")
-            append("2. 已形成的共识\n")
-            append("3. 仍有分歧或需要核验的地方\n")
-            append("4. 给用户的 2-4 条可执行建议\n")
-            append("不要声称未被上述材料支持的事实。")
+            append("\n\n")
+            append(structure)
+            append("\n要求：用长辈也能懂的白话，不用术语；不要照抄任何一家的原文；")
+            append("只依据上面真实出现的内容，不要声称材料里没有的事实；不确定就明确说「不确定」，不要编。")
         }
     }
 }

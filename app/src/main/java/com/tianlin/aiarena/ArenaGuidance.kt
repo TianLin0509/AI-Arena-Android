@@ -97,7 +97,7 @@ object ArenaErrorHelp {
         }
     }
 
-    /** 讨论总结失败时的说明。 */
+    /** 队长总结失败时的说明。 */
     fun explainSummary(detail: String, judgeName: String?): Advice {
         val who = judgeName ?: "负责总结的 AI"
         return when {
@@ -108,7 +108,7 @@ object ArenaErrorHelp {
             )
             detail.contains("超时") -> Advice(
                 what = "等了很久，$who 没有把总结写完。",
-                next = "点「重新总结」再试一次；也可以换一家 AI 当总结员（在成员里调整顺序）。",
+                next = "点「重新总结」再试一次；也可以换一位队长再总结。",
                 primary = Action.RETRY_SUMMARY,
             )
             detail.contains("上下文") || detail.contains("缩短") -> Advice(

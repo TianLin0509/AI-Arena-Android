@@ -177,10 +177,6 @@ internal fun RoundtableSettingsPage(
     skin: ArenaSkin,
     answerMode: AnswerMode,
     onAnswerModeChange: (AnswerMode) -> Unit,
-    captainEnabled: Boolean,
-    captain: ArenaService?,
-    onCaptainEnabledChange: (Boolean) -> Unit,
-    onCaptainChange: (ArenaService?) -> Unit,
     onBack: () -> Unit,
     onAppearance: () -> Unit,
     onMembers: () -> Unit,
@@ -296,59 +292,6 @@ internal fun RoundtableSettingsPage(
                             text = "网页偶尔不稳定时，选「依次回答」更容易成功。",
                             color = colors.muted,
                             style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
-            }
-
-            item(key = "captain") {
-                ArenaGroup(title = "队长") {
-                    ArenaSwitchRow(
-                        title = "队长模式",
-                        detail = if (captainEnabled) {
-                            "「观点讨论」时由队长把大家的观点汇总成一条，你看它那条就行"
-                        } else {
-                            "关掉后各家平等辩论，需要你自己逐条看"
-                        },
-                        checked = captainEnabled,
-                        onCheckedChange = onCaptainEnabledChange,
-                        contentDescriptionText = if (captainEnabled) "关闭队长模式" else "开启队长模式",
-                    )
-                    if (captainEnabled) {
-                        selectedServices.forEach { service ->
-                            ArenaRowDivider(startIndent = 62.dp)
-                            val chosen = CaptainPolicy.isCaptain(service, captain)
-                            ArenaRow(
-                                title = service.displayName,
-                                titleColor = if (chosen) colors.accent else colors.ink,
-                                detail = if (chosen) "当前队长，负责汇总和总结" else null,
-                                detailColor = colors.accent,
-                                leading = { BrandAvatar(service = service, size = 32.dp) },
-                                trailing = {
-                                    if (chosen) {
-                                        ArenaIcon(R.drawable.ic_check_circle, tint = colors.accent, size = 26.dp)
-                                    } else {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(24.dp)
-                                                .clip(RoundedCornerShape(99.dp))
-                                                .background(colors.surfaceAlt),
-                                        )
-                                    }
-                                },
-                                chevron = false,
-                                onClick = { onCaptainChange(service) },
-                                contentDescriptionText =
-                                    "${service.displayName}，${if (chosen) "当前队长" else "设为队长"}",
-                            )
-                        }
-                        ArenaRowDivider()
-                        Text(
-                            text = "队长会先写清大家的共识和分歧，再给结论；「讨论总结」也默认由它来写。" +
-                                "它没登录时会自动换成第一位可用的 AI。",
-                            color = colors.muted,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                         )
                     }
                 }
