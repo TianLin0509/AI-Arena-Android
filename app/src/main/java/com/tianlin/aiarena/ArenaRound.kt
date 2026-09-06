@@ -6,7 +6,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -42,10 +46,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
 // ---------------------------------------------------------------------------
@@ -424,6 +430,7 @@ internal fun RoundStage(
                     item(key = "summary") {
                         DiscussionSummaryCard(
                             summary = summary,
+                            judge = summary.judge,
                             trustSignal = DiscussionTrustPolicy.analyze(
                                 question = sessionController.originalQuestion,
                                 summary = summary.text,
@@ -497,6 +504,7 @@ internal fun RoundStage(
             summaryStatus = summaryStatus,
             selectedTab = currentTab,
             onSelect = { selectedTab = it },
+            onOpenService = onOpenService,
         )
     }
 }
@@ -718,56 +726,77 @@ private fun ResultTabBar(
     summaryStatus: String,
     selectedTab: String,
     onSelect: (String) -> Unit,
+    onOpenService: (ArenaService) -> Unit,
 ) {
     val colors = ArenaStyle.colors
-    val metrics = ArenaStyle.metrics
-    val compact = members.size >= 4
+    val cellCount = members.size + 1
     Surface(color = colors.card, tonalElevation = 0.dp) {
         Column {
             HorizontalDivider(color = colors.border)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                members.forEach { service ->
-                    val run = sessionController.runs[service] ?: ParticipantRun()
-                    val status = pool.statuses[service] ?: ServiceStatus()
-                    val word = runStatusWord(run, status)
+            // 按实际可用宽度定字号：用户手机（窄屏 + 大字号）上 "DeepSeek" 曾被裁成 "DeepS…"（2026-09-06）
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val cellWidth = (maxWidth - 12.dp - 4.dp * (cellCount - 1)) / cellCount
+                val labelStyle = when {
+                    cellWidth >= 100.dp -> MaterialTheme.typography.labelLarge
+                    cellWidth >= 80.dp -> MaterialTheme.typography.labelMedium
+                    else -> MaterialTheme.typography.labelSmall
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    members.forEach { service ->
+                        val run = sessionController.runs[service] ?: ParticipantRun()
+                        val status = pool.statuses[service] ?: ServiceStatus()
+                        val selected = selectedTab == service.name
+                        val active = run.phase == ParticipantPhase.QUEUED ||
+                            run.phase == ParticipantPhase.SENDING ||
+                            run.phase == ParticipantPhase.WAITING ||
+                            run.phase == ParticipantPhase.STREAMING
+                        // 已选中的那家再点一下就进它的网页（用户反馈 2026-09-06：下面这一行要能跳转）。
+                        // 这层意思直接写在格子上，别让人猜；正在回答时仍显示进度词。
+                        val showOpenHint = selected && !active
+                        ResultTabCell(
+                            label = service.shortName,
+                            caption = if (showOpenHint) "点开网页" else runStatusWord(run, status),
+                            captionColor = when {
+                                showOpenHint -> colors.accent
+                                run.requestId.isBlank() && run.detail == "等待开始" -> colors.muted
+                                run.phase == ParticipantPhase.ERROR -> colors.error
+                                run.phase == ParticipantPhase.COMPLETE -> colors.success
+                                run.phase == ParticipantPhase.IDLE -> colors.muted
+                                else -> colors.accent
+                            },
+                            selected = selected,
+                            labelStyle = labelStyle,
+                            onClick = { if (selected) onOpenService(service) else onSelect(service.name) },
+                            contentDescriptionText = if (selected) {
+                                "跳转到 ${service.displayName} 网页"
+                            } else {
+                                "切换到 ${service.displayName} 的回答"
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
                     ResultTabCell(
-                        label = service.shortName,
-                        caption = word,
-                        captionColor = when {
-                            run.requestId.isBlank() && run.detail == "等待开始" -> colors.muted
-                            run.phase == ParticipantPhase.ERROR -> colors.error
-                            run.phase == ParticipantPhase.COMPLETE -> colors.success
-                            run.phase == ParticipantPhase.IDLE -> colors.muted
-                            else -> colors.accent
+                        label = "总结",
+                        caption = summaryStatus,
+                        captionColor = when (summaryStatus) {
+                            "已总结" -> colors.success
+                            "总结中" -> colors.accent
+                            "没成功" -> colors.error
+                            "可做" -> colors.debate
+                            else -> colors.muted
                         },
-                        selected = selectedTab == service.name,
-                        compact = compact,
-                        onClick = { onSelect(service.name) },
-                        contentDescriptionText = "切换到 ${service.displayName} 的回答",
+                        selected = selectedTab == SUMMARY_TAB,
+                        labelStyle = labelStyle,
+                        onClick = { onSelect(SUMMARY_TAB) },
+                        contentDescriptionText = "切换到队长总结",
                         modifier = Modifier.weight(1f),
                     )
                 }
-                ResultTabCell(
-                    label = "总结",
-                    caption = summaryStatus,
-                    captionColor = when (summaryStatus) {
-                        "已总结" -> colors.success
-                        "总结中" -> colors.accent
-                        "没成功" -> colors.error
-                        "可做" -> colors.debate
-                        else -> colors.muted
-                    },
-                    selected = selectedTab == SUMMARY_TAB,
-                    compact = compact,
-                    onClick = { onSelect(SUMMARY_TAB) },
-                    contentDescriptionText = "切换到队长总结",
-                    modifier = Modifier.weight(1f),
-                )
             }
         }
     }
@@ -779,7 +808,7 @@ private fun ResultTabCell(
     caption: String,
     captionColor: Color,
     selected: Boolean,
-    compact: Boolean,
+    labelStyle: TextStyle,
     onClick: () -> Unit,
     contentDescriptionText: String,
     modifier: Modifier = Modifier,
@@ -804,15 +833,16 @@ private fun ResultTabCell(
             verticalArrangement = Arrangement.spacedBy(1.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            // 放不下就缩字号，永远不省略：格子上只有一个词，省略了就认不出是谁
             Text(
                 text = label,
                 color = if (selected) colors.accent else colors.ink,
-                style = if (compact) MaterialTheme.typography.labelMedium else MaterialTheme.typography.labelLarge,
+                style = labelStyle,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                 maxLines = 1,
                 softWrap = false,
-                overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
+                autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = labelStyle.fontSize, stepSize = 0.5.sp),
             )
             Text(
                 text = caption,
@@ -820,8 +850,8 @@ private fun ResultTabCell(
                 style = MaterialTheme.typography.labelSmall,
                 maxLines = 1,
                 softWrap = false,
-                overflow = TextOverflow.Clip,
                 textAlign = TextAlign.Center,
+                autoSize = TextAutoSize.StepBased(minFontSize = 8.sp, maxFontSize = 11.sp, stepSize = 0.5.sp),
             )
         }
     }
@@ -974,7 +1004,8 @@ private fun CaptainChip(
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                 maxLines = 1,
                 softWrap = false,
-                overflow = TextOverflow.Ellipsis,
+                // 窄屏 / 大字号下缩字号而不是截断
+                autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = 12.sp, stepSize = 0.5.sp),
             )
             Text(
                 text = when {
@@ -1012,17 +1043,17 @@ private fun GuidanceChip(
         color = colors.surface,
         contentColor = colors.accent,
     ) {
+        // 不限行数也不截断：以前三个 chip 平分一行、单行省略，用户手机（窄屏 + 大字号）上显示成"说得再…"（用户反馈 2026-09-06）
         Text(
             text = text,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
             style = MaterialTheme.typography.labelLarge,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
         )
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun NextRoundPanel(
     guidance: String,
@@ -1097,11 +1128,13 @@ private fun NextRoundPanel(
                 ),
                 maxLines = 4,
             )
-            // 三个现成的要求：点一下就填进去，长辈不用自己想措辞
+            // 三个现成的要求：点一下就填进去，长辈不用自己想措辞。
+            // FlowRow 让 chip 按内容定宽、放不下就换行，窄屏 / 大字号都不会截断
             if (guidance.isBlank()) {
-                Row(
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     GUIDANCE_EXAMPLES.forEach { example ->
                         GuidanceChip(
@@ -1111,7 +1144,6 @@ private fun NextRoundPanel(
                                 onGuidanceChange(example)
                                 dismissHint()
                             },
-                            modifier = Modifier.weight(1f),
                         )
                     }
                 }
@@ -1139,6 +1171,7 @@ private fun NextRoundPanel(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ProviderResultCard(
     service: ArenaService,
@@ -1257,9 +1290,9 @@ private fun ProviderResultCard(
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
-                    Row(
+                    // 动作按内容定宽、放不下就换行：用户手机上「跳转网页」曾被裁成"跳转"（2026-09-06）
+                    FlowRow(
                         modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         ArenaTextAction(
@@ -1285,7 +1318,6 @@ private fun ProviderResultCard(
                                 contentDescriptionText = "分享 ${service.displayName} 的回答",
                             )
                         }
-                        Spacer(Modifier.weight(1f))
                         ArenaTextAction(
                             text = "跳转网页",
                             onClick = onClick,
@@ -1469,9 +1501,11 @@ private fun ErrorAdviceBox(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DiscussionSummaryCard(
     summary: DiscussionSummary,
+    judge: ArenaService?,
     trustSignal: DiscussionTrustSignal,
     onCopy: (() -> Unit)?,
     onShare: (() -> Unit)?,
@@ -1493,8 +1527,10 @@ private fun DiscussionSummaryCard(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                // 谁写的总结就放谁的头像（用户反馈 2026-09-06）
+                if (judge != null) BrandAvatar(service = judge, size = 36.dp)
                 Column(Modifier.weight(1f)) {
                     ArenaHeading(
                         text = "队长总结",
@@ -1509,26 +1545,41 @@ private fun DiscussionSummaryCard(
                 }
                 RunStatusPill(summary.phase)
             }
+            val placeholder = summary.phase == ParticipantPhase.COMPLETE &&
+                SummarySanityPolicy.looksLikePlaceholder(summary.text)
+            if (placeholder) {
+                // 队长把内容写进了文件 / 只回了一句反问：App 读不到，别让家人以为这就是总结
+                ArenaNotice(
+                    tone = NoticeTone.WARNING,
+                    title = "总结好像没有正文",
+                    text = "${judge?.shortName ?: "队长"} 可能把内容写进了文件，或者只回了一句话，App 读不到文件里的字。" +
+                        "点「跳转网页」看原文，或者换一位队长再「重新总结」。",
+                    actionLabel = if (onOpenJudge != null) "跳转网页" else null,
+                    onAction = onOpenJudge,
+                    secondaryLabel = if (retryEnabled) "重新总结" else null,
+                    onSecondary = if (retryEnabled) onRetry else null,
+                    actionContentDescription = judge?.let { "跳转到 ${it.displayName} 网页" },
+                )
+            }
             if (summary.text.isNotBlank()) {
-                TrustSignalPanel(trustSignal, summary.depth)
-                Row(
+                if (!placeholder) TrustSignalPanel(trustSignal, summary.depth)
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     if (onCopy != null) {
-                        ArenaTextAction(
-                            text = "复制",
-                            onClick = onCopy,
-                            modifier = Modifier.weight(1f),
-                            contentDescriptionText = "复制队长总结",
-                        )
+                        ArenaTextAction(text = "复制", onClick = onCopy, contentDescriptionText = "复制队长总结")
                     }
                     if (onShare != null) {
+                        ArenaTextAction(text = "分享", onClick = onShare, contentDescriptionText = "分享队长总结")
+                    }
+                    if (judge != null && onOpenJudge != null) {
+                        // 总结读起来不对劲（比如队长把内容写成了文件）时，一步跳到它的网页看原文
                         ArenaTextAction(
-                            text = "分享",
-                            onClick = onShare,
-                            modifier = Modifier.weight(1f),
-                            contentDescriptionText = "分享队长总结",
+                            text = "跳转${judge.shortName}网页",
+                            onClick = onOpenJudge,
+                            color = colors.muted,
+                            contentDescriptionText = "跳转到 ${judge.displayName} 网页",
                         )
                     }
                 }

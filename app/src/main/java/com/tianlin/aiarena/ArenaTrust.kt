@@ -47,6 +47,30 @@ object DiscussionTrustPolicy {
     }
 }
 
+/**
+ * 总结"看起来没写正文"的判定。
+ *
+ * 用户手机上实测（2026-09-06）：豆包把总结写成了"文档"卡片，对话里只剩一句
+ * "我将结合三份 AI 回答的核心内容……需要我帮你压缩到更精炼的 300 字内版本吗？"。
+ * App 只能读对话里的文字，读不到文档正文，家人看到的就像没总结——而且那句话里有"共识 / 分歧"
+ * 两个词，交叉核验卡还会误报"共识已提炼"。很短、或不长且带"需要我 / 文档 / 已生成"这类话的，
+ * 当作可疑：卡片上明说，给「跳转网页看原文」和「重新总结」。prompt 里也已明说"写在对话里，不要生成文件"。
+ */
+object SummarySanityPolicy {
+    private val placeholderPhrases = listOf(
+        "需要我", "是否需要", "要不要我", "文档", "文件", "附件", "已生成", "已为你", "已为您", "已整理", "请查收", "点击查看",
+    )
+    const val SHORT_CHARS = 60
+    const val PLACEHOLDER_MAX_CHARS = 160
+
+    fun looksLikePlaceholder(text: String): Boolean {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return false
+        if (trimmed.length < SHORT_CHARS) return true
+        return trimmed.length < PLACEHOLDER_MAX_CHARS && placeholderPhrases.any(trimmed::contains)
+    }
+}
+
 data class BudgetedPrompt(
     val text: String,
     val compressed: Boolean,
