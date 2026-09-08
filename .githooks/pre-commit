@@ -1,0 +1,24 @@
+#!/bin/sh
+# Local guardrail, not a security boundary. Existing hooks must be composed.
+[ "$PROJECT_PREP_ALLOW_COMMIT" = "1" ] && exit 0
+main_wt=$(git -c core.quotePath=false worktree list --porcelain | sed -n '1s/^worktree //p') || exit 1
+this_wt=$(git rev-parse --show-toplevel) || exit 1
+[ -n "$main_wt" ] && [ -n "$this_wt" ] || exit 1
+if [ "$main_wt" = "$this_wt" ]; then
+  echo "Primary worktree is reserved for reviewed merges. Create a task worktree first." >&2
+  exit 1
+fi
+branch=$(git symbolic-ref --short HEAD) || exit 1
+protected=$(python -c '
+import json
+c=json.load(open(".agents/project.json",encoding="utf-8-sig"))
+p=c.get("protectedBranches",[])
+assert isinstance(p,list) and all(isinstance(x,str) for x in p)
+assert isinstance(c["trunk"],str) and c["trunk"]
+print("\n".join(["main","master","develop",c["trunk"]]+p))
+') || { echo "Cannot read protection config; refusing commit." >&2; exit 1; }
+if printf '%s\n' "$protected" | grep -Fx -- "$branch" >/dev/null; then
+  echo "Protected branch: use a task branch and the reviewed merge gate." >&2
+  exit 1
+fi
+exit 0

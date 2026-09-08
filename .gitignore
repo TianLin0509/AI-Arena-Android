@@ -17,3 +17,10 @@ keystore.properties
 /output/
 /*.xml
 /*.log
+
+# Python workflow helpers and local environment
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*

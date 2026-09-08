@@ -4,6 +4,18 @@
 
 当前版本：`v0.11.2`（`versionCode 17`）
 
+## 开发入口
+
+项目已配置 [project-prep](https://github.com/TianLin0509/project-prep) 工作流。首次 clone 后运行
+`python scripts/setup_project.py` 启用 Git 钩子，运行 `python scripts/run_checks.py` 验证主机环境。
+要求 Python 3.10+、Git 2.38+、JDK 17、Android SDK 36；Windows 使用 Git for Windows 自带的 sh。
+
+AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [.agents/AUTHOR.md](.agents/AUTHOR.md)，
+合并位读取 [.agents/MERGER.md](.agents/MERGER.md)。任务使用独立 worktree，主目录只接收经过独立审查的合并。
+完整验证与发布边界见 [.agents/TESTING.md](.agents/TESTING.md)。源码同步、签名 APK 发布分别执行；普通合并不自动抬版本。
+
+## 简介
+
 面向国内 Android 用户的多 AI 圆桌工具。应用本身无需注册账号、没有自建后端；用户只需在内嵌的 AI 官网完成一次登录，之后由 App 复用本机 WebView 登录状态，汇总多家回答并支持后续讨论。
 
 > 本项目通过真实 AI 网页工作，不是厂商官方 API。网页 DOM 改版后可能需要更新适配器。
@@ -153,9 +165,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.4.0`，`versionCode=4`。
-- 小修复：`0.4.1 / versionCode 5`。
-- 向后兼容的新功能：`0.5.0 / versionCode 6`。
+- 当前基线：`versionName=0.11.2`，`versionCode=17`。
+- 下一次小修复示例：`0.11.3 / versionCode 18`。
+- 下一次向后兼容新功能示例：`0.12.0 / versionCode 18`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：

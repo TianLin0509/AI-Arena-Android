@@ -1,0 +1,22 @@
+#!/bin/sh
+# Only a separately authorized synchronization may set this process-local flag.
+[ "$PROJECT_PREP_ALLOW_PUSH" = "1" ] && exit 0
+protected=$(python -c '
+import json
+c=json.load(open(".agents/project.json",encoding="utf-8-sig"))
+p=c.get("protectedBranches",[])
+assert isinstance(p,list) and all(isinstance(x,str) for x in p)
+assert isinstance(c["trunk"],str) and c["trunk"]
+print("\n".join(["main","master","develop",c["trunk"]]+p))
+') || { echo "Cannot read protection config; refusing push." >&2; exit 1; }
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/*)
+      name=${remote_ref#refs/heads/}
+      if printf '%s\n' "$protected" | grep -Fx -- "$name" >/dev/null; then
+        echo "Protected remote branch: $name. Merge locally, then use authorized synchronization." >&2
+        exit 1
+      fi ;;
+  esac
+done
+exit 0

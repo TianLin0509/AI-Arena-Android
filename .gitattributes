@@ -10,3 +10,6 @@ gradlew text eol=lf
 *.jar binary
 *.png binary
 *.jpg binary
+.githooks/* text eol=lf
+*.py text eol=lf
+*.json text eol=lf
