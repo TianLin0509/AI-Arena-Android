@@ -16,7 +16,7 @@ run_checks 先执行 `tests/` 下全部 Python 工作流回归测试，再执行
 
 ## 设备测试
 
-`app/src/androidTest` 的两个测试类属于设备测试，主机闸门只编译，不执行。涉及运行时行为的任务，Author 和 Merger 都须在隔离模拟器执行全部 instrumentation 并保留结果。不能将构建成功说成真机通过。
+`app/src/androidTest` 的全部测试类属于设备测试，主机闸门只编译，不执行。涉及运行时行为的任务，Author 和 Merger 都须在隔离模拟器执行全部 instrumentation 并保留结果。不能将构建成功说成真机通过。
 
 请仅对本任务拥有的隔离设备操作，并在每条 adb 命令填写同一个明确 serial：
 

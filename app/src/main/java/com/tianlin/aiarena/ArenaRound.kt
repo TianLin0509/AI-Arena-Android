@@ -1,12 +1,10 @@
 package com.tianlin.aiarena
 
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -23,6 +21,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.material3.HorizontalDivider
@@ -33,20 +33,23 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -57,17 +60,12 @@ import kotlinx.coroutines.launch
 // ---------------------------------------------------------------------------
 // 进行中 / 结果页
 //
-// 0.11 起改成"总览卡 + 底部分段切换"（用户 2026-09-06 在四套 mock 里选的 C 方案）：
-// 顶部总览卡把每家的状态、模式小字和第一句预览放在一屏里，不点也知道大概；
-// 底部分段控件在拇指范围内切到某一家的完整回答或「队长总结」。
+// 状态行原地展开各家回答；追问输入与三个操作集中放在成员列表下方。
 // ---------------------------------------------------------------------------
-
-/** 底部分段控件里「队长总结」那一格的 key；成员格用 [ArenaService.name]。 */
-private const val SUMMARY_TAB = "summary"
 
 @Composable
 internal fun RoundStage(
-    pool: ArenaWebViewPool,
+    statuses: Map<ArenaService, ServiceStatus>,
     sessionController: ArenaSessionController,
     selectedServices: List<ArenaService>,
     usableCount: Int,
@@ -84,24 +82,10 @@ internal fun RoundStage(
     offline: Boolean,
     /** 记住上次选的队长和总结深度。 */
     captainPreferences: ArenaCaptainPreferences,
-    onNewQuestion: () -> Unit,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
     val scope = rememberCoroutineScope()
-    var confirmNewQuestion by remember { mutableStateOf(false) }
-    if (confirmNewQuestion) {
-        ConfirmDialog(
-            title = "放弃这一轮，开始新问题？",
-            text = "还在等 AI 回答。现在开始新问题会停止等待，已经收到的回答会保留在历史里。",
-            confirmLabel = "开始新问题",
-            onConfirm = {
-                confirmNewQuestion = false
-                onNewQuestion()
-            },
-            onDismiss = { confirmNewQuestion = false },
-        )
-    }
     val members = selectedServices
     val activeServices = members.filter { sessionController.runs[it]?.requestId?.isNotBlank() == true }
     val trackedServices = activeServices.ifEmpty { members }
@@ -147,36 +131,17 @@ internal fun RoundStage(
         summary.phase == ParticipantPhase.WAITING ||
         summary.phase == ParticipantPhase.STREAMING
     val canSummarize = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy
-    val summaryStatus = when {
-        summary.phase == ParticipantPhase.COMPLETE -> "已总结"
-        summarizing -> "总结中"
-        summary.phase == ParticipantPhase.ERROR -> "没成功"
-        canSummarize -> "可做"
-        else -> "待答完"
+    // 历史里已有总结时直接展开；选择与展开状态跟随当前问题保存。
+    var summaryExpanded by rememberSaveable(sessionController.askedAtMillis) {
+        mutableStateOf(summary.phase != ParticipantPhase.IDLE)
     }
-
-    // ---- 当前看哪一格：新一轮开始切到第一家；打开带总结的历史直接看总结 ----
-    var selectedTab by rememberSaveable(sessionController.askedAtMillis) {
-        mutableStateOf(
-            if (summary.phase == ParticipantPhase.COMPLETE) SUMMARY_TAB else members.firstOrNull()?.name ?: SUMMARY_TAB,
-        )
-    }
-    LaunchedEffect(sessionController.roundNumber, roundRunning) {
-        if (roundRunning) selectedTab = members.firstOrNull()?.name ?: SUMMARY_TAB
-    }
-    val currentTab = if (selectedTab == SUMMARY_TAB || members.any { it.name == selectedTab }) {
-        selectedTab
-    } else {
-        members.firstOrNull()?.name ?: SUMMARY_TAB
-    }
-    val currentService = members.firstOrNull { it.name == currentTab }
 
     val startSummary: () -> Unit = {
         captainPreferences.saveCaptain(captain)
         captainPreferences.saveDepth(depth)
         if (sessionController.startSummary(CaptainPolicy.judgePreference(members, captain), roundGuidance, depth)) {
             onRoundGuidanceChange("")
-            selectedTab = SUMMARY_TAB
+            summaryExpanded = true
         }
     }
 
@@ -216,13 +181,6 @@ internal fun RoundStage(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    // 「新问题」是最常用的动作，放在结果页顶部随手可点；正在等回答时先确认一下
-                    ArenaSecondaryButton(
-                        text = "新问题",
-                        onClick = { if (busy) confirmNewQuestion = true else onNewQuestion() },
-                        modifier = Modifier.semantics { contentDescription = "开始新问题" },
-                        leading = { ArenaIcon(R.drawable.ic_add, tint = colors.accent, size = 20.dp) },
-                    )
                 }
                 if (busy) {
                     ArenaProgressBar(
@@ -314,101 +272,83 @@ internal fun RoundStage(
                 }
             }
 
-            item(key = "overview") {
-                OverviewCard(
-                    members = members,
-                    pool = pool,
-                    sessionController = sessionController,
-                    summaryStatus = summaryStatus,
-                    summarySubtitle = when {
-                        summary.phase == ParticipantPhase.COMPLETE ->
-                            "由 ${summary.judge?.displayName ?: "队长"} 做的${summary.depth.displayName}总结"
-                        summarizing -> summary.detail
-                        summary.phase == ParticipantPhase.ERROR -> "没成功，可以换个队长再试"
-                        canSummarize -> "答完了，选队长和深度就能做"
-                        else -> "至少 ${ArenaService.MIN_MEMBERS} 家答完后可做，可选队长和深度"
-                    },
-                    selectedTab = currentTab,
-                    onSelect = { selectedTab = it },
-                )
-            }
-
-            if (currentService != null) {
-                val service = currentService
-                val status = pool.statuses[service] ?: ServiceStatus()
-                val run = sessionController.runs[service] ?: ParticipantRun()
-                item(key = "run-${service.name}") {
-                    ProviderResultCard(
-                        service = service,
-                        status = status,
-                        run = run,
-                        collapsedLines = DEFAULT_COLLAPSED_LINES,
-                        expanded = expandedAnswers[service.name] == true,
-                        onExpandedChange = { expandedAnswers[service.name] = it },
-                        onClick = { onOpenService(service) },
-                        onCopy = copyText?.let { copy ->
-                            {
-                                val prepared = ShareTextPolicy.discussionSummary(
-                                    sessionController.originalQuestion,
-                                    run.response,
-                                )
-                                val copied = copy("${service.displayName} 的回答", prepared.text)
-                                scope.launch {
-                                    snackbarHostState.showSnackbar(
-                                        when {
-                                            !copied -> "复制失败"
-                                            prepared.truncated -> "回答过长，已截取后复制"
-                                            else -> "已复制 ${service.displayName} 的回答"
-                                        },
-                                    )
-                                }
-                            }
-                        },
-                        onShare = shareText?.let { share ->
-                            {
-                                val prepared = ShareTextPolicy.discussionSummary(
-                                    sessionController.originalQuestion,
-                                    run.response,
-                                )
-                                if (!share("${service.displayName} 的回答", prepared.text)) {
-                                    scope.launch { snackbarHostState.showSnackbar("当前设备没有可用的分享方式") }
-                                }
-                            }
-                        },
-                        recoveryEnabled = sessionStage == SessionStage.READY && !sessionController.isBusy,
-                        canReextract = run.requestId.isNotBlank() && !(
-                            run.detail.contains("输入框") ||
-                                run.detail.contains("发送失败") ||
-                                run.detail.contains("重发失败") ||
-                                run.detail.contains("尚未登录") ||
-                                run.detail.contains("注入失败") ||
-                                run.detail.contains("还没来得及发送")
-                            ),
-                        onRetrySend = { sessionController.retrySend(service) },
-                        onRetryExtraction = { sessionController.retryExtraction(service) },
-                        onSkip = { sessionController.skipService(service) },
-                    )
-                }
-                if (sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS) {
-                    item(key = "next-round") {
-                        NextRoundPanel(
-                            guidance = roundGuidance,
-                            onGuidanceChange = onRoundGuidanceChange,
-                            enabled = !sessionController.isBusy,
-                            onIterate = {
-                                if (sessionController.startIteration(answerMode, roundGuidance)) {
-                                    onRoundGuidanceChange("")
-                                }
-                            },
-                            onDebate = {
-                                if (sessionController.startDebate(answerMode, roundGuidance)) {
-                                    onRoundGuidanceChange("")
-                                }
-                            },
-                        )
+            item(key = "answers") {
+                ArenaCard(modifier = Modifier.fillMaxWidth()) {
+                    Column {
+                        members.forEachIndexed { index, service ->
+                            if (index > 0) HorizontalDivider(color = colors.border)
+                            val status = statuses[service] ?: ServiceStatus()
+                            val run = sessionController.runs[service] ?: ParticipantRun()
+                            ProviderResultCard(
+                                service = service,
+                                status = status,
+                                run = run,
+                                expanded = expandedAnswers[service.name] == true,
+                                onExpandedChange = { expandedAnswers[service.name] = it },
+                                onClick = { onOpenService(service) },
+                                onCopy = copyText?.let { copy ->
+                                    {
+                                        val prepared = ShareTextPolicy.discussionSummary(
+                                            sessionController.originalQuestion,
+                                            run.response,
+                                        )
+                                        val copied = copy("${service.displayName} 的回答", prepared.text)
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar(
+                                                when {
+                                                    !copied -> "复制失败"
+                                                    prepared.truncated -> "回答过长，已截取后复制"
+                                                    else -> "已复制 ${service.displayName} 的回答"
+                                                },
+                                            )
+                                        }
+                                    }
+                                },
+                                onShare = shareText?.let { share ->
+                                    {
+                                        val prepared = ShareTextPolicy.discussionSummary(
+                                            sessionController.originalQuestion,
+                                            run.response,
+                                        )
+                                        if (!share("${service.displayName} 的回答", prepared.text)) {
+                                            scope.launch { snackbarHostState.showSnackbar("当前设备没有可用的分享方式") }
+                                        }
+                                    }
+                                },
+                                recoveryEnabled = sessionStage == SessionStage.READY && !sessionController.isBusy,
+                                canReextract = run.requestId.isNotBlank() && !(
+                                    run.detail.contains("输入框") ||
+                                        run.detail.contains("发送失败") ||
+                                        run.detail.contains("重发失败") ||
+                                        run.detail.contains("尚未登录") ||
+                                        run.detail.contains("注入失败") ||
+                                        run.detail.contains("还没来得及发送")
+                                    ),
+                                onRetrySend = { sessionController.retrySend(service) },
+                                onRetryExtraction = { sessionController.retryExtraction(service) },
+                                onSkip = { sessionController.skipService(service) },
+                            )
+                        }
                     }
                 }
-            } else {
+            }
+            item(key = "next-round") {
+                NextRoundPanel(
+                    guidance = roundGuidance,
+                    onGuidanceChange = onRoundGuidanceChange,
+                    inputEnabled = !busy,
+                    enabled = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy,
+                    summaryExpanded = summaryExpanded,
+                    onSummary = { summaryExpanded = !summaryExpanded },
+                    onIterate = {
+                        if (sessionController.startIteration(answerMode, roundGuidance)) onRoundGuidanceChange("")
+                    },
+                    onDebate = {
+                        if (sessionController.startDebate(answerMode, roundGuidance)) onRoundGuidanceChange("")
+                    },
+                )
+            }
+            if (summaryExpanded) {
                 item(key = "summary-picker") {
                     SummaryPickerCard(
                         members = members,
@@ -417,7 +357,7 @@ internal fun RoundStage(
                         onCaptainChange = { captainName = it.name },
                         depth = depth,
                         onDepthChange = { depthName = it.name },
-                        captainModeReading = captain?.let { pool.statuses[it]?.modeReading } ?: AiModeReading(),
+                        captainModeReading = captain?.let { statuses[it]?.modeReading } ?: AiModeReading(),
                         onOpenCaptainPage = { captain?.let(onOpenService) },
                         canSummarize = canSummarize,
                         summarizing = summarizing,
@@ -468,18 +408,6 @@ internal fun RoundStage(
                 }
             }
 
-            if (sessionStage == SessionStage.READY) {
-                item(key = "footer-actions") {
-                    ArenaSecondaryButton(
-                        text = "开始新问题",
-                        onClick = onNewQuestion,
-                        // READY 阶段仍可能有总结或单家补救在跑；此时重置会与在途的网页自动化撞在一起。
-                        enabled = !sessionController.isBusy,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-
             if (usableCount < ArenaService.MIN_MEMBERS) {
                 item(key = "usable-warning") {
                     Text(
@@ -492,20 +420,8 @@ internal fun RoundStage(
             }
         }
 
-        ResultTabBar(
-            members = members,
-            pool = pool,
-            sessionController = sessionController,
-            summaryStatus = summaryStatus,
-            selectedTab = currentTab,
-            onSelect = { selectedTab = it },
-            onOpenService = onOpenService,
-        )
     }
 }
-
-/** 单家回答默认折叠的行数。Tab 布局下一屏只放一家，可以比以前（6 行）放得开。 */
-private const val DEFAULT_COLLAPSED_LINES = 12
 
 /** 总览卡里每家回答的第一行：去掉 Markdown 标记，只留一句话。 */
 internal fun previewLine(markdown: String, maxChars: Int = 60): String {
@@ -521,7 +437,7 @@ internal fun previewLine(markdown: String, maxChars: Int = 60): String {
     return if (line.length > maxChars) line.take(maxChars) + "…" else line
 }
 
-/** 底部分段控件和总览卡上的状态词：比 [RunStatusPill] 更短，放得进一格。 */
+/** 状态词的短文本，供状态展示与策略测试复用。 */
 internal fun runStatusWord(run: ParticipantRun, status: ServiceStatus): String {
     if (run.requestId.isNotBlank() || run.detail != "等待开始") {
         return when (run.phase) {
@@ -553,57 +469,7 @@ internal fun modeCaption(run: ParticipantRun, status: ServiceStatus): String {
     return if (status.state == ConnectionState.SIGNED_IN || run.requestId.isNotBlank()) "模式 未知" else ""
 }
 
-@Composable
-private fun OverviewCard(
-    members: List<ArenaService>,
-    pool: ArenaWebViewPool,
-    sessionController: ArenaSessionController,
-    summaryStatus: String,
-    summarySubtitle: String,
-    selectedTab: String,
-    onSelect: (String) -> Unit,
-) {
-    val colors = ArenaStyle.colors
-    ArenaCard(modifier = Modifier.fillMaxWidth()) {
-        Column {
-            members.forEachIndexed { index, service ->
-                if (index > 0) HorizontalDivider(color = colors.border, modifier = Modifier.padding(horizontal = 14.dp))
-                val status = pool.statuses[service] ?: ServiceStatus()
-                val run = sessionController.runs[service] ?: ParticipantRun()
-                val started = run.requestId.isNotBlank()
-                val preview = previewLine(run.response).ifBlank {
-                    if (started || run.detail != "等待开始") run.detail else status.detail
-                }
-                OverviewRow(
-                    selected = selectedTab == service.name,
-                    onClick = { onSelect(service.name) },
-                    contentDescriptionText = "查看 ${service.displayName} 的回答",
-                    leading = { BrandAvatar(service = service, size = 30.dp) },
-                    title = service.displayName,
-                    caption = modeCaption(run, status),
-                    thinkingUsed = run.thinkingUsed,
-                    preview = preview,
-                    previewColor = if (run.phase == ParticipantPhase.ERROR) colors.error else colors.muted,
-                    trailing = { if (started) RunStatusPill(run.phase) else StatusPill(status.state) },
-                )
-            }
-            HorizontalDivider(color = colors.border, modifier = Modifier.padding(horizontal = 14.dp))
-            OverviewRow(
-                selected = selectedTab == SUMMARY_TAB,
-                onClick = { onSelect(SUMMARY_TAB) },
-                contentDescriptionText = "查看队长总结",
-                leading = { SummaryAvatar(size = 30.dp) },
-                title = "队长总结",
-                caption = "",
-                thinkingUsed = false,
-                preview = summarySubtitle,
-                previewColor = colors.muted,
-                trailing = { SummaryStatusPill(summaryStatus) },
-            )
-        }
-    }
-}
-
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun OverviewRow(
     selected: Boolean,
@@ -616,6 +482,7 @@ private fun OverviewRow(
     preview: String,
     previewColor: Color,
     trailing: @Composable () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = ArenaStyle.colors
     val background by animateColorAsState(
@@ -623,20 +490,23 @@ private fun OverviewRow(
         label = "overview-row",
     )
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .background(background)
-            .clickable(onClick = onClick)
-            .semantics { contentDescription = contentDescriptionText }
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics {
+                contentDescription = contentDescriptionText
+                stateDescription = if (selected) "已展开" else "已折叠"
+            }
             .padding(horizontal = 14.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         leading()
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
+            FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
             ) {
                 Text(
                     text = title,
@@ -667,6 +537,12 @@ private fun OverviewRow(
             }
         }
         trailing()
+        ArenaIcon(
+            R.drawable.ic_chevron_right,
+            tint = colors.muted,
+            size = 14.dp,
+            modifier = Modifier.rotate(if (selected) -90f else 90f),
+        )
     }
 }
 
@@ -675,181 +551,6 @@ private fun OverviewRow(
 private fun ThinkingUsedPill() {
     val colors = ArenaStyle.colors
     ArenaPill(text = "已深度思考", foreground = colors.debate, background = colors.debateSoft, dot = false)
-}
-
-@Composable
-private fun SummaryAvatar(size: androidx.compose.ui.unit.Dp) {
-    val colors = ArenaStyle.colors
-    Box(
-        modifier = Modifier
-            .size(size)
-            .clip(RoundedCornerShape(99.dp))
-            .background(colors.debateSoft),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = "总",
-            color = colors.debate,
-            style = MaterialTheme.typography.titleSmall,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
-@Composable
-private fun SummaryStatusPill(status: String) {
-    val colors = ArenaStyle.colors
-    val (background, foreground) = when (status) {
-        "已总结" -> colors.successSoft to colors.success
-        "总结中" -> colors.accentSoft to colors.accent
-        "没成功" -> colors.errorSoft to colors.error
-        "可做" -> colors.debateSoft to colors.debate
-        else -> colors.surfaceAlt to colors.muted
-    }
-    ArenaPill(text = status, foreground = foreground, background = background, pulsing = status == "总结中")
-}
-
-/**
- * 底部分段切换：每家一格 + 「总结」一格，格里写名字和一个状态词。
- * 放在底栏正上方、拇指范围内（长辈常见的单手握法）。
- */
-@Composable
-private fun ResultTabBar(
-    members: List<ArenaService>,
-    pool: ArenaWebViewPool,
-    sessionController: ArenaSessionController,
-    summaryStatus: String,
-    selectedTab: String,
-    onSelect: (String) -> Unit,
-    onOpenService: (ArenaService) -> Unit,
-) {
-    val colors = ArenaStyle.colors
-    val cellCount = members.size + 1
-    Surface(color = colors.card, tonalElevation = 0.dp) {
-        Column {
-            HorizontalDivider(color = colors.border)
-            // 按实际可用宽度定字号：用户手机（窄屏 + 大字号）上 "DeepSeek" 曾被裁成 "DeepS…"（2026-09-06）
-            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
-                val cellWidth = (maxWidth - 12.dp - 4.dp * (cellCount - 1)) / cellCount
-                val labelStyle = when {
-                    cellWidth >= 100.dp -> MaterialTheme.typography.labelLarge
-                    cellWidth >= 80.dp -> MaterialTheme.typography.labelMedium
-                    else -> MaterialTheme.typography.labelSmall
-                }
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 6.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    members.forEach { service ->
-                        val run = sessionController.runs[service] ?: ParticipantRun()
-                        val status = pool.statuses[service] ?: ServiceStatus()
-                        val selected = selectedTab == service.name
-                        val active = run.phase == ParticipantPhase.QUEUED ||
-                            run.phase == ParticipantPhase.SENDING ||
-                            run.phase == ParticipantPhase.WAITING ||
-                            run.phase == ParticipantPhase.STREAMING
-                        // 已选中的那家再点一下就进它的网页（用户反馈 2026-09-06：下面这一行要能跳转）。
-                        // 这层意思直接写在格子上，别让人猜；正在回答时仍显示进度词。
-                        val showOpenHint = selected && !active
-                        ResultTabCell(
-                            label = service.shortName,
-                            caption = if (showOpenHint) "点开网页" else runStatusWord(run, status),
-                            captionColor = when {
-                                showOpenHint -> colors.accent
-                                run.requestId.isBlank() && run.detail == "等待开始" -> colors.muted
-                                run.phase == ParticipantPhase.ERROR -> colors.error
-                                run.phase == ParticipantPhase.COMPLETE -> colors.success
-                                run.phase == ParticipantPhase.IDLE -> colors.muted
-                                else -> colors.accent
-                            },
-                            selected = selected,
-                            labelStyle = labelStyle,
-                            onClick = { if (selected) onOpenService(service) else onSelect(service.name) },
-                            contentDescriptionText = if (selected) {
-                                "跳转到 ${service.displayName} 网页"
-                            } else {
-                                "切换到 ${service.displayName} 的回答"
-                            },
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                    ResultTabCell(
-                        label = "总结",
-                        caption = summaryStatus,
-                        captionColor = when (summaryStatus) {
-                            "已总结" -> colors.success
-                            "总结中" -> colors.accent
-                            "没成功" -> colors.error
-                            "可做" -> colors.debate
-                            else -> colors.muted
-                        },
-                        selected = selectedTab == SUMMARY_TAB,
-                        labelStyle = labelStyle,
-                        onClick = { onSelect(SUMMARY_TAB) },
-                        contentDescriptionText = "切换到队长总结",
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultTabCell(
-    label: String,
-    caption: String,
-    captionColor: Color,
-    selected: Boolean,
-    labelStyle: TextStyle,
-    onClick: () -> Unit,
-    contentDescriptionText: String,
-    modifier: Modifier = Modifier,
-) {
-    val colors = ArenaStyle.colors
-    val metrics = ArenaStyle.metrics
-    val background by animateColorAsState(
-        targetValue = if (selected) colors.accentSoft else Color.Transparent,
-        label = "tab-bg",
-    )
-    Surface(
-        modifier = modifier
-            .heightIn(min = metrics.minTouch)
-            .semantics { contentDescription = contentDescriptionText }
-            .clip(RoundedCornerShape(metrics.controlCorner))
-            .clickable(onClick = onClick),
-        color = background,
-        shape = RoundedCornerShape(metrics.controlCorner),
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(1.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            // 放不下就缩字号，永远不省略：格子上只有一个词，省略了就认不出是谁
-            Text(
-                text = label,
-                color = if (selected) colors.accent else colors.ink,
-                style = labelStyle,
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                maxLines = 1,
-                softWrap = false,
-                textAlign = TextAlign.Center,
-                autoSize = TextAutoSize.StepBased(minFontSize = 9.sp, maxFontSize = labelStyle.fontSize, stepSize = 0.5.sp),
-            )
-            Text(
-                text = caption,
-                color = captionColor,
-                style = MaterialTheme.typography.labelSmall,
-                maxLines = 1,
-                softWrap = false,
-                textAlign = TextAlign.Center,
-                autoSize = TextAutoSize.StepBased(minFontSize = 8.sp, maxFontSize = 11.sp, stepSize = 0.5.sp),
-            )
-        }
-    }
 }
 
 /**
@@ -954,13 +655,6 @@ private fun SummaryPickerCard(
                     color = colors.muted,
                     style = MaterialTheme.typography.bodySmall,
                 )
-            } else if (canSummarize) {
-                // 「继续追问」（观点讨论 / 独立迭代）在每家回答下面；停在总结页的人未必知道
-                Text(
-                    text = "想让几家先互相讨论再总结：切到任一家的回答，下面有「观点讨论」。",
-                    color = colors.muted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
             }
         }
     }
@@ -1020,159 +714,102 @@ private fun CaptainChip(
     }
 }
 
-private val GUIDANCE_EXAMPLES = listOf("说得再简单些", "重点比较优缺点", "给出具体做法")
-
 @Composable
-private fun GuidanceChip(
-    text: String,
-    enabled: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val colors = ArenaStyle.colors
-    Surface(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = modifier.semantics { contentDescription = "填入要求：$text" },
-        shape = RoundedCornerShape(50),
-        color = colors.surface,
-        contentColor = colors.accent,
-    ) {
-        // 不限行数也不截断：以前三个 chip 平分一行、单行省略，用户手机（窄屏 + 大字号）上显示成"说得再…"（用户反馈 2026-09-06）
-        Text(
-            text = text,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.labelLarge,
-            textAlign = TextAlign.Center,
-        )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun NextRoundPanel(
+internal fun NextRoundPanel(
     guidance: String,
     onGuidanceChange: (String) -> Unit,
+    inputEnabled: Boolean,
     enabled: Boolean,
+    summaryExpanded: Boolean,
+    onSummary: () -> Unit,
     onIterate: () -> Unit,
     onDebate: () -> Unit,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
-    val context = LocalContext.current
-    val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
-    // 很多人不知道「观点讨论」前可以先写自己的要求（直接点也能跑）。第一次到这里给一条提示，
-    // 用户点「知道了」或自己写过要求之后就不再打扰（用户反馈 2026-09-05）。
-    var hintSeen by remember { mutableStateOf(guidePreferences.hasSeenRoundGuidanceHint()) }
-    val dismissHint = {
-        if (!hintSeen) {
-            hintSeen = true
-            guidePreferences.markRoundGuidanceHintSeen()
-        }
-    }
-    ArenaCard(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            SectionTitle(text = "继续追问")
-            if (!hintSeen) {
-                ArenaNotice(
-                    tone = NoticeTone.INFO,
-                    title = "可以先提要求，再让它们讨论",
-                    text = "在下面写一句你的要求（比如「说得再简单些」），AI 讨论时会照着做。不写也能直接点「观点讨论」。",
-                    actionLabel = "知道了",
-                    onAction = dismissHint,
-                )
-            }
-            Text(
-                text = "「独立迭代」把下面这句话原样发给每家 AI；「观点讨论」会把其他 AI 的观点转给对方，让它们互相评论。" +
-                    "想要一条整合好的结论，去底部的「总结」做队长总结。",
-                color = colors.muted,
-                style = MaterialTheme.typography.bodySmall,
-            )
+            Text("继续追问", color = colors.ink, style = MaterialTheme.typography.labelLarge)
             OutlinedTextField(
                 value = guidance,
-                onValueChange = {
-                    onGuidanceChange(it.take(ArenaLimits.MAX_GUIDANCE_CHARS))
-                    if (it.isNotBlank()) dismissHint()
-                },
-                enabled = enabled,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 84.dp),
+                onValueChange = { onGuidanceChange(it.take(ArenaLimits.MAX_GUIDANCE_CHARS)) },
+                enabled = inputEnabled,
+                modifier = Modifier.weight(1f).testTag("round-guidance")
+                    .semantics { contentDescription = "继续追问" },
                 placeholder = {
                     Text(
-                        text = "你的要求（选填），例如：说得再简单些 / 重点比较优缺点",
+                        "补充你的要求，或直接点击下方按钮。",
                         color = colors.muted,
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        autoSize = TextAutoSize.StepBased(
+                            minFontSize = 12.sp,
+                            maxFontSize = MaterialTheme.typography.bodySmall.fontSize,
+                            stepSize = 0.5.sp,
+                        ),
                     )
                 },
-                textStyle = MaterialTheme.typography.bodyLarge,
+                textStyle = MaterialTheme.typography.bodyMedium,
                 shape = RoundedCornerShape(metrics.controlCorner),
                 colors = TextFieldDefaults.colors(
-                    focusedContainerColor = colors.surface,
-                    unfocusedContainerColor = colors.surface,
-                    disabledContainerColor = colors.surface,
+                    focusedContainerColor = colors.card,
+                    unfocusedContainerColor = colors.card,
+                    disabledContainerColor = colors.card,
                     focusedIndicatorColor = colors.accent,
-                    unfocusedIndicatorColor = if (metrics.flatSurfaces) colors.surface else colors.border,
-                    disabledIndicatorColor = colors.surface,
+                    unfocusedIndicatorColor = colors.border,
+                    disabledIndicatorColor = colors.border,
                     cursorColor = colors.accent,
                     focusedTextColor = colors.ink,
                     unfocusedTextColor = colors.ink,
                 ),
-                maxLines = 4,
+                minLines = 1,
+                maxLines = 2,
             )
-            // 三个现成的要求：点一下就填进去，长辈不用自己想措辞。
-            // FlowRow 让 chip 按内容定宽、放不下就换行，窄屏 / 大字号都不会截断
-            if (guidance.isBlank()) {
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    GUIDANCE_EXAMPLES.forEach { example ->
-                        GuidanceChip(
-                            text = example,
-                            enabled = enabled,
-                            onClick = {
-                                onGuidanceChange(example)
-                                dismissHint()
-                            },
-                        )
-                    }
-                }
-            }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                ArenaPrimaryButton(
-                    text = "独立迭代",
-                    onClick = onIterate,
-                    enabled = guidance.isNotBlank() && enabled,
-                    modifier = Modifier.weight(1f),
-                )
-                ArenaPrimaryButton(
-                    text = "观点讨论",
-                    onClick = onDebate,
-                    enabled = enabled,
-                    modifier = Modifier.weight(1f),
-                    containerColor = colors.debateSoft,
-                    contentColor = colors.debate,
-                )
-            }
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            RoundAction("队长总结", onSummary, true, Modifier.weight(1f).testTag("summary-toggle")
+                .semantics { stateDescription = if (summaryExpanded) "已展开" else "已折叠" }, primary = true)
+            RoundAction("观点讨论", onDebate, enabled, Modifier.weight(1f).testTag("round-debate"))
+            RoundAction("独立迭代", onIterate, enabled && guidance.isNotBlank(), Modifier.weight(1f).testTag("round-iterate"))
+        }
+    }
+}
+
+@Composable
+private fun RoundAction(
+    text: String,
+    onClick: () -> Unit,
+    enabled: Boolean,
+    modifier: Modifier,
+    primary: Boolean = false,
+) {
+    val colors = ArenaStyle.colors
+    val metrics = ArenaStyle.metrics
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.heightIn(min = metrics.minTouch),
+        shape = RoundedCornerShape(metrics.controlCorner),
+        color = if (primary) colors.accent else colors.debateSoft,
+        contentColor = (if (primary) colors.onAccent else colors.debate).copy(alpha = if (enabled) 1f else 0.4f),
+    ) {
+        Box(Modifier.padding(horizontal = 4.dp, vertical = 10.dp), contentAlignment = Alignment.Center) {
+            Text(text, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center, maxLines = 1, softWrap = false,
+                autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = MaterialTheme.typography.labelLarge.fontSize, stepSize = 0.5.sp))
         }
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ProviderResultCard(
+internal fun ProviderResultCard(
     service: ArenaService,
     status: ServiceStatus,
     run: ParticipantRun,
-    collapsedLines: Int,
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     onClick: () -> Unit,
@@ -1185,74 +822,44 @@ private fun ProviderResultCard(
     onSkip: () -> Unit,
 ) {
     val colors = ArenaStyle.colors
+    val rowRequester = remember { BringIntoViewRequester() }
+    val scope = rememberCoroutineScope()
+    val changeExpanded: (Boolean) -> Unit = { value ->
+        onExpandedChange(value)
+        if (!value) {
+            scope.launch {
+                // Folding a long answer must return the reader to its own status row.
+                withFrameNanos { }
+                rowRequester.bringIntoView()
+            }
+        }
+    }
     val active = run.phase == ParticipantPhase.QUEUED ||
         run.phase == ParticipantPhase.SENDING ||
         run.phase == ParticipantPhase.WAITING ||
         run.phase == ParticipantPhase.STREAMING
-    val accentBorder by animateColorAsState(
-        targetValue = when {
-            run.phase == ParticipantPhase.ERROR -> colors.error
-            run.phase == ParticipantPhase.COMPLETE -> colors.success
-            active -> colors.accent
-            else -> colors.border
-        },
-        label = "result-border",
-    )
     val started = run.requestId.isNotBlank()
     val stalled = run.phase == ParticipantPhase.WAITING && run.detail.contains("迟迟没有回应")
     val failed = run.phase == ParticipantPhase.ERROR && started
     // 千问这类站点会弹滑块 / 验证码，App 只能等；不明说的话家人会以为卡住了（用户反馈 2026-09-06）
     val securityChallenge = run.phase == ParticipantPhase.WAITING && run.detail.contains("安全验证")
-    val mode = modeCaption(run, status)
-
-    ArenaCard(modifier = Modifier.fillMaxWidth(), borderColor = accentBorder) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable(onClick = onClick)
-                    .padding(horizontal = 16.dp, vertical = 13.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                BrandAvatar(service = service, size = 34.dp)
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Text(
-                            text = service.displayName,
-                            color = colors.ink,
-                            style = MaterialTheme.typography.titleMedium,
-                        )
-                        if (run.thinkingUsed) ThinkingUsedPill()
-                    }
-                    Text(
-                        text = when {
-                            stalled -> if (run.response.isNotBlank()) "回答了一部分，后面一直没动静" else "等了很久还没有回答"
-                            failed -> if (run.response.isNotBlank()) "只收到一部分回答" else "这次没有回答成功"
-                            started || run.detail != "等待开始" -> run.detail
-                            else -> status.detail
-                        },
-                        color = if (failed) colors.error else colors.muted,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (mode.isNotBlank()) {
-                        Text(
-                            text = mode,
-                            color = colors.muted,
-                            style = MaterialTheme.typography.labelSmall,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-                if (started) RunStatusPill(run.phase) else StatusPill(status.state)
-            }
-
+    Column(modifier = Modifier.fillMaxWidth()) {
+        OverviewRow(
+            selected = expanded,
+            onClick = { changeExpanded(!expanded) },
+            contentDescriptionText = "${service.displayName} 的回答",
+            leading = { BrandAvatar(service = service, size = 30.dp) },
+            title = service.displayName,
+            caption = modeCaption(run, status),
+            thinkingUsed = run.thinkingUsed,
+            preview = previewLine(run.response).ifBlank {
+                if (started || run.detail != "等待开始") run.detail else status.detail
+            },
+            previewColor = if (failed) colors.error else colors.muted,
+            trailing = { if (started) RunStatusPill(run.phase) else StatusPill(status.state) },
+            modifier = Modifier.testTag("answer-row-${service.name}").bringIntoViewRequester(rowRequester),
+        )
+        if (expanded) {
             if (active) {
                 ArenaProgressBar(
                     progress = null,
@@ -1270,12 +877,13 @@ private fun ProviderResultCard(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    // 折叠态同样走 Markdown 渲染：它是默认视图，不能退回无格式纯文本。
                     MarkdownText(
                         markdown = run.response,
                         color = colors.ink,
                         style = MaterialTheme.typography.bodyLarge,
-                        collapsedLines = if (expanded) null else collapsedLines,
+                        modifier = Modifier.fillMaxWidth()
+                            .testTag("answer-body-${service.name}")
+                            .clickable(role = Role.Button, onClickLabel = "收起 ${service.displayName} 的回答") { changeExpanded(false) },
                     )
                     if (run.responseTruncated) {
                         Text(
@@ -1291,13 +899,9 @@ private fun ProviderResultCard(
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         ArenaTextAction(
-                            text = if (expanded) "收起" else "展开全文",
-                            onClick = { onExpandedChange(!expanded) },
-                            contentDescriptionText = if (expanded) {
-                                "收起 ${service.displayName} 的回答"
-                            } else {
-                                "展开 ${service.displayName} 的完整回答"
-                            },
+                            text = "收起",
+                            onClick = { changeExpanded(false) },
+                            contentDescriptionText = "收起 ${service.displayName} 的回答",
                         )
                         if (onCopy != null) {
                             ArenaTextAction(
@@ -1323,6 +927,13 @@ private fun ProviderResultCard(
                 }
             }
 
+            if (run.response.isBlank()) {
+                ArenaTextAction(
+                    text = "跳转网页",
+                    onClick = onClick,
+                    contentDescriptionText = "跳转到 ${service.displayName} 网页",
+                )
+            }
             if (securityChallenge) {
                 ArenaNotice(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
