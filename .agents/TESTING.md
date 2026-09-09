@@ -32,7 +32,7 @@ adb 可能在 instrumentation 失败时仍退出 0，必须检查输出最终为
 
 ## 发布
 
-当前产品版本 `0.12.1`、versionCode `19`，折叠回答 UI 基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
+当前产品版本 `0.13.0`、versionCode `20`，折叠回答 UI 基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
 
 保持 `com.tianlin.aiarena` 和原 release 密钥。`keystore.properties`、密钥和密码留在仓库外/忽略文件；无签名配置的 release 构建是未签名包。Debug APK 和 CI 未签名 APK 不能替换用户已安装的签名 release。
 
@@ -41,3 +41,5 @@ adb 可能在 instrumentation 失败时仍退出 0，必须检查输出最终为
 ## 工作流来源
 
 `scripts/merge_task.py` 与 `.githooks/*` 原样来自 `TianLin0509/project-prep` v0.1.0，提交 `441d2c732a7c3718acd5b499dccf3e9c218b2925`，MIT（Copyright 2026 TianLin0509）。本仓库同为 MIT。它绑定主干/候选完整 SHA，在一次性 Git fixture 验证，不在旧运行目录试验。
+
+附件变更还须验证：系统文件选择、实际字节复制、限制与取消、上传失败不发文字、同一附件交付多个隔离 WebView、历史/重试引用保留，以及仅失败项串行恢复。合成网页通过不代表六家真实账号全部上传通过。

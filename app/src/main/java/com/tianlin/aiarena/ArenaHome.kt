@@ -67,9 +67,9 @@ internal fun AskHome(
     usableCount: Int,
     onMembers: () -> Unit,
     onConnections: () -> Unit,
-    voiceInputActive: Boolean,
-    voiceInputEnabled: Boolean,
-    onVoiceInput: () -> Unit,
+    attachmentDraft: AttachmentDraft,
+    attachmentsEnabled: Boolean,
+    onChooseAttachments: () -> Unit,
     offline: Boolean,
     crashNotice: ArenaCrashReport?,
     onCrashRestart: () -> Unit,
@@ -168,15 +168,15 @@ internal fun AskHome(
                 onQuestionChange = onQuestionChange,
                 questionWithinLimit = questionWithinLimit,
                 lengthAdvisory = lengthAdvisory,
-                voiceInputActive = voiceInputActive,
-                voiceInputEnabled = voiceInputEnabled,
-                onVoiceInput = onVoiceInput,
                 compact = imeVisible,
                 focusRequester = composerFocus,
             )
 
+            AttachmentComposer(attachmentDraft.attachments, attachmentDraft.picking, attachmentsEnabled,
+                onChooseAttachments, attachmentDraft::remove, attachmentDraft.error)
+
             AnimatedVisibility(
-                visible = question.isBlank(),
+                visible = question.isBlank() && attachmentDraft.attachments.isEmpty(),
                 enter = fadeIn() + expandVertically(),
                 exit = fadeOut() + shrinkVertically(),
             ) {
@@ -250,6 +250,7 @@ internal fun AskHome(
                     // 主按钮永远可以点：点了以后要么开始，要么带你去做"下一步该做的事"。
                     // 灰掉的大按钮对长辈来说等于"这个 App 坏了"。
                     ArenaPrimaryButton(
+                        enabled = !attachmentDraft.picking,
                         text = when {
                             !ready -> "先登录 AI（还差 $missing 家）"
                             !questionWithinLimit -> "问题太长，请缩短"
@@ -259,7 +260,7 @@ internal fun AskHome(
                             when {
                                 !ready -> onConnections()
                                 !questionWithinLimit -> onTooLong()
-                                question.isBlank() -> {
+                                question.isBlank() && attachmentDraft.attachments.isEmpty() -> {
                                     runCatching { composerFocus.requestFocus() }
                                     onNeedQuestion()
                                 }
@@ -325,10 +326,7 @@ internal fun QuestionComposer(
     onQuestionChange: (String) -> Unit,
     questionWithinLimit: Boolean,
     lengthAdvisory: String?,
-    voiceInputActive: Boolean,
-    voiceInputEnabled: Boolean,
-    onVoiceInput: () -> Unit,
-    /** 键盘占掉大半屏时压矮一档，好让分隔线和语音/清空那行也留在可视区内。 */
+    /** 键盘占掉大半屏时压矮一档，好让分隔线和清空那行也留在可视区内。 */
     compact: Boolean = false,
     focusRequester: FocusRequester? = null,
 ) {
@@ -382,15 +380,6 @@ internal fun QuestionComposer(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                if (voiceInputEnabled) {
-                    ArenaSecondaryButton(
-                        text = if (voiceInputActive) "听写中…" else "语音输入",
-                        onClick = onVoiceInput,
-                        enabled = !voiceInputActive,
-                        modifier = Modifier.semantics { contentDescription = "语音输入问题" },
-                        leading = { ArenaIcon(R.drawable.ic_mic, tint = colors.accent, size = 20.dp) },
-                    )
-                }
                 if (question.isNotEmpty()) {
                     ArenaTextAction(
                         text = "清空",

@@ -1,0 +1,332 @@
+package com.tianlin.aiarena
+
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import androidx.activity.ComponentActivity
+import androidx.test.core.app.ActivityScenario
+import androidx.test.platform.app.InstrumentationRegistry
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
+import org.junit.Assert.*
+import org.junit.Test
+import java.io.File
+import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+
+/** Actual WebView content-URI transfers; all bytes and sites are isolated synthetic fixtures. */
+class ArenaAttachmentInstrumentedTest {
+    private val instrumentation = InstrumentationRegistry.getInstrumentation()
+    private val context get() = instrumentation.targetContext
+    private val names = listOf("probe.png", "probe.pdf", "probe.txt")
+    private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
+    private fun imported() = ArenaAttachmentStore(context).importDocuments(names.map(AttachmentFixtureProvider::uri))
+
+    @Test fun privateCopiesSurviveStoreReopenAndCorruptionIsRejected() {
+        val files = imported()
+        val reopened = ArenaAttachmentStore(context)
+        files.forEach { attachment ->
+            assertArrayEquals(AttachmentFixtureProvider.bytes(attachment.name), reopened.verify(attachment).readBytes())
+        }
+        reopened.dataFile(files.first().id).appendText("corrupt")
+        assertTrue(runCatching { reopened.verify(files.first()) }.isFailure)
+        reopened.discardImported(files)
+    }
+
+    @Test fun unknownSizeOverLimitRollsBackEntireBatch() {
+        val store = ArenaAttachmentStore(context)
+        val directory = File(context.filesDir, "arena_attachments")
+        val before = directory.list()?.toSet().orEmpty()
+        val outcome = runCatching { store.importDocuments(listOf(AttachmentFixtureProvider.uri("probe.png"), AttachmentFixtureProvider.uri("too-big.txt"))) }
+        assertTrue(outcome.isFailure)
+        assertEquals(before, directory.list()?.toSet().orEmpty())
+    }
+
+    @Test fun garbageCollectionKeepsDiskSessionsDraftsLeasesAndUnreadableReferences() {
+        val store = ArenaAttachmentStore(context)
+        val old = imported()
+        val leased = store.importDocuments(listOf(AttachmentFixtureProvider.uri("probe.txt")))
+        val leaseOwner = "gc-${System.nanoTime()}"
+        ArenaAttachmentLeases.issue(context, leaseOwner, leased.single(), store.verify(leased.single()))
+        val sessions = File(context.filesDir, "arena_sessions").apply { mkdirs() }
+        val reference = File(sessions, "session_gc_${System.nanoTime()}.json")
+        reference.writeText(JSONObject().put("version", ArenaSessionJson.SCHEMA_VERSION).put("id", reference.nameWithoutExtension)
+            .put("originalQuestion", "Synthetic attachment retention check").put("services", JSONArray()).put("runs", JSONObject())
+            .put("history", JSONArray()).put("summary", JSONObject())
+            .put("lastRoundAttachments", JSONArray().put(JSONObject().put("id", old[0].id))).toString())
+        val fresh = store.importDocuments(listOf(AttachmentFixtureProvider.uri("probe.txt")), setOf(old[1].id))
+        assertTrue(store.dataFile(old[0].id).isFile)
+        assertTrue(store.dataFile(old[1].id).isFile)
+        assertFalse(store.dataFile(old[2].id).exists())
+        assertTrue(store.dataFile(leased.single().id).isFile)
+        reference.writeText("{broken-json")
+        val last = store.importDocuments(listOf(AttachmentFixtureProvider.uri("probe.txt")), emptySet())
+        assertTrue(store.dataFile(old[1].id).isFile)
+        assertTrue(store.dataFile(fresh[0].id).isFile)
+        assertTrue(reference.delete())
+        ArenaAttachmentLeases.revoke(leaseOwner)
+        store.discardImported(old + fresh + last + leased)
+    }
+
+    @Test fun missingVendorStructureAndDecoySuccessNeverPermitSendingOrAvatarUpload() {
+        withView("<button aria-label='Upload avatar'>Upload avatar</button><div class='upload-success' data-status='success'>probe.txt uploaded success</div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 40, "a".repeat(64))
+            ArenaService.defaultMembers.forEach { service ->
+                evaluate(view, ArenaAttachmentScript.prepare("decoy", listOf(attachment), service))
+                evaluate(view, "window.__arenaAttachment.chosen=true;true")
+                assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("decoy", service))).getBoolean("ready"))
+                assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("decoy", service))).has("x"))
+            }
+        }
+    }
+
+    @Test fun vendorReadinessUsesCurrentReactCommitAndParseSuccess() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='newcard'></div></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 40, "a".repeat(64))
+            assertEquals("true", evaluate(view, ArenaAttachmentScript.prepare("vendor", listOf(attachment), ArenaService.DEEPSEEK)))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;
+                const card=document.createElement('div');card.className='_25c7358';card.style='height:40px';card.innerHTML='<span class="e70accd6">probe.txt</span>';newcard.appendChild(card);
+                const root={tag:3,stateNode:{}},oldRoot={tag:3,stateNode:root.stateNode};root.stateNode.current=root;
+                window.currentFile={fileName:'probe.txt',fileSize:40,id:'remote-id',status:'PENDING'};
+                const current={memoizedProps:{file:currentFile},return:root},stale={memoizedProps:{file:{...currentFile,status:'SUCCESS'}},return:oldRoot,alternate:current};current.alternate=stale;card['__reactFiber${'$'}fixture']=stale;true;
+            """.trimIndent())
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("vendor", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "currentFile.status='SUCCESS';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("vendor", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "currentFile.status='FAILED';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("vendor", ArenaService.DEEPSEEK))).has("error"))
+        }
+        withView("<div data-testid='attachment_area' id='area'></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 40, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("doubao", listOf(attachment), ArenaService.DOUBAO))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.fileState={fileName:'probe.txt',size:40,type:'file',fileKey:'remote',localKey:'local',status:'Normal',parseState:3,reviewState:0};
+                area['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:[fileState]},return:root};true;
+            """.trimIndent())
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("doubao", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.parseState=1;true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("doubao", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.parseState=2;true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("doubao", ArenaService.DOUBAO))).has("error"))
+        }
+    }
+
+    @Test fun kimiImagesRequireObservedLoadingToSuccessNotUnspecifiedAppearance() {
+        withView("<div data-testid='input-attachment-list' id='area'></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "probe.png", "image/png", 40, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("kimi", listOf(attachment), ArenaService.KIMI))
+            evaluate(view, "window.__arenaAttachment.chosen=true;area.innerHTML='<div class=\"image-thumbnail success\" style=\"height:80px;width:80px\"><img src=\"https://fixture.invalid/p.png\"></div>';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi", ArenaService.KIMI))).getBoolean("ready"))
+            evaluate(view, "area.firstChild.className='image-thumbnail loading';true")
+            evaluate(view, "area.firstChild.className='image-thumbnail success';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi", ArenaService.KIMI))).getBoolean("ready"))
+            evaluate(view, "area.firstChild.className='image-thumbnail error';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi", ArenaService.KIMI))).has("error"))
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.prepare("old-draft", listOf(attachment), ArenaService.KIMI))).has("error"))
+        }
+    }
+
+    @Test fun threePendingWebViewsReceiveSameThreeFilesWithExactHashes() {
+        val attachments = imported()
+        val store = ArenaAttachmentStore(context)
+        val files = attachments.map { it to store.verify(it) }
+        ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
+            val loaded = CountDownLatch(3)
+            val done = CountDownLatch(3)
+            val errors = mutableListOf<String>()
+            val views = mutableListOf<WebView>()
+            lateinit var broker: ArenaFileChooserBroker
+            scenario.onActivity { activity ->
+                val frame = FrameLayout(activity)
+                activity.setContentView(frame)
+                broker = ArenaFileChooserBroker(activity)
+                ArenaService.defaultMembers.forEach { service ->
+                    val view = WebView(activity)
+                    view.settings.javaScriptEnabled = true
+                    view.settings.allowContentAccess = false
+                    view.settings.allowFileAccess = false
+                    frame.addView(view, FrameLayout.LayoutParams(720, 1200))
+                    view.webViewClient = object : WebViewClient() { override fun onPageFinished(view: WebView, url: String?) { loaded.countDown() } }
+                    view.webChromeClient = object : WebChromeClient() {
+                        override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                            if (!broker.handle(view, callback, params)) callback.onReceiveValue(null)
+                            return true
+                        }
+                    }
+                    view.loadDataWithBaseURL(service.url, fixture(service = service), "text/html", "UTF-8", service.url)
+                    views += view
+                }
+            }
+            assertTrue(loaded.await(15, TimeUnit.SECONDS))
+            onMain {
+                views.forEachIndexed { index, view ->
+                    ArenaAttachmentTransport(Handler(Looper.getMainLooper()), broker).upload(view, ArenaService.defaultMembers[index], "three-$index", files, { true }) { error ->
+                        if (error != null) errors += error
+                        done.countDown()
+                    }
+                }
+            }
+            assertTrue("Uploads did not settle", done.await(25, TimeUnit.SECONDS))
+            assertEquals(emptyList<String>(), errors)
+            views.forEach { view ->
+                val read = JSONArray(evaluate(view, "JSON.stringify(window.received)"))
+                assertEquals(3, read.length())
+                repeat(read.length()) { index ->
+                    val value = read.getJSONObject(index)
+                    val attachment = attachments.single { it.name == value.getString("name") }
+                    val actual = android.util.Base64.decode(value.getString("data").substringAfter(','), android.util.Base64.DEFAULT)
+                    assertEquals(attachment.sizeBytes, actual.size.toLong())
+                    assertEquals(attachment.sha256, MessageDigest.getInstance("SHA-256").digest(actual).joinToString("") { "%02x".format(it) })
+                }
+            }
+            onMain { broker.cancelAll(); views.forEach(WebView::destroy) }
+        }
+        store.discardImported(attachments)
+    }
+
+    @Test fun parseFailureStopsBeforeSendAndBareFileSelectionIsNotReady() {
+        withView(fixture(fail = true)) { view, broker ->
+            val files = imported()
+            val done = CountDownLatch(1)
+            val error = AtomicReference<String?>()
+            var sends = 0
+            onMain {
+                ArenaAttachmentTransport(Handler(Looper.getMainLooper()), broker).upload(view, ArenaService.DEEPSEEK, "fail-upload", files.map { it to ArenaAttachmentStore(context).verify(it) }, { true }) { failure ->
+                    error.set(failure)
+                    if (failure == null) sends++
+                    done.countDown()
+                }
+            }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertNotNull(error.get())
+            assertEquals(0, sends)
+            evaluate(view, "window.fileStates.forEach(f=>f.status='PENDING');true")
+            val result = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("fail-upload", ArenaService.DEEPSEEK)))
+            assertFalse(result.getBoolean("ready"))
+            ArenaAttachmentStore(context).discardImported(files)
+        }
+    }
+
+    @Test fun cancellationAndNavigationRejectLateChoosersAndRevokeUris() {
+        withView(fixture()) { view, broker ->
+            val files = imported()
+            val store = ArenaAttachmentStore(context)
+            var callbackCount = 0
+            var supplied: Array<Uri>? = null
+            onMain {
+                broker.prepare(view, ArenaService.DEEPSEEK, "old", files.map { it to store.verify(it) }) { callbackCount++ }
+                broker.navigated(view)
+                assertFalse(broker.handle(view, ValueCallback { supplied = it }, params()))
+                broker.prepare(view, ArenaService.DEEPSEEK, "new", files.map { it to store.verify(it) }) { callbackCount++ }
+                assertTrue(broker.handle(view, ValueCallback { supplied = it }, params()))
+                assertEquals(1, callbackCount)
+                assertEquals(3, supplied!!.size)
+                broker.cancelAll()
+            }
+            supplied!!.forEach { uri -> assertTrue(runCatching { context.contentResolver.openInputStream(uri)!!.use { it.read() } }.isFailure) }
+            store.discardImported(files)
+        }
+    }
+
+    @Test fun wrongModeMimeAndOriginNeverReceivePreselectedFiles() {
+        withView(fixture()) { view, broker ->
+            val files = imported()
+            val store = ArenaAttachmentStore(context)
+            onMain {
+                listOf(params(multiple = false), params(accept = arrayOf("video/*"))).forEach { choice ->
+                    var error: String? = null
+                    var called = false
+                    broker.prepare(view, ArenaService.DEEPSEEK, "blocked", files.map { it to store.verify(it) }) { error = it }
+                    assertTrue(broker.handle(view, ValueCallback { called = true; assertNull(it) }, choice))
+                    assertTrue(called)
+                    assertNotNull(error)
+                }
+                assertFalse(ArenaFileChooserBroker.trusted(ArenaService.DEEPSEEK, "https://chat.deepseek.com.evil.example/"))
+                assertFalse(ArenaFileChooserBroker.trusted(ArenaService.KIMI, "https://kimi.com@evil.example/"))
+                assertFalse(ArenaFileChooserBroker.trusted(ArenaService.DOUBAO, "file:///private"))
+                broker.cancelAll()
+            }
+            store.discardImported(files)
+        }
+    }
+
+    private fun params(multiple: Boolean = true, accept: Array<String> = arrayOf("*/*")) = object : WebChromeClient.FileChooserParams() {
+        override fun getMode() = if (multiple) MODE_OPEN_MULTIPLE else MODE_OPEN
+        override fun getAcceptTypes() = accept
+        override fun isCaptureEnabled() = false
+        override fun getTitle(): CharSequence? = null
+        override fun getFilenameHint(): String? = null
+        override fun createIntent() = android.content.Intent()
+    }
+
+    private fun withView(html: String, block: (WebView, ArenaFileChooserBroker) -> Unit) {
+        ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
+            lateinit var view: WebView
+            lateinit var broker: ArenaFileChooserBroker
+            val loaded = CountDownLatch(1)
+            scenario.onActivity { activity ->
+                broker = ArenaFileChooserBroker(activity)
+                view = WebView(activity)
+                view.settings.javaScriptEnabled = true
+                activity.setContentView(view)
+                view.webViewClient = object : WebViewClient() { override fun onPageFinished(view: WebView, url: String?) { loaded.countDown() } }
+                view.webChromeClient = object : WebChromeClient() {
+                    override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                        if (!broker.handle(view, callback, params)) callback.onReceiveValue(null)
+                        return true
+                    }
+                }
+                view.loadDataWithBaseURL(ArenaService.DEEPSEEK.url, html, "text/html", "UTF-8", ArenaService.DEEPSEEK.url)
+            }
+            assertTrue(loaded.await(15, TimeUnit.SECONDS))
+            try { block(view, broker) } finally { onMain { broker.cancelAll(); view.destroy() } }
+        }
+    }
+
+    private fun evaluate(view: WebView, script: String): String {
+        val result = AtomicReference<String>()
+        val done = CountDownLatch(1)
+        onMain { view.evaluateJavascript(script) { raw -> result.set(JSONTokener(raw).nextValue().toString()); done.countDown() } }
+        assertTrue(done.await(10, TimeUnit.SECONDS))
+        return result.get()
+    }
+
+    private fun fixture(fail: Boolean = false, service: ArenaService = ArenaService.DEEPSEEK): String {
+        val kind = service.name
+        val controls = if (service == ArenaService.KIMI) """
+            <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; multiple style=&quot;display:none&quot;></label>';document.getElementById('upload').onchange=handle;">Add</button><div id="menu"></div>
+        """.trimIndent() else """
+            <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" multiple accept="image/*,.pdf,.txt" style="display:none">
+        """.trimIndent()
+        return """
+            <meta name="viewport" content="width=device-width,initial-scale=1"><div class="_77cefa5"><textarea></textarea>$controls<div id="cards" data-testid="${if(service == ArenaService.KIMI) "input-attachment-list" else "attachment_area"}"></div></div>
+            <script>
+            window.received=[];window.fileStates=[];const root={tag:3,stateNode:{}};root.stateNode.current=root;
+            cards['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:fileStates},return:root};
+            function handle(){for(const file of document.getElementById('upload').files){
+              const image=file.type.startsWith('image/'),card=document.createElement('div');card.style='height:80px;width:180px';
+              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
+              if('$kind'==='DEEPSEEK'){card.className='_25c7358';card.innerHTML='<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
+              else if('$kind'==='KIMI'){card.className=image?'image-thumbnail loading':'file-card-container parsing';card.innerHTML=image?'<img src="https://fixture.invalid/p.png">':'<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">'+file.name.split('.').pop()+'</span>';}
+              else {card.setAttribute('data-testid','attachment_file_item');card.textContent=file.name;}
+              cards.appendChild(card);const reader=new FileReader();reader.onload=()=>{received.push({name:file.name,data:reader.result});setTimeout(()=>{
+                state.status=${if(fail) "'FAILED'" else if(service == ArenaService.DOUBAO) "'Normal'" else "'SUCCESS'"};state.parseState=${if(fail) 2 else 1};
+                state.imageList=[{key:state.fileKey,image_ori:{url:'https://fixture.invalid/p.png'}}];
+                if('$kind'==='KIMI')card.className=(image?'image-thumbnail ':'file-card-container ')+${if(fail) "'error'" else "'success'"};
+              },150);};reader.readAsDataURL(file);
+            }}
+            const direct=document.getElementById('upload');if(direct)direct.onchange=handle;
+            </script>
+        """.trimIndent()
+    }
+}
