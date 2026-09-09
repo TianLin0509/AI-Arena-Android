@@ -20,6 +20,7 @@ enum class RestoreOutcome {
     UNREADABLE,
     /** 本地存储不可用。 */
     NO_STORAGE,
+    SAVE_FAILED,
 }
 
 class ArenaSessionController(
@@ -71,8 +72,9 @@ class ArenaSessionController(
      * 落盘专用单线程。一次 save() 要做全量 JSON 编码 + 两次 fsync，
      * 而流式回答期间每家 AI 每 1.5 秒轮询一次都会触发它——放在主线程上必然 ANR。
      */
+    @Volatile private var persistThread: Thread? = null
     private val persistExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "arena-session-persist").apply { isDaemon = true }
+        Thread(runnable, "arena-session-persist").apply { isDaemon = true }.also { persistThread = it }
     }
     private var persistShutdown = false
 
@@ -92,6 +94,9 @@ class ArenaSessionController(
     private var sessionEpoch = 0L
     private var requestSequence = 0L
     private var sessionId = ""
+    var lastRoundAttachments by mutableStateOf<List<ArenaAttachment>>(emptyList())
+        private set
+    private val recoveryQueue = ArrayDeque<Pair<ArenaService, Boolean>>()
     private var lastRoundPrompts: Map<ArenaService, String> = emptyMap()
     /** 各家网页里这条讨论对应的对话地址；打开历史会话时用它把网页切回去。 */
     private val conversationUrls = mutableMapOf<ArenaService, String>()
@@ -119,8 +124,10 @@ class ArenaSessionController(
         question: String,
         services: List<ArenaService>,
         answerMode: AnswerMode = AnswerMode.PARALLEL,
+        attachments: List<ArenaAttachment> = emptyList(),
     ): Boolean {
-        val normalizedQuestion = question.trim()
+        ArenaAttachmentPolicy.validate(attachments)?.let { sessionMessage = it; return false }
+        val normalizedQuestion = AttachmentPromptPolicy.withDefault(question, attachments).trim()
         if (isBusy || stage != SessionStage.IDLE || services.distinct().size < 2) return false
         if (!QuestionPolicy.isValid(normalizedQuestion)) {
             sessionMessage = if (normalizedQuestion.isEmpty()) {
@@ -138,6 +145,7 @@ class ArenaSessionController(
         storageWarning = null
         history.clear()
         summary = DiscussionSummary()
+        lastRoundAttachments = emptyList()
         lastRoundPrompts = emptyMap()
         conversationUrls.clear()
         currentRoundContextNotice = ""
@@ -150,15 +158,17 @@ class ArenaSessionController(
             prompts = selected.associateWith { normalizedQuestion },
             answerMode = answerMode,
             guidance = "",
+            attachments = attachments,
         )
     }
 
     fun startIteration(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
+        attachments: List<ArenaAttachment> = emptyList(),
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
-        val newPrompt = guidance.trim()
+        val newPrompt = AttachmentPromptPolicy.withDefault(guidance, attachments).trim()
         if (newPrompt.isBlank()) {
             sessionMessage = "请输入本轮独立迭代的 Prompt"
             return false
@@ -171,18 +181,20 @@ class ArenaSessionController(
         val services = ArenaService.entries.filter { it in completed.keys }
         if (services.size < ArenaService.MIN_MEMBERS) return false
         val prompts = services.associateWith { newPrompt }
-        return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt)
+        return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt, attachments)
     }
 
     /** 观点讨论：把其他 AI 的回答转给每一家让它们互相评论。各家平等；把大家收拢成一条的活交给「队长总结」。 */
     fun startDebate(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
+        attachments: List<ArenaAttachment> = emptyList(),
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
         if (responses.size < 2) return false
         val debateIndex = history.count { it.kind == RoundKind.DEBATE } + 1
+        val instruction = AttachmentPromptPolicy.withDefault(guidance, attachments).take(ArenaLimits.MAX_GUIDANCE_CHARS)
         val services = ArenaService.entries.filter { it in responses.keys }
         val prompts = linkedMapOf<ArenaService, String>()
         var compressedCount = 0
@@ -193,7 +205,7 @@ class ArenaSessionController(
                     target = target,
                     responses = responses,
                     debateIndex = debateIndex,
-                    guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
+                    guidance = instruction,
                     quoteLimit = quoteLimit,
                 )
             } ?: run {
@@ -203,7 +215,7 @@ class ArenaSessionController(
             prompts[target] = budgeted.text
             if (budgeted.compressed) compressedCount += 1
         }
-        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, guidance)
+        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, instruction, attachments)
         if (started && compressedCount > 0) {
             currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
             sessionMessage += " · $currentRoundContextNotice"
@@ -220,6 +232,7 @@ class ArenaSessionController(
         preferredServices: List<ArenaService>,
         customInstruction: String = "",
         depth: SummaryDepth = SummaryDepth.STANDARD,
+        attachments: List<ArenaAttachment> = emptyList(),
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
@@ -235,7 +248,7 @@ class ArenaSessionController(
                 originalQuestion = originalQuestion,
                 history = history.toList(),
                 responses = responses,
-                customInstruction = customInstruction,
+                customInstruction = AttachmentPromptPolicy.withDefault(customInstruction, attachments),
                 quoteLimit = quoteLimit,
                 depth = depth,
             )
@@ -243,8 +256,18 @@ class ArenaSessionController(
             sessionMessage = "总结上下文超过 ${PromptBudgetPolicy.budgetFor(judge)} 字，请缩短原问题"
             return false
         }
-        val prompt = budgetedPrompt.text
+        return sendSummary(judge, budgetedPrompt.text, depth, attachments, budgetedPrompt.compressed)
+    }
 
+    fun retrySummary(): Boolean {
+        val previous = summary
+        val judge = previous.judge ?: return false
+        if (isBusy || previous.prompt.isBlank()) return false
+        return sendSummary(judge, previous.prompt, previous.depth, previous.attachments, false)
+    }
+
+    private fun sendSummary(judge: ArenaService, prompt: String, depth: SummaryDepth, attachments: List<ArenaAttachment>, compressed: Boolean): Boolean {
+        ArenaAttachmentPolicy.validate(attachments)?.let { sessionMessage = it; return false }
         sessionEpoch += 1
         handler.removeCallbacksAndMessages(null)
         val requestId = "summary_${++requestSequence}_${judge.name.lowercase()}_${System.currentTimeMillis()}"
@@ -261,12 +284,24 @@ class ArenaSessionController(
             requestId = requestId,
             detail = "正在请 ${judge.displayName} 做${depth.displayName}总结",
             depth = depth,
+            prompt = prompt,
+            attachments = attachments.toList(),
         )
         sessionMessage = "正在请 ${judge.displayName} 做${depth.displayName}总结" +
-            if (budgetedPrompt.compressed) " · 已压缩引用回答" else ""
+            if (compressed) " · 已压缩引用回答" else ""
         schedulePersist()
-        pool.sendPrompt(judge, prompt, requestId) { outcome ->
-            if (!isSummaryActive(execution)) return@sendPrompt
+        val sendTimeout = Runnable {
+            if (isSummaryActive(execution) && summary.phase == ParticipantPhase.SENDING) {
+                pool.cancelAutomation()
+                summary = summary.copy(phase = ParticipantPhase.ERROR, detail = "总结发送超时，已停止；可打开原网页确认")
+                summaryExecution = null
+                schedulePersist()
+            }
+        }
+        handler.postDelayed(sendTimeout, if (attachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
+        pool.sendPromptWithAttachments(judge, prompt, requestId, attachments) { outcome ->
+            if (!isSummaryActive(execution)) return@sendPromptWithAttachments
+            handler.removeCallbacks(sendTimeout)
             if (outcome.success) {
                 summary = summary.copy(phase = ParticipantPhase.WAITING, detail = "等待总结回答")
                 schedulePersist()
@@ -279,6 +314,29 @@ class ArenaSessionController(
             }
         }
         return true
+    }
+
+    /** 用户明确触发后逐家处理失败项；已完成成员绝不重发，取消后队列立即作废。 */
+    fun retryFailed(resend: Boolean): Boolean {
+        if (isBusy || stage != SessionStage.READY) return false
+        recoveryQueue.clear()
+        sessionServices.filter { runs[it]?.phase == ParticipantPhase.ERROR }.forEach { service ->
+            if (if (resend) !lastRoundPrompts[service].isNullOrBlank() else !runs[service]?.requestId.isNullOrBlank()) {
+                recoveryQueue.addLast(service to resend)
+            }
+        }
+        if (recoveryQueue.isEmpty()) {
+            sessionMessage = if (resend) "旧记录缺少原轮发送内容，请保留历史开新会话"
+            else "没有可定位的原回答，请打开 AI 网页查看，或保留历史开新会话"
+            return false
+        }
+        return startNextFailedRecovery()
+    }
+
+    private fun startNextFailedRecovery(): Boolean {
+        if (isBusy || recoveryQueue.isEmpty()) return false
+        val (service, resend) = recoveryQueue.removeFirst()
+        return startRecovery(service, if (resend) lastRoundPrompts[service] else null, resend)
     }
 
     fun retrySend(service: ArenaService): Boolean {
@@ -313,6 +371,7 @@ class ArenaSessionController(
     }
 
     fun cancelCurrentRound() {
+        recoveryQueue.clear()
         val activeSummary = summaryExecution
         if (activeSummary != null && isSummaryActive(activeSummary)) {
             handler.removeCallbacksAndMessages(null)
@@ -361,9 +420,13 @@ class ArenaSessionController(
         sessionEpoch += 1
     }
 
-    fun reset() {
+    fun reset(): Boolean {
+        recoveryQueue.clear()
         // 必须同步写完：后面紧接着要把活动会话清空，异步落盘会把它又设回去。
-        persistNow(synchronous = true)
+        if (!persistNow(synchronous = true)) {
+            sessionMessage = "未能保存当前讨论，请稍后再试；当前内容仍保留"
+            return false
+        }
         persistGeneration += 1
         persistenceHandler.removeCallbacksAndMessages(null)
         pool.setProtectedServices(emptySet())
@@ -385,6 +448,7 @@ class ArenaSessionController(
         sessionMessage = "等待开始"
         history.clear()
         summary = DiscussionSummary()
+        lastRoundAttachments = emptyList()
         lastRoundPrompts = emptyMap()
         conversationUrls.clear()
         currentRoundContextNotice = ""
@@ -392,9 +456,12 @@ class ArenaSessionController(
         storageWarning = null
         ArenaService.entries.forEach { service -> runs[service] = ParticipantRun() }
         refreshRecentSessions()
+        return true
     }
 
     fun destroy() {
+        recoveryQueue.clear()
+        pool.cancelAutomation()
         pool.setProtectedServices(emptySet())
         // 进程随时可能被回收，最后这一次必须同步写完，不能交给后台线程。
         persistShutdown = true
@@ -428,7 +495,7 @@ class ArenaSessionController(
             refreshRecentSessions()
             return RestoreOutcome.UNREADABLE
         }
-        persistNow(synchronous = true)
+        if (!persistNow(synchronous = true)) return RestoreOutcome.SAVE_FAILED
         persistGeneration += 1
         applySnapshot(snapshot, recovered = false)
         repository.setActiveSession(snapshot.id)
@@ -443,8 +510,10 @@ class ArenaSessionController(
         prompts: Map<ArenaService, String>,
         answerMode: AnswerMode,
         guidance: String,
+        attachments: List<ArenaAttachment> = emptyList(),
     ): Boolean {
         if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
+        ArenaAttachmentPolicy.validate(attachments)?.let { sessionMessage = it; return false }
 
         sessionEpoch += 1
         handler.removeCallbacksAndMessages(null)
@@ -476,6 +545,7 @@ class ArenaSessionController(
             services = services,
             dispatchOrder = dispatchOrder,
             prompts = prompts,
+            attachments = attachments.toList(),
             guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
             startedAtMillis = System.currentTimeMillis(),
             requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
@@ -493,6 +563,7 @@ class ArenaSessionController(
                 ParticipantRun(ParticipantPhase.IDLE, detail = "本轮未参与")
             }
         }
+        lastRoundAttachments = attachments.toList()
         lastRoundPrompts = prompts.mapValues { (_, prompt) -> prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS) }
         activeExecution = execution
         pool.setProtectedServices(services.toSet())
@@ -605,8 +676,16 @@ class ArenaSessionController(
             pollRecovery(execution)
             return true
         }
-        pool.sendPrompt(service, prompt.orEmpty(), requestId) { outcome ->
-            if (!isRecoveryActive(execution)) return@sendPrompt
+        val sendTimeout = Runnable {
+            if (isRecoveryActive(execution) && runs[service]?.phase == ParticipantPhase.SENDING) {
+                pool.cancelAutomation()
+                finishRecovery(execution, runs.getValue(service).copy(phase = ParticipantPhase.ERROR, detail = "重发超时，已停止；请打开原网页确认"))
+            }
+        }
+        handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
+        pool.sendPromptWithAttachments(service, prompt.orEmpty(), requestId, lastRoundAttachments) { outcome ->
+            if (!isRecoveryActive(execution)) return@sendPromptWithAttachments
+            handler.removeCallbacks(sendTimeout)
             if (outcome.success) {
                 runs[service] = runs.getValue(service).copy(
                     phase = ParticipantPhase.WAITING,
@@ -756,6 +835,7 @@ class ArenaSessionController(
             else -> "${execution.service.displayName} 单家补救未完成，其他结果仍保留"
         }
         schedulePersist(immediate = true)
+        startNextFailedRecovery()
     }
 
     private fun updateLatestRoundResult(service: ArenaService, result: ParticipantRun) {
@@ -829,20 +909,22 @@ class ArenaSessionController(
                 requestId = requestId,
                 detail = "发送无响应，已停止等待",
             )
+            pool.cancelAutomation()
             onSendFinished(false)
             schedulePersist()
             maybeFinishRound(execution)
         }
-        handler.postDelayed(sendTimeout, SEND_HARD_TIMEOUT_MILLIS)
-        pool.sendPrompt(
+        handler.postDelayed(sendTimeout, if (execution.attachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
+        pool.sendPromptWithAttachments(
             service = service,
             prompt = execution.prompts.getValue(service),
+            attachments = execution.attachments,
             requestId = requestId,
         ) { outcome ->
-            if (sendSettled) return@sendPrompt
+            if (sendSettled) return@sendPromptWithAttachments
             sendSettled = true
             handler.removeCallbacks(sendTimeout)
-            if (!isActive(execution) || runs[service]?.requestId != requestId) return@sendPrompt
+            if (!isActive(execution) || runs[service]?.requestId != requestId) return@sendPromptWithAttachments
             if (outcome.success) {
                 runs[service] = ParticipantRun(
                     phase = ParticipantPhase.WAITING,
@@ -1047,6 +1129,7 @@ class ArenaSessionController(
             results = results,
             startedAtMillis = execution.startedAtMillis,
             finishedAtMillis = System.currentTimeMillis(),
+            attachments = execution.attachments,
         )
         while (history.size > ArenaLimits.MAX_HISTORY_ROUNDS) history.removeAt(0)
         val completed = results.values.count { it.phase == ParticipantPhase.COMPLETE }
@@ -1181,17 +1264,17 @@ class ArenaSessionController(
             history = history.toList(),
             summary = summary,
             lastRoundPrompts = lastRoundPrompts,
+            lastRoundAttachments = lastRoundAttachments,
             conversationUrls = conversationUrls.toMap(),
             updatedAtMillis = System.currentTimeMillis(),
         )
     }
 
-    private fun persistNow(synchronous: Boolean = false) {
-        val repository = sessionRepository ?: return
-        val snapshot = buildSnapshot() ?: return
+    private fun persistNow(synchronous: Boolean = false): Boolean {
+        val repository = sessionRepository ?: return true
+        val snapshot = buildSnapshot() ?: return true
         if (synchronous || persistShutdown) {
-            writeSnapshot(repository, snapshot)
-            return
+            return writeSnapshot(repository, snapshot)
         }
         val generation = persistGeneration
         // 写盘和读取最近列表都在后台线程完成，只把结果回投到主线程更新 UI 状态。
@@ -1215,17 +1298,33 @@ class ArenaSessionController(
                     .onFailure { storageWarning = "本地保存失败，当前讨论仍可继续" }
             }
         }
+        return true
     }
 
-    /** 同步落盘。只在 destroy() 这类"进程可能马上没了"的时刻使用。 */
-    private fun writeSnapshot(repository: ArenaSessionRepository, snapshot: ArenaSessionSnapshot) {
-        runCatching {
-            repository.save(snapshot)
-            repository.setActiveSession(snapshot.id)
-        }.onFailure { storageWarning = "本地保存失败，当前讨论仍可继续" }
+    /** Queue barrier: an older async save must finish before a newer reset/restore/destroy snapshot. */
+    private fun writeSnapshot(repository: ArenaSessionRepository, snapshot: ArenaSessionSnapshot): Boolean {
+        return try {
+            val write = {
+                repository.save(snapshot)
+                repository.setActiveSession(snapshot.id)
+            }
+            if (Thread.currentThread() === persistThread) write()
+            else persistExecutor.submit(java.util.concurrent.Callable { write() }).get()
+            storageWarning = null
+            true
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+            storageWarning = "本地保存被中断，当前讨论仍保留，请稍后重试"
+            false
+        } catch (_: Exception) {
+            storageWarning = "本地保存失败，当前讨论仍保留，请稍后重试"
+            false
+        }
     }
 
     private fun applySnapshot(snapshot: ArenaSessionSnapshot, recovered: Boolean) {
+        recoveryQueue.clear()
+        pool.cancelAutomation()
         sessionEpoch += 1
         persistGeneration += 1
         handler.removeCallbacksAndMessages(null)
@@ -1249,6 +1348,7 @@ class ArenaSessionController(
             runs[service] = recoverRun(snapshot.runs[service] ?: ParticipantRun())
         }
         summary = recoverSummary(snapshot.summary)
+        lastRoundAttachments = snapshot.lastRoundAttachments
         lastRoundPrompts = snapshot.lastRoundPrompts
         conversationUrls.clear()
         conversationUrls.putAll(snapshot.conversationUrls)
@@ -1339,6 +1439,7 @@ class ArenaSessionController(
         val services: List<ArenaService>,
         val dispatchOrder: List<ArenaService>,
         val prompts: Map<ArenaService, String>,
+        val attachments: List<ArenaAttachment>,
         val guidance: String,
         val startedAtMillis: Long,
         /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示"已排队"。 */
@@ -1389,6 +1490,7 @@ class ArenaSessionController(
 
         /** 单家发送的端到端上限，比 WebView 池自身的看门狗更宽，只做最后兜底。 */
         const val SEND_HARD_TIMEOUT_MILLIS = 60_000L
+        const val ATTACHMENT_SEND_TIMEOUT_MILLIS = 200_000L
         /** 新问题前等各家网页开好新对话的上限；超时就直接发，发不进去会走原有的失败路径。 */
         const val FRESH_CONVERSATION_TIMEOUT_MILLIS = 25_000L
 

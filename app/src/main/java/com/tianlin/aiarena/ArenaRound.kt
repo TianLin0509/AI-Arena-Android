@@ -128,6 +128,9 @@ internal fun RoundStage(
     onRoundGuidanceChange: (String) -> Unit,
     expandedAnswers: MutableMap<String, Boolean>,
     onNewSession: () -> Unit,
+    attachmentDraft: AttachmentDraft,
+    attachmentsEnabled: Boolean,
+    onChooseAttachments: () -> Unit,
     onOpenService: (ArenaService) -> Unit,
     snackbarHostState: SnackbarHostState,
     copyText: TextCopyRequest?,
@@ -183,7 +186,7 @@ internal fun RoundStage(
     val summarizing = summary.phase == ParticipantPhase.SENDING ||
         summary.phase == ParticipantPhase.WAITING ||
         summary.phase == ParticipantPhase.STREAMING
-    val canSummarize = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy
+    val canSummarize = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy && !attachmentDraft.picking
     // 历史里已有总结时直接展开；选择与展开状态跟随当前问题保存。
     var summaryExpanded by rememberSaveable(sessionController.askedAtMillis) {
         mutableStateOf(summary.phase != ParticipantPhase.IDLE)
@@ -192,8 +195,9 @@ internal fun RoundStage(
     val startSummary: () -> Unit = {
         captainPreferences.saveCaptain(captain)
         captainPreferences.saveDepth(depth)
-        if (sessionController.startSummary(CaptainPolicy.judgePreference(members, captain), roundGuidance, depth)) {
+        if (sessionController.startSummary(CaptainPolicy.judgePreference(members, captain), roundGuidance, depth, attachmentDraft.attachments)) {
             onRoundGuidanceChange("")
+            attachmentDraft.clear()
             summaryExpanded = true
         }
     }
@@ -251,6 +255,16 @@ internal fun RoundStage(
             ),
             verticalArrangement = Arrangement.spacedBy(metrics.gap),
         ) {
+            val failedServices = members.filter { sessionController.runs[it]?.phase == ParticipantPhase.ERROR }
+            if (failedServices.isNotEmpty()) {
+                item(key = "recovery") {
+                    RoundRecoveryCard(failedServices, busy,
+                        onReextract = { sessionController.retryFailed(resend = false) },
+                        onResend = { sessionController.retryFailed(resend = true) },
+                        onOpenService = onOpenService,
+                        onNewSession = onNewSession)
+                }
+            }
             if (offline) {
                 item(key = "offline") {
                     ArenaNotice(
@@ -375,15 +389,17 @@ internal fun RoundStage(
                 NextRoundPanel(
                     guidance = roundGuidance,
                     onGuidanceChange = onRoundGuidanceChange,
-                    inputEnabled = !busy,
-                    enabled = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy,
+                    inputEnabled = !busy && !attachmentDraft.picking,
+                    enabled = sessionStage == SessionStage.READY && completedCount >= ArenaService.MIN_MEMBERS && !busy && !attachmentDraft.picking,
                     summaryExpanded = summaryExpanded,
                     onSummary = { summaryExpanded = !summaryExpanded },
+                    hasAttachments = attachmentDraft.attachments.isNotEmpty(),
+                    attachmentContent = { AttachmentComposer(attachmentDraft.attachments, attachmentDraft.picking, attachmentsEnabled && !busy, onChooseAttachments, attachmentDraft::remove, attachmentDraft.error, summaryHint = true) },
                     onIterate = {
-                        if (sessionController.startIteration(answerMode, roundGuidance)) onRoundGuidanceChange("")
+                        if (sessionController.startIteration(answerMode, roundGuidance, attachmentDraft.attachments)) { onRoundGuidanceChange(""); attachmentDraft.clear() }
                     },
                     onDebate = {
-                        if (sessionController.startDebate(answerMode, roundGuidance)) onRoundGuidanceChange("")
+                        if (sessionController.startDebate(answerMode, roundGuidance, attachmentDraft.attachments)) { onRoundGuidanceChange(""); attachmentDraft.clear() }
                     },
                 )
             }
@@ -440,7 +456,11 @@ internal fun RoundStage(
                                 }
                             },
                             retryEnabled = canSummarize,
-                            onRetry = startSummary,
+                            onRetry = {
+                                // 旧版历史未保存总结 prompt，沿用旧版“重新总结”的路径。
+                                if (summary.prompt.isBlank() && summary.attachments.isEmpty()) startSummary()
+                                else sessionController.retrySummary()
+                            },
                             onOpenJudge = summary.judge?.let { judge -> { onOpenService(judge) } },
                         )
                     }
@@ -753,6 +773,47 @@ private fun CaptainChip(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+internal fun RoundRecoveryCard(
+    failed: List<ArenaService>, busy: Boolean,
+    onReextract: () -> Unit, onResend: () -> Unit,
+    onOpenService: (ArenaService) -> Unit, onNewSession: () -> Unit,
+) {
+    val colors = ArenaStyle.colors
+    var confirmResend by remember { mutableStateOf(false) }
+    ArenaCard(Modifier.fillMaxWidth().testTag("round-recovery")) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("本轮需要恢复", color = colors.error, style = MaterialTheme.typography.titleMedium)
+            Text("${failed.size} 家尚未完成。先尝试重新提取已有回答，不会重复发送问题。", color = colors.ink, style = MaterialTheme.typography.bodySmall)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                ArenaSecondaryButton("重新提取", onReextract, enabled = !busy,
+                    modifier = Modifier.testTag("recover-extract"))
+                ArenaTextAction("重发失败项", { confirmResend = true }, enabled = !busy,
+                    modifier = Modifier.testTag("recover-resend"))
+                ArenaTextAction("保留历史，开新会话", onNewSession, enabled = !busy,
+                    modifier = Modifier.testTag("recover-new-session"))
+            }
+            Text("需要登录或验证时，打开对应网页处理：", color = colors.muted, style = MaterialTheme.typography.labelSmall)
+            FlowRow {
+                failed.forEach { service ->
+                    ArenaTextAction(service.shortName, { onOpenService(service) },
+                        contentDescriptionText = "恢复：打开 ${service.shortName} 网页")
+                }
+            }
+        }
+    }
+    if (confirmResend) {
+        ConfirmDialog(
+            title = "重发失败项？",
+            text = "会将原轮问题和附件再次发给尚未完成的 AI，可能产生重复提问；已完成的 AI 不会重发。",
+            confirmLabel = "确认重发",
+            onConfirm = { confirmResend = false; onResend() },
+            onDismiss = { confirmResend = false },
+        )
+    }
+}
+
 @Composable
 internal fun NextRoundPanel(
     guidance: String,
@@ -763,6 +824,8 @@ internal fun NextRoundPanel(
     onSummary: () -> Unit,
     onIterate: () -> Unit,
     onDebate: () -> Unit,
+    hasAttachments: Boolean = false,
+    attachmentContent: (@Composable () -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
     val metrics = ArenaStyle.metrics
@@ -808,11 +871,12 @@ internal fun NextRoundPanel(
                 maxLines = 2,
             )
         }
+        attachmentContent?.invoke()
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             RoundAction("队长总结", onSummary, true, Modifier.weight(1f).testTag("summary-toggle")
                 .semantics { stateDescription = if (summaryExpanded) "已展开" else "已折叠" }, primary = true)
             RoundAction("观点讨论", onDebate, enabled, Modifier.weight(1f).testTag("round-debate"))
-            RoundAction("独立迭代", onIterate, enabled && guidance.isNotBlank(), Modifier.weight(1f).testTag("round-iterate"))
+            RoundAction("独立迭代", onIterate, enabled && (guidance.isNotBlank() || hasAttachments), Modifier.weight(1f).testTag("round-iterate"))
         }
     }
 }

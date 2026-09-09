@@ -31,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -83,8 +84,7 @@ internal val QuestionExamples = listOf(
 fun ArenaApp(
     pool: ArenaWebViewPool,
     debugInitialQuestion: String = "",
-    voiceInputState: VoiceInputState? = null,
-    voiceInputRequest: VoiceInputRequest? = null,
+    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)? = null,
     copyText: TextCopyRequest? = null,
     shareText: TextShareRequest? = null,
     /** 用系统浏览器打开外链（下载新版 APK）。返回 false 表示没有可用浏览器。 */
@@ -103,6 +103,11 @@ fun ArenaApp(
     val sessionController = remember(pool, sessionRepository) {
         ArenaSessionController(pool = pool, sessionRepository = sessionRepository)
     }
+    // Keep the draft while switching to login/original web pages; those pages remove DiscussionHome from composition.
+    val attachmentDraft = rememberSaveable(saver = AttachmentDraft.Saver) { AttachmentDraft() }
+    DisposableEffect(attachmentDraft) { onDispose { attachmentDraft.invalidate() } }
+    val questionDraft = rememberSaveable { mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion }) }
+    val guidanceDraft = rememberSaveable { mutableStateOf("") }
     val network = remember(context) { ArenaNetworkMonitor(context) }
     DisposableEffect(network) {
         network.start()
@@ -342,7 +347,6 @@ fun ArenaApp(
                     else -> RoundtableRoot(
                         pool = pool,
                         sessionController = sessionController,
-                        debugInitialQuestion = debugInitialQuestion,
                         selectedServices = selectedMembers,
                         onSelectedServicesChange = { services ->
                             selectedMemberNames = services.joinToString(",") { it.name }
@@ -360,8 +364,10 @@ fun ArenaApp(
                         membersReturnPage = RoundtablePage.fromName(membersReturnPageName),
                         onMembersReturnPageChange = { membersReturnPageName = it.name },
                         snackbarHostState = snackbarHostState,
-                        voiceInputState = voiceInputState,
-                        voiceInputRequest = voiceInputRequest,
+                        chooseAttachments = chooseAttachments,
+                        attachmentDraft = attachmentDraft,
+                        questionDraft = questionDraft,
+                        guidanceDraft = guidanceDraft,
                         largeTextEnabled = largeTextEnabled,
                         onLargeTextChange = { largeTextEnabled = it },
                         copyText = copyText,
@@ -404,7 +410,6 @@ fun ArenaApp(
 private fun RoundtableRoot(
     pool: ArenaWebViewPool,
     sessionController: ArenaSessionController,
-    debugInitialQuestion: String,
     selectedServices: List<ArenaService>,
     onSelectedServicesChange: (List<ArenaService>) -> Unit,
     showConnectionGuide: Boolean,
@@ -417,8 +422,10 @@ private fun RoundtableRoot(
     membersReturnPage: RoundtablePage,
     onMembersReturnPageChange: (RoundtablePage) -> Unit,
     snackbarHostState: SnackbarHostState,
-    voiceInputState: VoiceInputState?,
-    voiceInputRequest: VoiceInputRequest?,
+    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)?,
+    attachmentDraft: AttachmentDraft,
+    questionDraft: MutableState<String>,
+    guidanceDraft: MutableState<String>,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
     copyText: TextCopyRequest?,
@@ -448,7 +455,6 @@ private fun RoundtableRoot(
         DiscussionHome(
             pool = pool,
             sessionController = sessionController,
-            debugInitialQuestion = debugInitialQuestion,
             selectedServices = selectedServices,
             onSelectedServicesChange = onSelectedServicesChange,
             usableCount = usableCount,
@@ -459,8 +465,10 @@ private fun RoundtableRoot(
             membersReturnPage = membersReturnPage,
             onMembersReturnPageChange = onMembersReturnPageChange,
             snackbarHostState = snackbarHostState,
-            voiceInputState = voiceInputState,
-            voiceInputRequest = voiceInputRequest,
+            chooseAttachments = chooseAttachments,
+            attachmentDraft = attachmentDraft,
+            questionDraft = questionDraft,
+            guidanceDraft = guidanceDraft,
             largeTextEnabled = largeTextEnabled,
             onLargeTextChange = onLargeTextChange,
             copyText = copyText,
@@ -505,7 +513,6 @@ private fun RoundtableRoot(
 private fun DiscussionHome(
     pool: ArenaWebViewPool,
     sessionController: ArenaSessionController,
-    debugInitialQuestion: String,
     selectedServices: List<ArenaService>,
     onSelectedServicesChange: (List<ArenaService>) -> Unit,
     usableCount: Int,
@@ -516,8 +523,10 @@ private fun DiscussionHome(
     membersReturnPage: RoundtablePage,
     onMembersReturnPageChange: (RoundtablePage) -> Unit,
     snackbarHostState: SnackbarHostState,
-    voiceInputState: VoiceInputState?,
-    voiceInputRequest: VoiceInputRequest?,
+    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)?,
+    attachmentDraft: AttachmentDraft,
+    questionDraft: MutableState<String>,
+    guidanceDraft: MutableState<String>,
     largeTextEnabled: Boolean,
     onLargeTextChange: (Boolean) -> Unit,
     copyText: TextCopyRequest?,
@@ -541,13 +550,11 @@ private fun DiscussionHome(
 ) {
     val context = LocalContext.current
     val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
-    var question by rememberSaveable {
-        mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion })
-    }
+    var question by questionDraft
     var answerModeName by rememberSaveable { mutableStateOf(guidePreferences.loadAnswerMode().name) }
     // 队长与总结深度的记忆：结果页「队长总结」用它记住上次的选择。
     val captainPreferences = remember(context) { ArenaCaptainPreferences(context) }
-    var roundGuidance by rememberSaveable { mutableStateOf("") }
+    var roundGuidance by guidanceDraft
     val expandedAnswers = remember { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
     val answerMode = AnswerMode.fromName(answerModeName)
@@ -568,21 +575,11 @@ private fun DiscussionHome(
     val sessionStage = sessionController.stage
     val completedCount = sessionController.completedCount
     val questionWithinLimit = question.length <= ArenaLimits.MAX_QUESTION_CHARS
-    val voiceEvent = voiceInputState?.event
-
-    LaunchedEffect(voiceEvent?.id) {
-        val event = voiceEvent ?: return@LaunchedEffect
-        val outcome = voiceInputState.take(event.id) ?: return@LaunchedEffect
-        when (outcome) {
-            is VoiceInputOutcome.Success -> {
-                val merged = VoiceInputPolicy.merge(question, outcome.transcript)
-                question = merged.text
-                snackbarHostState.showSnackbar(
-                    if (merged.truncated) "语音内容过长，已保留可容纳的部分" else "已添加语音内容",
-                )
-            }
-            VoiceInputOutcome.Cancelled -> snackbarHostState.showSnackbar("已取消语音输入")
-            is VoiceInputOutcome.Error -> snackbarHostState.showSnackbar(outcome.message)
+    val pickAttachments: () -> Unit = {
+        chooseAttachments?.let { choose ->
+            val retainedIds = (attachmentDraft.attachments + sessionController.lastRoundAttachments +
+                sessionController.summary.attachments + sessionController.history.flatMap { it.attachments }).map { it.id }.toSet()
+            attachmentDraft.choose { callback -> choose(retainedIds, callback) }
         }
     }
 
@@ -614,16 +611,24 @@ private fun DiscussionHome(
     }
 
     /** 回到干净的提问页：顶部「新会话」、设置恢复与崩溃恢复共用；reset 先保存旧讨论。 */
-    val startFresh: () -> Unit = {
-        sessionController.reset()
-        question = ""
-        roundGuidance = ""
-        expandedAnswers.clear()
+    val startFresh: () -> Boolean = {
+        val resetSucceeded = sessionController.reset()
+        if (resetSucceeded) {
+            attachmentDraft.clear()
+            question = ""
+            roundGuidance = ""
+            expandedAnswers.clear()
+        } else {
+            scope.launch { snackbarHostState.showSnackbar(sessionController.storageWarning ?: "当前讨论未能保存，暂未开始新会话") }
+        }
+        resetSucceeded
     }
 
     val restoreRecentSession: (String) -> Unit = { sessionId ->
+        attachmentDraft.invalidate()
         val outcome = sessionController.restoreSession(sessionId)
         if (outcome == RestoreOutcome.OK || outcome == RestoreOutcome.OK_AFTER_STOP) {
+            attachmentDraft.clear()
             question = sessionController.originalQuestion
             roundGuidance = ""
             expandedAnswers.clear()
@@ -635,6 +640,7 @@ private fun DiscussionHome(
             RestoreOutcome.OK_AFTER_STOP -> "已停止进行中的一轮，并打开这条讨论"
             RestoreOutcome.UNREADABLE -> "这条记录的文件已损坏，已从列表移除"
             RestoreOutcome.NO_STORAGE -> "本地存储不可用，无法打开历史"
+            RestoreOutcome.SAVE_FAILED -> "当前讨论未能保存，已保留当前内容，暂未切换历史"
         }
         scope.launch { snackbarHostState.showSnackbar(message) }
     }
@@ -696,9 +702,10 @@ private fun DiscussionHome(
                     }
                 },
                 onResetSession = {
-                    startFresh()
-                    onPageChange(RoundtablePage.HOME)
-                    scope.launch { snackbarHostState.showSnackbar("已清除，回到了提问页") }
+                    if (startFresh()) {
+                        onPageChange(RoundtablePage.HOME)
+                        scope.launch { snackbarHostState.showSnackbar("已清除，回到了提问页") }
+                    }
                 },
                 onRestartApp = onRestartApp,
                 onShowOnboarding = onShowOnboarding,
@@ -734,21 +741,20 @@ private fun DiscussionHome(
                         onPageChange(RoundtablePage.MEMBERS)
                     },
                     onConnections = onManageConnections,
-                    voiceInputActive = voiceInputState?.active == true,
-                    voiceInputEnabled = voiceInputRequest != null,
-                    onVoiceInput = { voiceInputRequest?.invoke() },
+                    attachmentDraft = attachmentDraft,
+                    attachmentsEnabled = chooseAttachments != null,
+                    onChooseAttachments = pickAttachments,
                     offline = offline,
                     crashNotice = unacknowledgedCrash,
                     onCrashRestart = {
-                        startFresh()
-                        onAcknowledgeCrash()
+                        if (startFresh()) onAcknowledgeCrash()
                     },
                     onCrashDismiss = onAcknowledgeCrash,
                     availableUpdate = bannerUpdate,
                     onInstallUpdate = onInstallUpdate,
                     onDismissUpdate = onDismissUpdate,
                     onNeedQuestion = {
-                        scope.launch { snackbarHostState.showSnackbar("先在上面写下你的问题，或者点「语音输入」说出来") }
+                        scope.launch { snackbarHostState.showSnackbar("先写下问题，或者添加照片 / 文件") }
                     },
                     onTooLong = {
                         scope.launch {
@@ -757,10 +763,11 @@ private fun DiscussionHome(
                     },
                     onStart = {
                         expandedAnswers.clear()
-                        if (sessionController.startInitial(question, usableServices, answerMode)) {
+                        if (sessionController.startInitial(question, usableServices, answerMode, attachmentDraft.attachments)) {
+                            attachmentDraft.clear()
                             scope.launch {
                                 snackbarHostState.showSnackbar(
-                                    "已发给 ${usableServices.size} 位 AI，正在等回答",
+                                    "开始向 ${usableServices.size} 位 AI 发送，请留意各家状态",
                                 )
                             }
                         }
@@ -778,7 +785,10 @@ private fun DiscussionHome(
                     roundGuidance = roundGuidance,
                     onRoundGuidanceChange = { roundGuidance = it },
                     expandedAnswers = expandedAnswers,
-                    onNewSession = startFresh,
+                    onNewSession = { startFresh() },
+                    attachmentDraft = attachmentDraft,
+                    attachmentsEnabled = chooseAttachments != null,
+                    onChooseAttachments = pickAttachments,
                     onOpenService = onOpenService,
                     snackbarHostState = snackbarHostState,
                     copyText = copyText,

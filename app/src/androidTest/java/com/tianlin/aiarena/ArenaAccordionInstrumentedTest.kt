@@ -33,6 +33,70 @@ class ArenaAccordionInstrumentedTest {
     private var shares = 0
     private var retries = 0
 
+    @Test fun recoveryIsVisibleWithoutExpandingAnswersAndResendRequiresConfirmation() {
+        var extracts = 0
+        var resends = 0
+        var fresh = 0
+        compose.setContent {
+            ArenaTheme {
+                Column(Modifier.width(300.dp).verticalScroll(rememberScrollState())) {
+                    RoundRecoveryCard(ArenaService.defaultMembers, false, { extracts++ }, { resends++ }, { opened += it }, { fresh++ })
+                }
+            }
+        }
+        compose.onNodeWithTag("round-recovery").assertIsDisplayed()
+        compose.onNodeWithTag("recover-extract").performClick()
+        compose.runOnIdle { assertEquals(1, extracts); assertEquals(0, resends) }
+        compose.onNodeWithTag("recover-resend").performScrollTo().performClick()
+        compose.onNodeWithText("取消").performClick()
+        compose.runOnIdle { assertEquals(0, resends) }
+        compose.onNodeWithTag("recover-resend").performClick()
+        compose.onNodeWithText("确认重发").performClick()
+        compose.onNodeWithContentDescription("恢复：打开 Kimi 网页").performScrollTo().performClick()
+        compose.onNodeWithTag("recover-new-session").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, resends); assertEquals(1, fresh); assertEquals(listOf(ArenaService.KIMI), opened) }
+    }
+
+    @Test fun attachmentCanBeRemovedAndAllowsAnAttachmentOnlyIteration() {
+        val attachment = ArenaAttachment("fixture", "测试照片.png", "image/png", 32, "a".repeat(64))
+        var iterations = 0
+        compose.setContent {
+            ArenaTheme {
+                val draft = remember { AttachmentDraft(listOf(attachment)) }
+                Column(Modifier.width(300.dp)) {
+                    NextRoundPanel("", {}, true, true, false, {}, { iterations++ }, {},
+                        hasAttachments = draft.attachments.isNotEmpty(),
+                        attachmentContent = { AttachmentComposer(draft.attachments, false, true, {}, draft::remove, summaryHint = true) })
+                }
+            }
+        }
+        compose.onNodeWithText("测试照片.png").assertIsDisplayed()
+        compose.onNodeWithTag("round-iterate").assertIsEnabled().performClick()
+        compose.onNodeWithContentDescription("移除附件 测试照片.png").performClick()
+        compose.onNodeWithText("测试照片.png").assertDoesNotExist()
+        compose.onNodeWithTag("round-iterate").assertIsNotEnabled()
+        compose.runOnIdle { assertEquals(1, iterations) }
+    }
+
+    @Test fun selectingFileThenStartingNewSessionIgnoresLatePickerDelivery() {
+        lateinit var reply: (Result<List<ArenaAttachment>>) -> Unit
+        compose.setContent {
+            ArenaTheme {
+                val draft = remember { AttachmentDraft() }
+                Column {
+                    RoundHeader("观点讨论", "完成", false, draft::clear)
+                    AttachmentComposer(draft.attachments, draft.picking, true,
+                        { draft.choose { reply = it } }, draft::remove)
+                }
+            }
+        }
+        compose.onNodeWithTag("choose-attachments").performClick()
+        compose.onNodeWithTag("new-session").performClick()
+        compose.runOnIdle { reply(Result.success(listOf(ArenaAttachment("late", "旧问题照片.png", "image/png", 32, "a".repeat(64))))) }
+        compose.onNodeWithText("旧问题照片.png").assertDoesNotExist()
+        compose.onNodeWithTag("choose-attachments").assertIsEnabled()
+    }
+
     @Test fun idleNewSessionOpensImmediatelyWithoutConfirmation() {
         var newSessions = 0
         compose.setContent {

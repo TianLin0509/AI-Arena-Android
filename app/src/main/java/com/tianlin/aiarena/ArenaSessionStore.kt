@@ -22,6 +22,7 @@ data class ArenaSessionSnapshot(
     val history: List<RoundRecord>,
     val summary: DiscussionSummary,
     val lastRoundPrompts: Map<ArenaService, String> = emptyMap(),
+    val lastRoundAttachments: List<ArenaAttachment> = emptyList(),
     /**
      * 各家网页里这条讨论对应的对话地址。打开历史会话时把每家网页切回去，
      * 后续「观点讨论」才是接着当时那条对话说，而不是发进不知哪一条里。
@@ -49,7 +50,7 @@ interface ArenaSessionRepository {
     fun setActiveSession(id: String?)
     fun listRecent(limit: Int = 8): List<RecentArenaSession>
 
-    /** 从索引里剔除一条并删掉它的文件。用于清理点开必然失败的死条目。 */
+    /** 从索引移除不可读条目，保留原文件供恢复，不能让附件引用随记录损坏丢失。 */
     fun forget(id: String)
 }
 
@@ -104,7 +105,6 @@ class ArenaSessionStore internal constructor(
     override fun forget(id: String) {
         if (!isValidId(id)) return
         writeIndex(readIndex().filterNot { it.id == id })
-        sessionFile(id).delete()
         if (preferences.getString(KEY_ACTIVE_SESSION, null) == id) setActiveSession(null)
     }
 
@@ -229,6 +229,7 @@ internal object ArenaSessionJson {
         .put("runs", encodeRuns(snapshot.runs))
         .put("history", JSONArray().also { array -> snapshot.history.forEach { array.put(encodeRound(it)) } })
         .put("summary", encodeSummary(snapshot.summary))
+        .put("lastRoundAttachments", encodeAttachments(snapshot.lastRoundAttachments))
         .put("lastRoundPrompts", JSONObject().also { prompts ->
             snapshot.lastRoundPrompts.forEach { (service, prompt) -> prompts.put(service.name, prompt) }
         })
@@ -267,6 +268,7 @@ internal object ArenaSessionJson {
             runs = runs,
             history = history,
             summary = json.optJSONObject("summary")?.let(::decodeSummary) ?: DiscussionSummary(),
+            lastRoundAttachments = decodeAttachments(json, "lastRoundAttachments"),
             lastRoundPrompts = json.optJSONObject("lastRoundPrompts")?.let { prompts ->
                 ArenaService.entries.mapNotNull { service ->
                     prompts.optString(service.name).takeIf { it.isNotBlank() }?.let { prompt ->
@@ -287,6 +289,26 @@ internal object ArenaSessionJson {
     }
 
     private const val MAX_CONVERSATION_URL_CHARS = 2_000
+
+    private fun encodeAttachments(items: List<ArenaAttachment>): JSONArray = JSONArray().also { array ->
+        items.forEach { attachment ->
+            array.put(JSONObject().put("id", attachment.id).put("name", attachment.name)
+                .put("mimeType", attachment.mimeType).put("sizeBytes", attachment.sizeBytes).put("sha256", attachment.sha256))
+        }
+    }
+
+    private fun decodeAttachments(owner: JSONObject, key: String = "attachments"): List<ArenaAttachment> {
+        if (!owner.has(key)) return emptyList()
+        val array = owner.get(key)
+        require(array is JSONArray) { "附件容器格式无效" }
+        // Never drop invalid entries and accidentally turn an attachment round into text-only.
+        require(array.length() <= 3) { "附件记录超过支持数量" }
+        return (0 until array.length()).map { index ->
+            val item = array.getJSONObject(index)
+            ArenaAttachment(item.getString("id"), item.getString("name"), item.getString("mimeType"),
+                item.getLong("sizeBytes"), item.getString("sha256"))
+        }.also { require(ArenaAttachmentPolicy.validate(it) == null) { "附件记录无效" } }
+    }
 
     private fun encodeRuns(runs: Map<ArenaService, ParticipantRun>): JSONObject = JSONObject().also { json ->
         ArenaService.entries.forEach { service -> json.put(service.name, encodeRun(runs[service] ?: ParticipantRun())) }
@@ -322,6 +344,7 @@ internal object ArenaSessionJson {
         .put("startedAtMillis", round.startedAtMillis)
         .put("finishedAtMillis", round.finishedAtMillis)
         .put("captain", round.captain?.name ?: JSONObject.NULL)
+        .put("attachments", encodeAttachments(round.attachments))
 
     private fun decodeRound(json: JSONObject): RoundRecord = RoundRecord(
         number = json.optInt("number"),
@@ -334,6 +357,7 @@ internal object ArenaSessionJson {
         startedAtMillis = json.optLong("startedAtMillis"),
         finishedAtMillis = json.optLong("finishedAtMillis"),
         captain = json.optString("captain").enumOrNull<ArenaService>(),
+        attachments = decodeAttachments(json),
     )
 
     private fun encodeSummary(summary: DiscussionSummary): JSONObject = JSONObject()
@@ -343,6 +367,8 @@ internal object ArenaSessionJson {
         .put("text", summary.text)
         .put("detail", summary.detail)
         .put("depth", summary.depth.name)
+        .put("prompt", summary.prompt)
+        .put("attachments", encodeAttachments(summary.attachments))
 
     private fun decodeSummary(json: JSONObject): DiscussionSummary = DiscussionSummary(
         phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
@@ -351,6 +377,8 @@ internal object ArenaSessionJson {
         text = json.optString("text").take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS),
         detail = json.optString("detail").take(200),
         depth = SummaryDepth.fromName(json.optString("depth")),
+        prompt = json.optString("prompt").take(ArenaLimits.MAX_STORED_PROMPT_CHARS),
+        attachments = decodeAttachments(json),
     )
 
     private inline fun <reified T : Enum<T>> String.enumOrNull(): T? =

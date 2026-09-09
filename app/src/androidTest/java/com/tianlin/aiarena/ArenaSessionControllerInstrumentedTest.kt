@@ -6,7 +6,11 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.io.File
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -61,6 +65,256 @@ class ArenaSessionControllerInstrumentedTest {
             assertEquals(null, repository.loadActive())
             assertTrue(controller.runs.values.all { it.phase == ParticipantPhase.IDLE })
             assertEquals("中止后仍保留的问题", controller.recentSessions.single().title)
+            controller.destroy()
+        }
+    }
+
+    private val attachmentFixture = ArenaAttachment("00000000-0000-0000-0000-000000000001", "report.pdf", "application/pdf", 64, "a".repeat(64))
+
+    @Test fun invalidAttachmentContainersNeverDecodeAsTextOnlyHistory() {
+        val source = recoverySnapshot("不能丢附件").copy(lastRoundAttachments = listOf(attachmentFixture))
+        listOf("lastRoundAttachments", "round", "summary").forEach { location ->
+            listOf<Any>("broken", JSONObject(), JSONObject.NULL).forEach { invalid ->
+                val encoded = ArenaSessionJson.encode(source)
+                when (location) {
+                    "lastRoundAttachments" -> encoded.put(location, invalid)
+                    "round" -> encoded.getJSONArray("history").getJSONObject(0).put("attachments", invalid)
+                    else -> encoded.getJSONObject("summary").put("attachments", invalid)
+                }
+                assertTrue("Invalid $location must fail closed", runCatching { ArenaSessionJson.decode(encoded) }.isFailure)
+            }
+        }
+        val legacy = ArenaSessionJson.encode(source)
+        legacy.remove("lastRoundAttachments")
+        legacy.getJSONArray("history").getJSONObject(0).remove("attachments")
+        legacy.getJSONObject("summary").remove("attachments")
+        assertTrue(ArenaSessionJson.decode(legacy).lastRoundAttachments.isEmpty())
+    }
+
+    @Test fun unreadableAttachmentHistoryIsRemovedFromIndexButItsOriginalFileIsKept() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val directoryName = "attachment_corruption_${System.nanoTime()}"
+        val store = ArenaSessionStore(context, directoryName, directoryName)
+        val source = recoverySnapshot("损坏容器保留文件").copy(lastRoundAttachments = listOf(attachmentFixture))
+        store.save(source)
+        val original = File(context.filesDir, "$directoryName/${source.id}.json")
+        val damaged = ArenaSessionJson.encode(source).put("lastRoundAttachments", "bad-container").toString()
+        original.writeText(damaged, Charsets.UTF_8)
+        assertEquals(null, store.load(source.id))
+        store.forget(source.id)
+        assertTrue(store.listRecent().isEmpty())
+        assertTrue(original.isFile)
+        assertEquals(damaged, original.readText(Charsets.UTF_8))
+    }
+
+    @Test fun synchronousResetWaitsBehindOldAsyncSaveAndKeepsNewestAttachmentReferences() {
+        val firstSaveEntered = CountDownLatch(1)
+        val releaseOldSave = CountDownLatch(1)
+        val oldSaveFinished = CountDownLatch(1)
+        val first = AtomicBoolean(true)
+        val writtenRounds = CopyOnWriteArrayList<Int>()
+        val repository = object : FakeSessionRepository() {
+            override fun save(snapshot: ArenaSessionSnapshot) {
+                val block = first.getAndSet(false)
+                if (block) {
+                    firstSaveEntered.countDown()
+                    check(releaseOldSave.await(4, TimeUnit.SECONDS)) { "Old save was never released" }
+                }
+                super.save(snapshot)
+                writtenRounds += snapshot.roundNumber
+                if (block) oldSaveFinished.countDown()
+            }
+        }
+        val controller = onMain { ArenaSessionController(FakeGateway(), fastTiming, repository) }
+        onMain { controller.startInitial("保存顺序测试", ArenaService.defaultMembers) }
+        awaitHistorySize(controller, 1)
+        assertTrue(firstSaveEntered.await(2, TimeUnit.SECONDS))
+        var release: Thread? = null
+        try {
+            onMain {
+                assertTrue(controller.startIteration(guidance = "新一轮及新附件", attachments = listOf(attachmentFixture)))
+                release = Thread { Thread.sleep(150); releaseOldSave.countDown() }.apply { start() }
+                assertTrue(controller.reset())
+            }
+            assertTrue(oldSaveFinished.await(2, TimeUnit.SECONDS))
+            onMain {
+                assertEquals(listOf(1, 2), writtenRounds.toList())
+                val saved = repository.load(controller.recentSessions.single().id)!!
+                assertEquals(2, saved.roundNumber)
+                assertEquals(listOf(attachmentFixture), saved.lastRoundAttachments)
+                assertEquals(null, repository.loadActive())
+                controller.destroy()
+            }
+        } finally { releaseOldSave.countDown(); release?.join() }
+    }
+
+    @Test fun failedSynchronousSaveDoesNotResetSessionOrDiscardAttachmentReferences() {
+        val fail = AtomicBoolean(false)
+        val repository = object : FakeSessionRepository() {
+            override fun save(snapshot: ArenaSessionSnapshot) {
+                if (fail.get()) throw java.io.IOException("disk unavailable")
+                super.save(snapshot)
+            }
+        }
+        val controller = onMain { ArenaSessionController(FakeGateway(), fastTiming, repository) }
+        onMain { controller.startInitial("不能丢的问题", ArenaService.defaultMembers, attachments = listOf(attachmentFixture)) }
+        awaitHistorySize(controller, 1)
+        fail.set(true)
+        onMain {
+            assertFalse(controller.reset())
+            assertEquals("不能丢的问题", controller.originalQuestion)
+            assertEquals(SessionStage.READY, controller.stage)
+            assertEquals(listOf(attachmentFixture), controller.lastRoundAttachments)
+            assertTrue(controller.storageWarning?.contains("保存失败") == true)
+            fail.set(false)
+            assertTrue(controller.reset())
+            assertEquals(SessionStage.IDLE, controller.stage)
+            controller.destroy()
+        }
+    }
+
+    @Test fun attachmentsReachEveryMemberAndPersistThroughHistoryAndColdStart() {
+        val repository = FakeSessionRepository()
+        val gateway = FakeGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain { assertTrue(controller.startInitial("", ArenaService.defaultMembers, attachments = listOf(attachmentFixture))) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            assertEquals(AttachmentPromptPolicy.DEFAULT_QUESTION, controller.originalQuestion)
+            assertEquals(3, gateway.attachmentRecords.size)
+            assertTrue(gateway.attachmentRecords.all { it.third == listOf(attachmentFixture) })
+            assertEquals(listOf(attachmentFixture), controller.history.single().attachments)
+            controller.destroy()
+            val encoded = ArenaSessionJson.encode(repository.loadActive()!!)
+            repository.save(ArenaSessionJson.decode(encoded))
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals(listOf(attachmentFixture), restored.lastRoundAttachments)
+            restored.destroy()
+        }
+    }
+
+    @Test fun uploadFailureNeverDispatchesTextAndRetryUsesSavedOriginalAttachment() {
+        val repository = FakeSessionRepository()
+        val gateway = FakeGateway(attachmentFailures = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain { controller.startInitial("附件原始问题", ArenaService.defaultMembers, attachments = listOf(attachmentFixture)) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            assertFalse(gateway.sentServices.contains(ArenaService.DEEPSEEK))
+            assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+            assertEquals(2, controller.completedCount)
+            controller.destroy()
+        }
+        val retryGateway = FakeGateway()
+        val restored = onMain { ArenaSessionController(retryGateway, fastTiming, repository) }
+        onMain { assertTrue(restored.retryFailed(resend = true)) }
+        awaitProviderPhase(restored, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+        onMain {
+            assertEquals(listOf(ArenaService.DEEPSEEK), retryGateway.sentServices.toList())
+            assertEquals("附件原始问题", retryGateway.attachmentRecords.single().second)
+            assertEquals(listOf(attachmentFixture), retryGateway.attachmentRecords.single().third)
+            assertEquals(3, restored.completedCount)
+            restored.destroy()
+        }
+    }
+
+    @Test fun followupIterationAndDebateDeliverTheirOwnAttachmentsWithTheRightPrompt() {
+        val gateway = FakeGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        onMain { controller.startInitial("最初问题", ArenaService.defaultMembers) }
+        awaitHistorySize(controller, 1)
+        onMain { assertTrue(controller.startIteration(guidance = "只按这个新要求处理附件", attachments = listOf(attachmentFixture))) }
+        awaitHistorySize(controller, 2)
+        onMain {
+            assertTrue(gateway.attachmentRecords.takeLast(3).all { it.second == "只按这个新要求处理附件" && it.third == listOf(attachmentFixture) })
+            assertEquals(listOf(attachmentFixture), controller.history.last().attachments)
+            assertTrue(controller.startDebate(attachments = listOf(attachmentFixture)))
+        }
+        awaitHistorySize(controller, 3)
+        onMain {
+            assertTrue(gateway.attachmentRecords.takeLast(3).all { it.second.contains(AttachmentPromptPolicy.DEFAULT_QUESTION) && it.third == listOf(attachmentFixture) })
+            assertEquals(listOf(attachmentFixture), controller.history.last().attachments)
+            controller.destroy()
+        }
+    }
+
+    private fun twoFailedSnapshot(): ArenaSessionSnapshot {
+        val original = recoverySnapshot("DeepSeek 原轮内容")
+        return original.copy(
+            runs = original.runs + (ArenaService.DOUBAO to ParticipantRun(ParticipantPhase.ERROR, "doubao-existing-request", detail = "应用重启，已停止等待")),
+            lastRoundPrompts = original.lastRoundPrompts + (ArenaService.DOUBAO to "豆包原轮内容"),
+            lastRoundAttachments = listOf(attachmentFixture),
+        )
+    }
+
+    @Test fun failedBatchWaitsForEachRecoveryAndNeverResendsCompletedMember() {
+        val repository = FakeSessionRepository()
+        val snapshot = twoFailedSnapshot()
+        repository.save(snapshot); repository.setActiveSession(snapshot.id)
+        val gateway = FakeGateway(waitReads = mapOf(ArenaService.DEEPSEEK to 4))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain {
+            assertTrue(controller.retryFailed(resend = true))
+            assertEquals(listOf(ArenaService.DEEPSEEK), gateway.sentServices.toList())
+            assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.KIMI).phase)
+        }
+        awaitProviderPhase(controller, ArenaService.DOUBAO, ParticipantPhase.COMPLETE)
+        onMain {
+            assertEquals(listOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO), gateway.sentServices.toList())
+            assertTrue(gateway.attachmentRecords.all { it.third == listOf(attachmentFixture) })
+            assertFalse(controller.isBusy)
+            controller.destroy()
+        }
+    }
+
+    @Test fun failedBatchExtractionKeepsRequestIdsWithoutSendingOrClearingAttachments() {
+        val repository = FakeSessionRepository()
+        val snapshot = twoFailedSnapshot()
+        repository.save(snapshot); repository.setActiveSession(snapshot.id)
+        val gateway = FakeGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain { assertTrue(controller.retryFailed(resend = false)) }
+        awaitProviderPhase(controller, ArenaService.DOUBAO, ParticipantPhase.COMPLETE)
+        onMain {
+            assertTrue(gateway.sentServices.isEmpty())
+            assertEquals("failed_request", controller.runs.getValue(ArenaService.DEEPSEEK).requestId)
+            assertEquals("doubao-existing-request", controller.runs.getValue(ArenaService.DOUBAO).requestId)
+            assertEquals(listOf(attachmentFixture), controller.lastRoundAttachments)
+            controller.destroy()
+        }
+    }
+
+    @Test fun cancellingBatchPreventsQueuedRecoveryAndLateCallbacks() {
+        val repository = FakeSessionRepository()
+        val snapshot = twoFailedSnapshot().copy(lastRoundAttachments = emptyList())
+        repository.save(snapshot); repository.setActiveSession(snapshot.id)
+        val gateway = DeferredSendGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain {
+            assertTrue(controller.retryFailed(resend = true))
+            controller.cancelCurrentRound()
+            gateway.releaseAllCallbacks()
+            assertEquals(listOf(ArenaService.DEEPSEEK), gateway.sentServices)
+            assertFalse(controller.isBusy)
+            assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.KIMI).phase)
+            controller.destroy()
+        }
+    }
+
+    @Test fun summaryRetryKeepsExactPromptAndAttachmentsAndTargetsOnlyCaptain() {
+        val gateway = FakeGateway(attachmentFailures = setOf(ArenaService.KIMI))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        onMain { controller.startInitial("总结测试", ArenaService.defaultMembers) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            val before = gateway.attachmentRecords.size
+            assertTrue(controller.startSummary(listOf(ArenaService.KIMI), "结合附件回答", attachments = listOf(attachmentFixture)))
+            assertEquals(ParticipantPhase.ERROR, controller.summary.phase)
+            val originalPrompt = controller.summary.prompt
+            assertTrue(controller.retrySummary())
+            val attempts = gateway.attachmentRecords.drop(before)
+            assertEquals(2, attempts.size)
+            assertTrue(attempts.all { it.first == ArenaService.KIMI && it.second == originalPrompt && it.third == listOf(attachmentFixture) })
             controller.destroy()
         }
     }
@@ -736,11 +990,22 @@ class ArenaSessionControllerInstrumentedTest {
         private val neverRespond: Set<ArenaService> = emptySet(),
         private val responseTextLength: Int = 0,
         private val securityChallengeReads: Map<ArenaService, Int> = emptyMap(),
+        private val attachmentFailures: Set<ArenaService> = emptySet(),
     ) : ArenaGateway {
         val sentServices = CopyOnWriteArrayList<ArenaService>()
         val prompts = CopyOnWriteArrayList<String>()
         val sentRecords = CopyOnWriteArrayList<Pair<ArenaService, String>>()
         val readCounts = ConcurrentHashMap<ArenaService, Int>()
+        val attachmentRecords = CopyOnWriteArrayList<Triple<ArenaService, String, List<ArenaAttachment>>>()
+
+        override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+            attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+            attachmentRecords += Triple(service, prompt, attachments.toList())
+            if (attachments.isNotEmpty() && service in attachmentFailures) {
+                callback(SendOutcome(false, requestId, "附件上传未完成"))
+            } else sendPrompt(service, prompt, requestId, callback)
+        }
+
 
         override fun sendPrompt(
             service: ArenaService,
@@ -790,6 +1055,7 @@ class ArenaSessionControllerInstrumentedTest {
 
     private class DeferredSendGateway : ArenaGateway {
         private val callbacks = mutableListOf<Pair<String, (SendOutcome) -> Unit>>()
+        val sentServices = mutableListOf<ArenaService>()
 
         override fun sendPrompt(
             service: ArenaService,
@@ -797,6 +1063,7 @@ class ArenaSessionControllerInstrumentedTest {
             requestId: String,
             callback: (SendOutcome) -> Unit,
         ) {
+            sentServices += service
             callbacks += requestId to callback
         }
 
@@ -814,7 +1081,7 @@ class ArenaSessionControllerInstrumentedTest {
         }
     }
 
-    private class FakeSessionRepository : ArenaSessionRepository {
+    private open class FakeSessionRepository : ArenaSessionRepository {
         private val snapshots = linkedMapOf<String, ArenaSessionSnapshot>()
         private var activeId: String? = null
         private var sequence = 0

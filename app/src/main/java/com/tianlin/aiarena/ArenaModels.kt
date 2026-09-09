@@ -137,6 +137,15 @@ enum class ParticipantPhase {
     ERROR,
 }
 
+/** 私有附件副本的稳定引用；不存外部 URI 或任意文件路径。 */
+data class ArenaAttachment(
+    val id: String,
+    val name: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+    val sha256: String,
+)
+
 data class ParticipantRun(
     val phase: ParticipantPhase = ParticipantPhase.IDLE,
     val requestId: String = "",
@@ -191,6 +200,7 @@ data class RoundRecord(
     val finishedAtMillis: Long,
     /** 这一轮实际负责整合的队长；null = 当时没开队长模式。界面靠它判断能不能说"看第一条就够"。 */
     val captain: ArenaService? = null,
+    val attachments: List<ArenaAttachment> = emptyList(),
 )
 
 data class DiscussionSummary(
@@ -201,6 +211,8 @@ data class DiscussionSummary(
     val detail: String = "尚未总结",
     /** 这份总结是按哪个深度做的；老文件没有这个字段时按「标准」。 */
     val depth: SummaryDepth = SummaryDepth.STANDARD,
+    val prompt: String = "",
+    val attachments: List<ArenaAttachment> = emptyList(),
 )
 
 /**
@@ -274,6 +286,18 @@ data class ResponseSnapshot(
 }
 
 interface ArenaGateway {
+    /** 必须确认附件就绪后再发送文字；旧实现必须明确拒绝附件，不能静默漏发。 */
+    fun sendPromptWithAttachments(
+        service: ArenaService,
+        prompt: String,
+        requestId: String,
+        attachments: List<ArenaAttachment>,
+        callback: (SendOutcome) -> Unit,
+    ) {
+        if (attachments.isEmpty()) sendPrompt(service, prompt, requestId, callback)
+        else callback(SendOutcome(false, requestId, "当前网页尚不支持附件发送，请打开原网页处理"))
+    }
+
     fun sendPrompt(
         service: ArenaService,
         prompt: String,

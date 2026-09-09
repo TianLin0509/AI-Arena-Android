@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -26,6 +27,8 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONObject
 import org.json.JSONTokener
+import java.io.File
+import java.util.concurrent.Executors
 
 class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     val statuses = mutableStateMapOf<ArenaService, ServiceStatus>().apply {
@@ -51,6 +54,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      * 避免迟到的回调结束掉后来的自动化。
      */
     private var automationToken = 0L
+    private var cancellationEpoch = 0L
+    private var activeSendRequest: String? = null
+    private val fileBroker = ArenaFileChooserBroker(activity)
+    private val manualFileCallbacks = mutableMapOf<WebView, ValueCallback<Array<Uri>>>()
+    private val attachmentExecutor = Executors.newSingleThreadExecutor()
     private var automationWatchdog: Runnable? = null
     private var automationOnTimeout: (() -> Unit)? = null
     private var backgroundProbeInProgress = false
@@ -279,13 +287,46 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
     ) = sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = false)
 
+    override fun sendPromptWithAttachments(
+        service: ArenaService,
+        prompt: String,
+        requestId: String,
+        attachments: List<ArenaAttachment>,
+        callback: (SendOutcome) -> Unit,
+    ) {
+        if (attachments.isEmpty()) return sendPrompt(service, prompt, requestId, callback)
+        val error = ArenaAttachmentPolicy.validate(attachments)
+        if (error != null) return callback(SendOutcome(false, requestId, error))
+        if (service !in setOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO, ArenaService.KIMI)) {
+            return callback(SendOutcome(false, requestId, "${service.displayName} 暂不支持圆桌附件，请换用 DeepSeek、豆包或 Kimi"))
+        }
+        val epoch = cancellationEpoch
+        if (destroyed) return callback(SendOutcome(false, requestId, "网页已关闭"))
+        attachmentExecutor.execute {
+            val checked = runCatching {
+                val store = ArenaAttachmentStore(activity.applicationContext)
+                attachments.map { it to store.verify(it) }
+            }
+            handler.post {
+                if (destroyed || epoch != cancellationEpoch) return@post
+                checked.fold(
+                    onSuccess = { sendPromptInternal(service, prompt, requestId, callback, false, it, epoch) },
+                    onFailure = { callback(SendOutcome(false, requestId, it.message ?: "附件无法读取，请重新选择")) },
+                )
+            }
+        }
+    }
+
     private fun sendPromptInternal(
         service: ArenaService,
         prompt: String,
         requestId: String,
         callback: (SendOutcome) -> Unit,
         reloadedOnce: Boolean,
+        attachmentFiles: List<Pair<ArenaAttachment, File>> = emptyList(),
+        epoch: Long = cancellationEpoch,
     ) {
+        if (destroyed || epoch != cancellationEpoch) return
         if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn) {
             callback(SendOutcome(false, requestId, "${service.displayName} 尚未登录"))
             return
@@ -298,7 +339,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             val target = failedPage.url?.takeIf { it.startsWith("https://") } ?: service.url
             navigate(service, failedPage, target) { ok ->
                 if (ok) {
-                    sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = true)
+                    sendPromptInternal(service, prompt, requestId, callback, true, attachmentFiles, epoch)
                 } else {
                     callback(SendOutcome(false, requestId, "${service.displayName} 网页打不开，请确认网络正常后再试"))
                 }
@@ -308,12 +349,22 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val fullPrompt = prompt.trim()
         activateForAutomation(
             service = service,
+            epoch = epoch,
+            timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
             onTimeout = {
                 finishSend(SendOutcome(false, requestId, "${service.displayName} 网页输入框加载超时"), callback)
             },
         ) { webView ->
+            val token = automationToken
+            activeSendRequest = requestId
             webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId)) {
-                sendStandard(webView, service, fullPrompt, requestId, callback)
+                if (destroyed || token != automationToken || epoch != cancellationEpoch) return@evaluateJavascript
+                if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
+                else ArenaAttachmentTransport(handler, fileBroker).upload(webView, service, requestId, attachmentFiles, { !destroyed && token == automationToken && epoch == cancellationEpoch }) { error ->
+                    if (destroyed || token != automationToken || epoch != cancellationEpoch) return@upload
+                    if (error != null) finishSend(SendOutcome(false, requestId, error), callback)
+                    else sendStandard(webView, service, fullPrompt, requestId, callback)
+                }
             }
         }
     }
@@ -357,7 +408,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     override fun cancelAutomation() {
-        if (destroyed || automationService == null) return
+        cancellationEpoch++
+        fileBroker.cancelAll()
+        manualFileCallbacks.keys.toList().forEach(::cancelManualChooser)
+        if (destroyed) return
+        val request = activeSendRequest
+        if (request != null) webViews[automationService]?.evaluateJavascript(
+            "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(request)}]=true;" + ArenaAttachmentScript.cancel(request), null,
+        )
         // 让所有在途回调因 token 失配而失效，并把界面可见性立刻复位。
         finishAutomation()
     }
@@ -366,8 +424,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         service: ArenaService,
         onTimeout: () -> Unit,
         waited: Long = 0L,
+        epoch: Long = cancellationEpoch,
+        timeoutMillis: Long = AUTOMATION_HARD_TIMEOUT_MS,
         block: (WebView) -> Unit,
     ) {
+        if (epoch != cancellationEpoch) return
         if (destroyed) {
             onTimeout()
             return
@@ -385,6 +446,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         service = service,
                         onTimeout = onTimeout,
                         waited = waited + AUTOMATION_QUEUE_INTERVAL_MS,
+                        epoch = epoch,
+                        timeoutMillis = timeoutMillis,
                         block = block,
                     )
                 },
@@ -410,7 +473,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             pending?.invoke()
         }
         automationWatchdog = watchdog
-        handler.postDelayed(watchdog, AUTOMATION_HARD_TIMEOUT_MS)
+        handler.postDelayed(watchdog, timeoutMillis)
         applyVisibility(service, hiddenAutomation = true)
         webView.onResume()
         handler.postDelayed({
@@ -426,13 +489,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         onTimeout: () -> Unit,
         onReady: (WebView) -> Unit,
     ) {
+        val token = automationToken
         val selectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val probe = "(function() { ${selectorHelperScript()} return !!arenaFirstMatch($selectors); })();"
         webView.evaluateJavascript(probe) { raw ->
+            if (destroyed || token != automationToken) return@evaluateJavascript
             if (raw == "true") {
                 onReady(webView)
             } else if (attempt + 1 < AUTOMATION_READY_ATTEMPTS) {
                 handler.postDelayed({
+                    if (destroyed || token != automationToken) return@postDelayed
                     waitForPromptInput(webView, service, attempt + 1, onTimeout, onReady)
                 }, AUTOMATION_READY_INTERVAL_MS)
             } else {
@@ -442,6 +508,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun finishAutomation() {
+        activeSendRequest?.let { request ->
+            webViews[automationService]?.evaluateJavascript(
+                "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(request)}]=true;" + ArenaAttachmentScript.cancel(request), null,
+            )
+        }
+        activeSendRequest = null
+        fileBroker.cancelAll()
         automationWatchdog?.let(handler::removeCallbacks)
         automationWatchdog = null
         automationOnTimeout = null
@@ -478,14 +551,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         requestId: String,
         callback: (SendOutcome) -> Unit,
     ) {
+        val token = automationToken
         var scriptCallbackConsumed = false
         val scriptCallbackTimeout = Runnable {
+            if (destroyed || token != automationToken) return@Runnable
             if (scriptCallbackConsumed) return@Runnable
             scriptCallbackConsumed = true
             finishSend(SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
         }
         handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
         webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
+            if (destroyed || token != automationToken) return@evaluateJavascript
             if (scriptCallbackConsumed) return@evaluateJavascript
             scriptCallbackConsumed = true
             handler.removeCallbacks(scriptCallbackTimeout)
@@ -507,14 +583,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // before deciding that a send failed.
             val verifyDelayMs = 2_500L
             handler.postDelayed({
+                if (destroyed || token != automationToken) return@postDelayed
                 var verifyCallbackConsumed = false
                 val verifyCallbackTimeout = Runnable {
+                    if (destroyed || token != automationToken) return@Runnable
                     if (verifyCallbackConsumed) return@Runnable
                     verifyCallbackConsumed = true
                     finishSend(SendOutcome(false, requestId, "网页发送确认超时"), callback)
                 }
                 handler.postDelayed(verifyCallbackTimeout, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                 webView.evaluateJavascript(verifySendScript(service, requestId)) { verifyRaw ->
+                    if (destroyed || token != automationToken) return@evaluateJavascript
                     if (verifyCallbackConsumed) return@evaluateJavascript
                     verifyCallbackConsumed = true
                     handler.removeCallbacks(verifyCallbackTimeout)
@@ -541,11 +620,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
         attempt: Int = 0,
     ) {
+        val token = automationToken
         val clickDelayMs = if (attempt == 0) 900L else 1_400L
         handler.postDelayed({
+            if (destroyed || token != automationToken) return@postDelayed
             webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) {
+                if (destroyed || token != automationToken) return@evaluateJavascript
                 handler.postDelayed({
+                    if (destroyed || token != automationToken) return@postDelayed
                     webView.evaluateJavascript(verifySendScript(ArenaService.DOUBAO, requestId)) { raw ->
+                        if (destroyed || token != automationToken) return@evaluateJavascript
                         if (raw == "true") {
                             finishSuccessfulSend(webView, ArenaService.DOUBAO, requestId, callback)
                         } else if (attempt + 1 < DOUBAO_SEND_ATTEMPTS) {
@@ -576,7 +660,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     fun destroy() {
         if (destroyed) return
+        cancelAutomation()
         destroyed = true
+        attachmentExecutor.shutdown()
         preloadGeneration += 1
         handler.removeCallbacksAndMessages(null)
         webViews.keys.toList().forEach(::disposeWebView)
@@ -596,6 +682,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun disposeWebView(service: ArenaService) {
         val webView = webViews.remove(service) ?: return
+        cancelManualChooser(webView)
+        fileBroker.destroyed(webView)
         pendingBackgroundProbes.remove(service)
         confirmedSignedIn.remove(service)
         explicitLoginProbeCounts.remove(service)
@@ -664,11 +752,59 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     webView: WebView,
                     filePathCallback: ValueCallback<Array<Uri>>,
                     fileChooserParams: FileChooserParams,
-                ): Boolean = activity.openImageFileChooser(filePathCallback)
+                ): Boolean {
+                    if (fileBroker.handle(webView, filePathCallback, fileChooserParams)) return true
+                    if (destroyed || automationService != null || !ArenaFileChooserBroker.trusted(service, webView.url)) {
+                        filePathCallback.onReceiveValue(null)
+                        return true
+                    }
+                    val generation = fileBroker.generation(webView)
+                    val origin = webView.url
+                    cancelManualChooser(webView)
+                    manualFileCallbacks[webView] = filePathCallback
+                    fun deliver(uris: Array<Uri>?) {
+                        if (manualFileCallbacks[webView] === filePathCallback) {
+                            manualFileCallbacks.remove(webView)
+                            filePathCallback.onReceiveValue(uris)
+                        }
+                    }
+                    // Manual provider uploads cannot know the Compose draft references: preserve all copies.
+                    activity.chooseAttachments(ArenaAttachmentLeases.retainedIds() + ArenaAttachmentStore(activity).storedIds()) { result ->
+                        if (destroyed || webViews[service] !== webView || generation != fileBroker.generation(webView) || origin != webView.url) {
+                            deliver(null)
+                            return@chooseAttachments
+                        }
+                        val files = result.getOrNull().orEmpty()
+                        if (files.isEmpty()) {
+                            deliver(null)
+                            result.exceptionOrNull()?.let { android.widget.Toast.makeText(activity, it.message, android.widget.Toast.LENGTH_LONG).show() }
+                        } else {
+                            attachmentExecutor.execute {
+                                val checked = runCatching { files.map { it to ArenaAttachmentStore(activity).verify(it) } }
+                                handler.post {
+                                    if (destroyed || generation != fileBroker.generation(webView) || origin != webView.url) {
+                                        deliver(null)
+                                    } else checked.fold(onSuccess = { verified ->
+                                        fileBroker.prepare(webView, service, "manual-${SystemClock.elapsedRealtime()}", verified) { error ->
+                                            if (error != null) android.widget.Toast.makeText(activity, error, android.widget.Toast.LENGTH_LONG).show()
+                                        }
+                                        fileBroker.handle(webView, ValueCallback(::deliver), fileChooserParams)
+                                    }, onFailure = { error ->
+                                        deliver(null)
+                                        android.widget.Toast.makeText(activity, error.message ?: "附件读取失败", android.widget.Toast.LENGTH_LONG).show()
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    return true
+                }
             }
             webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                     if (destroyed || webViews[service] !== view) return
+                    fileBroker.navigated(view)
+                    cancelManualChooser(view)
                     val decision = LoginTrustPolicy.duringNavigation(service in confirmedSignedIn)
                     statuses[service] = ServiceStatus(
                         state = decision.state,
@@ -712,6 +848,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                     if (destroyed) return true
+                    fileBroker.destroyed(view)
+                    cancelManualChooser(view)
                     statuses[service] = ServiceStatus(
                         state = ConnectionState.ERROR,
                         detail = "网页进程已退出，点重新加载恢复",
@@ -758,6 +896,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun cancelManualChooser(view: WebView) {
+        manualFileCallbacks.remove(view)?.onReceiveValue(null)
     }
 
     private fun probe(service: ArenaService) {
@@ -967,6 +1109,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               $stateBootstrap
               $selectorHelper
               if ($conversationAdvanced) return 'already_sent';
+              if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
@@ -1020,6 +1163,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               try {
                 const text = $quotedPrompt;
                 $stateBootstrap
+                const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
+                if (cancelled()) return 'cancelled';
                 $selectorHelper
                 $qwenFetchHook
                 $zhipuMessageDispatch
@@ -1052,6 +1197,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     data: null
                   }));
                   setTimeout(function() {
+                    if (cancelled()) return;
                     input.focus();
                     const currentSelection = window.getSelection();
                     const insertRange = document.createRange();
@@ -1086,6 +1232,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     // 同一个问题出现两遍。改成稍后核对，真没有再兜底。
                     needsSyntheticInput = false;
                     setTimeout(function() {
+                      if (cancelled()) return;
                       const nowText = String(input.innerText || input.textContent || '').replace(/\s+/g, ' ').trim();
                       if (nowText.length > 0) return;
                       input.textContent = text;
@@ -1103,6 +1250,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   return input.value || input.innerText || input.textContent || '';
                 };
                 const attemptSend = function() {
+                  if (cancelled()) return;
                   if ($conversationAdvanced) return;
                   if (!currentInputText().trim()) return;
                   const send = arenaFirstMatch($sendSelectors);

@@ -5,58 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class VoiceInputPolicyTest {
-    @Test
-    fun blankQuestionUsesTrimmedTranscript() {
-        val result = VoiceInputPolicy.merge("", "  请帮我制定旅行计划  ")
-
-        assertEquals("请帮我制定旅行计划", result.text)
-        assertEquals(9, result.addedCharacters)
-        assertFalse(result.truncated)
-    }
-
-    @Test
-    fun transcriptAppendsToExistingQuestionOnNewLine() {
-        val result = VoiceInputPolicy.merge("已有问题", "再补充预算")
-
-        assertEquals("已有问题\n再补充预算", result.text)
-        assertFalse(result.truncated)
-    }
-
-    @Test
-    fun blankTranscriptDoesNotChangeQuestion() {
-        val result = VoiceInputPolicy.merge("已有问题", "   ")
-
-        assertEquals("已有问题", result.text)
-        assertEquals(0, result.addedCharacters)
-    }
-
-    @Test
-    fun transcriptIsBoundedByQuestionLimit() {
-        val result = VoiceInputPolicy.merge("12345678", "abcdef", maxCharacters = 12)
-
-        assertEquals("12345678\nabc", result.text)
-        assertEquals(3, result.addedCharacters)
-        assertTrue(result.truncated)
-    }
-
-    @Test
-    fun voiceStateRejectsDuplicateRequestAndPublishesOneEvent() {
-        val state = VoiceInputState()
-
-        assertTrue(state.begin())
-        assertFalse(state.begin())
-        assertTrue(state.active)
-        state.finish(VoiceInputOutcome.Success("测试语音"))
-
-        assertFalse(state.active)
-        assertEquals("测试语音", (state.event?.outcome as VoiceInputOutcome.Success).transcript)
-        val eventId = state.event!!.id
-        assertEquals("测试语音", (state.take(eventId) as VoiceInputOutcome.Success).transcript)
-        assertEquals(null, state.take(eventId))
-        assertEquals(null, state.event)
-    }
-
+class AccessibilityPolicyTest {
     @Test
     fun largeTextScaleRespectsSystemScaleAndUpperBound() {
         assertEquals(1.0f, TextScalePolicy.composeFontScale(1.0f, false))

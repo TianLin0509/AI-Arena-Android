@@ -6,9 +6,6 @@
 
     <queries>
         <intent>
-            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
-        </intent>
-        <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
     </queries>
@@ -24,6 +21,11 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.AiArena"
         android:usesCleartextTraffic="false">
+        <provider
+            android:name=".ArenaAttachmentProvider"
+            android:authorities="${applicationId}.attachments"
+            android:exported="false"
+            android:grantUriPermissions="true" />
         <!--
             configChanges 是必须的：WebView 池与进行中的圆桌轮次都挂在 Activity 上，
             一旦系统重建 Activity，已登录的页面会全部重载、正在等待的回答会被判为失败。
