@@ -32,7 +32,7 @@ adb 可能在 instrumentation 失败时仍退出 0，必须检查输出最终为
 
 ## 发布
 
-当前产品版本 `0.11.2`、versionCode `17`，源码基线 `9d4f3d93ec0fd89677437fc38a49db31459507da`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
+当前产品版本 `0.12.0`、versionCode `18`，本次 UI 功能基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
 
 保持 `com.tianlin.aiarena` 和原 release 密钥。`keystore.properties`、密钥和密码留在仓库外/忽略文件；无签名配置的 release 构建是未签名包。Debug APK 和 CI 未签名 APK 不能替换用户已安装的签名 release。
 

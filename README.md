@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.11.2`（`versionCode 17`）
+当前版本：`v0.12.0`（`versionCode 18`）
 
 ## 开发入口
 
@@ -164,9 +164,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.11.2`，`versionCode=17`。
-- 下一次小修复示例：`0.11.3 / versionCode 18`。
-- 下一次向后兼容新功能示例：`0.12.0 / versionCode 18`（与上例二选一，实际发布时继续递增）。
+- 当前基线：`versionName=0.12.0`，`versionCode=18`。
+- 下一次小修复示例：`0.12.1 / versionCode 19`。
+- 下一次向后兼容新功能示例：`0.13.0 / versionCode 19`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：
