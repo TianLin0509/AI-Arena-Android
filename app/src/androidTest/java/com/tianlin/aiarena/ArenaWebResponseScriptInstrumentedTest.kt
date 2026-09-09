@@ -26,7 +26,7 @@ class ArenaWebResponseScriptInstrumentedTest {
             """
                 <div class="ds-virtual-list-visible-items">
                   <div class="user">用户问题<img alt="照片隐私文字" /></div>
-                  <div class="assistant"><div class="ds-markdown"><p>DeepSeek 最终文本</p><img alt="不应进入结果" /></div></div>
+                  <div class="assistant"><div class="ds-markdown"><p>DeepSeek 最终文本</p><img alt="不应进入结果" /></div><div style="height:32px"><button class="ds-button--icon">复制</button></div></div>
                 </div>
             """.trimIndent(),
         )
@@ -46,7 +46,7 @@ class ArenaWebResponseScriptInstrumentedTest {
                   <div class="bg-g-send">用户问题</div><img alt="用户照片" />
                 </div>
                 <div class="v_list_row" data-observe-row>
-                  <div class="md-box-root">豆包最终文本</div><div class="message-action-bar"></div>
+                  <div class="md-box-root">豆包最终文本</div><div class="message-action-bar" style="height:32px"><button>复制</button></div>
                 </div>
             """.trimIndent(),
         )
@@ -68,7 +68,7 @@ class ArenaWebResponseScriptInstrumentedTest {
                 <div class="chat-content-item-assistant">
                   <div class="toolcall"><div class="markdown-container toolcall-content-text">内部思考过程</div></div>
                   <div class="segment-content"><div class="markdown-container">Kimi 最终文本</div></div>
-                  <div class="segment-assistant-actions"></div>
+                  <div class="segment-assistant-actions" style="height:32px"><button>复制</button></div>
                 </div>
             """.trimIndent(),
         )
@@ -77,6 +77,37 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertFalse(payload.getBoolean("streaming"))
         assertEquals("Kimi 最终文本", payload.getString("text"))
         assertFalse(payload.getString("text").contains("内部思考"))
+    }
+
+    @Test
+    fun absentOrCollapsedCompletionBarsStillMeanStreaming() {
+        val cases = mapOf(
+            ArenaService.DEEPSEEK to """
+                <div class="ds-virtual-list-visible-items">
+                  <div class="user">用户问题</div>
+                  <div class="assistant"><div class="ds-markdown">未结束的回答</div></div>
+                </div>
+            """.trimIndent(),
+            ArenaService.DOUBAO to """
+                <div class="v_list_row" data-observe-row><div class="bg-g-send">用户问题</div></div>
+                <div class="v_list_row" data-observe-row><div class="md-box-root">未结束的回答</div>
+                  <div class="message-action-bar" style="height:0;overflow:hidden"><button>复制</button></div>
+                </div>
+            """.trimIndent(),
+            ArenaService.KIMI to """
+                <div class="chat-content-item-user">用户问题</div>
+                <div class="chat-content-item-assistant">
+                  <div class="segment-content"><div class="markdown-container">未结束的回答</div></div>
+                  <div class="segment-assistant-actions" style="height:32px"></div>
+                </div>
+            """.trimIndent(),
+        )
+        cases.forEach { (service, html) ->
+            val payload = evaluate(service, "still_streaming_${service.name}", html)
+            assertTrue("${service.name} must expose the partial answer", payload.getBoolean("found"))
+            assertEquals("未结束的回答", payload.getString("text"))
+            assertTrue("${service.name} has no visible completion controls", payload.getBoolean("streaming"))
+        }
     }
 
     @Test

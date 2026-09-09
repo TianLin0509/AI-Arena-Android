@@ -152,7 +152,7 @@ class ArenaSessionControllerInstrumentedTest {
             assertEquals(ParticipantPhase.COMPLETE, controller.summary.phase)
             assertEquals(ArenaService.DEEPSEEK, controller.summary.judge)
             assertEquals(1, controller.history.size)
-            assertTrue(gateway.prompts.any { it.contains("多 AI 讨论的主持人") })
+            assertTrue(gateway.prompts.any { it.contains("多 AI 讨论的队长") })
             assertTrue(gateway.prompts.any { it.contains("只给三条建议") })
             controller.destroy()
         }

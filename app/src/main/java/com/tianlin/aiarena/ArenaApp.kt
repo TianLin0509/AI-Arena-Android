@@ -613,7 +613,7 @@ private fun DiscussionHome(
         }
     }
 
-    /** 回到干净的提问页：结果页「开始新问题」、设置页「清除卡住的讨论」、崩溃提示「重新开始」共用。 */
+    /** 回到干净的提问页：设置页「清除卡住的讨论」、崩溃提示「重新开始」共用。 */
     val startFresh: () -> Unit = {
         sessionController.reset()
         question = ""
@@ -768,7 +768,7 @@ private fun DiscussionHome(
                 )
             } else {
                 RoundStage(
-                    pool = pool,
+                    statuses = pool.statuses,
                     sessionController = sessionController,
                     selectedServices = selectedServices,
                     usableCount = usableCount,
@@ -784,7 +784,6 @@ private fun DiscussionHome(
                     shareText = shareText,
                     offline = offline,
                     captainPreferences = captainPreferences,
-                    onNewQuestion = startFresh,
                 )
             }
         }

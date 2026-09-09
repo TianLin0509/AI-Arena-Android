@@ -102,6 +102,8 @@ dependencies {
     implementation("androidx.webkit:webkit:1.17.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     testImplementation("junit:junit:4.13.2")
     // JVM 单测里 android.jar 的 org.json 是桩（一调就抛 "not mocked"），拿真实现来跑解析测试。
     testImplementation("org.json:json:20250107")

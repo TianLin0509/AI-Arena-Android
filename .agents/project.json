@@ -13,7 +13,7 @@
   "worktreeHint": "每个任务独立 worktree；JDK 17、Android SDK 36、Python 3.10+；用 ANDROID_HOME 或各自未跟踪的 local.properties 配置 SDK。不要复制签名凭据或共享 build 目录。",
   "notes": [
     "主机闸门执行全部 JVM 单测、debug/release lint、debug/release APK 和 instrumentation APK 编译。",
-    "两个 androidTest 文件需要隔离设备执行；主机闸门不声称覆盖设备测试。运行时改动的独立审查还须亲验设备测试，见 .agents/TESTING.md。",
+    "全部 androidTest 测试需要隔离设备执行；主机闸门不声称覆盖设备测试。运行时改动的独立审查还须亲验设备测试，见 .agents/TESTING.md。",
     "保留现有显式发布流程：发布任务同步 versionName/versionCode、README、CHANGELOG 和签名包；不在每次合并自动抬版本。",
     "合并只在本地进行。经授权的远端同步使用进程级 PROJECT_PREP_ALLOW_PUSH=1，禁止写入全局环境。"
   ]
