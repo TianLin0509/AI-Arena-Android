@@ -24,6 +24,48 @@ class ArenaSessionControllerInstrumentedTest {
     )
 
     @Test
+    fun newSessionResetPreservesCompletedHistoryButClearsColdStartSelection() {
+        val repository = FakeSessionRepository()
+        val controller = onMain { ArenaSessionController(FakeGateway(), fastTiming, repository) }
+        onMain { assertTrue(controller.startInitial("应保留在历史里的问题", ArenaService.defaultMembers)) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            controller.reset()
+            assertEquals(SessionStage.IDLE, controller.stage)
+            assertEquals("", controller.originalQuestion)
+            assertEquals(0, controller.completedCount)
+            assertEquals(null, repository.loadActive())
+            val saved = repository.load(controller.recentSessions.single().id)!!
+            assertEquals("应保留在历史里的问题", saved.originalQuestion)
+            assertEquals(3, saved.runs.values.count { it.phase == ParticipantPhase.COMPLETE })
+            controller.destroy()
+            val restarted = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals(SessionStage.IDLE, restarted.stage)
+            assertEquals(1, restarted.recentSessions.size)
+            restarted.destroy()
+        }
+    }
+
+    @Test
+    fun newSessionDuringSendIgnoresLateCallbacksAndPreservesInterruptedHistory() {
+        val repository = FakeSessionRepository()
+        val gateway = DeferredSendGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        onMain {
+            assertTrue(controller.startInitial("中止后仍保留的问题", ArenaService.defaultMembers))
+            assertTrue(controller.isBusy)
+            controller.reset()
+            gateway.releaseAllCallbacks()
+            assertFalse(controller.isBusy)
+            assertEquals(SessionStage.IDLE, controller.stage)
+            assertEquals(null, repository.loadActive())
+            assertTrue(controller.runs.values.all { it.phase == ParticipantPhase.IDLE })
+            assertEquals("中止后仍保留的问题", controller.recentSessions.single().title)
+            controller.destroy()
+        }
+    }
+
+    @Test
     fun parallelModeDispatchesAllBeforeResponsesFinish() {
         val gateway = FakeGateway()
         val controller = onMain { ArenaSessionController(gateway, fastTiming) }

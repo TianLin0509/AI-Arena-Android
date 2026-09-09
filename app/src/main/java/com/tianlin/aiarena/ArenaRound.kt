@@ -31,6 +31,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -63,6 +64,57 @@ import kotlinx.coroutines.launch
 // 状态行原地展开各家回答；追问输入与三个操作集中放在成员列表下方。
 // ---------------------------------------------------------------------------
 
+/** 新会话始终在右上角；只有尚在收取回答时才确认停止，历史由 reset 保存。 */
+@Composable
+internal fun RoundHeader(title: String, narration: String, busy: Boolean, onNewSession: () -> Unit) {
+    val colors = ArenaStyle.colors
+    var confirmNewSession by rememberSaveable { mutableStateOf(false) }
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ArenaHeading(
+                text = title,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleLarge,
+                maxLines = 1,
+            )
+            TextButton(
+                modifier = Modifier.testTag("new-session").heightIn(min = ArenaStyle.metrics.minTouch),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                onClick = { if (busy) confirmNewSession = true else onNewSession() },
+            ) {
+                Text(
+                    text = "新会话",
+                    color = colors.onHero,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = MaterialTheme.typography.labelLarge.fontSize),
+                )
+            }
+        }
+        Text(
+            text = narration,
+            color = colors.onHeroMuted,
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+    if (confirmNewSession) {
+        ConfirmDialog(
+            title = "开始新会话？",
+            text = "将停止等待本轮回答，已收到的内容会保留在历史中。",
+            confirmLabel = "开始新会话",
+            onConfirm = { confirmNewSession = false; onNewSession() },
+            onDismiss = { confirmNewSession = false },
+        )
+    }
+}
+
 @Composable
 internal fun RoundStage(
     statuses: Map<ArenaService, ServiceStatus>,
@@ -75,6 +127,7 @@ internal fun RoundStage(
     roundGuidance: String,
     onRoundGuidanceChange: (String) -> Unit,
     expandedAnswers: MutableMap<String, Boolean>,
+    onNewSession: () -> Unit,
     onOpenService: (ArenaService) -> Unit,
     snackbarHostState: SnackbarHostState,
     copyText: TextCopyRequest?,
@@ -162,26 +215,12 @@ internal fun RoundStage(
                     .padding(start = metrics.gutter, end = metrics.gutter, top = 16.dp, bottom = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        ArenaHeading(
-                            text = sessionController.currentRoundKind?.displayName ?: "AI 圆桌",
-                            style = MaterialTheme.typography.titleLarge,
-                            maxLines = 1,
-                        )
-                        Text(
-                            text = narration,
-                            color = colors.onHeroMuted,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
+                RoundHeader(
+                    title = sessionController.currentRoundKind?.displayName ?: "AI 圆桌",
+                    narration = narration,
+                    busy = busy,
+                    onNewSession = onNewSession,
+                )
                 if (busy) {
                     ArenaProgressBar(
                         progress = if (roundRunning && trackedServices.isNotEmpty()) {
