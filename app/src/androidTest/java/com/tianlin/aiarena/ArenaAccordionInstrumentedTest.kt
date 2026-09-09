@@ -33,6 +33,52 @@ class ArenaAccordionInstrumentedTest {
     private var shares = 0
     private var retries = 0
 
+    @Test fun idleNewSessionOpensImmediatelyWithoutConfirmation() {
+        var newSessions = 0
+        compose.setContent {
+            ArenaTheme { RoundHeader("观点讨论", "本轮已完成", false) { newSessions++ } }
+        }
+        compose.onNodeWithTag("new-session").assertIsDisplayed().performClick()
+        compose.onNodeWithText("开始新会话？").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(1, newSessions) }
+    }
+
+    @Test fun busyNewSessionRequiresConfirmationAndCancelKeepsCurrentRound() {
+        var newSessions = 0
+        compose.setContent {
+            ArenaTheme { RoundHeader("观点讨论", "正在等待回答", true) { newSessions++ } }
+        }
+        compose.onNodeWithTag("new-session").performClick()
+        compose.onNodeWithText("将停止等待本轮回答，已收到的内容会保留在历史中。").assertIsDisplayed()
+        compose.onNodeWithText("取消").performClick()
+        compose.runOnIdle { assertEquals(0, newSessions) }
+        compose.onNodeWithTag("new-session").performClick()
+        compose.onNodeWithText("开始新会话").performClick()
+        compose.runOnIdle { assertEquals(1, newSessions) }
+        compose.onNodeWithText("开始新会话？").assertDoesNotExist()
+    }
+
+    @Test fun narrowElderHeaderKeepsNewSessionAndTitleVisible() {
+        compose.setContent {
+            CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density, 1.3f)) {
+                ArenaTheme(ArenaSkin.ELDER) {
+                    Column(Modifier.width(280.dp)) {
+                        RoundHeader("观点讨论", "三家已经完成回答", false) {}
+                    }
+                }
+            }
+        }
+        listOf("新会话", "观点讨论").forEach { label ->
+            val layouts = mutableListOf<TextLayoutResult>()
+            compose.onNodeWithText(label, useUnmergedTree = true).assertIsDisplayed()
+                .performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            assertFalse("Clipped header: $label", layouts.single().hasVisualOverflow)
+        }
+        val title = compose.onNodeWithText("观点讨论").fetchSemanticsNode().boundsInRoot
+        val action = compose.onNodeWithTag("new-session").fetchSemanticsNode().boundsInRoot
+        assertTrue("New session must stay to the right of the title", action.left >= title.right)
+    }
+
     private fun showMembers(count: Int, error: Boolean = false, longAnswers: Boolean = false) {
         compose.setContent {
             ArenaTheme {

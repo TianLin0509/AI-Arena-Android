@@ -613,7 +613,7 @@ private fun DiscussionHome(
         }
     }
 
-    /** 回到干净的提问页：设置页「清除卡住的讨论」、崩溃提示「重新开始」共用。 */
+    /** 回到干净的提问页：顶部「新会话」、设置恢复与崩溃恢复共用；reset 先保存旧讨论。 */
     val startFresh: () -> Unit = {
         sessionController.reset()
         question = ""
@@ -778,6 +778,7 @@ private fun DiscussionHome(
                     roundGuidance = roundGuidance,
                     onRoundGuidanceChange = { roundGuidance = it },
                     expandedAnswers = expandedAnswers,
+                    onNewSession = startFresh,
                     onOpenService = onOpenService,
                     snackbarHostState = snackbarHostState,
                     copyText = copyText,
@@ -1047,4 +1048,3 @@ internal fun RunStatusPill(phase: ParticipantPhase) {
         phase == ParticipantPhase.STREAMING
     ArenaPill(text = label, foreground = foreground, background = background, pulsing = pulsing)
 }
-

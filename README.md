@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.12.0`（`versionCode 18`）
+当前版本：`v0.12.1`（`versionCode 19`）
 
 ## 开发入口
 
@@ -51,7 +51,7 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 复制、分享、跳转原网页和失败补救仍在对应回答内，操作按钮不会触发正文折叠。
 - 状态列表下方是「继续追问」与最多两行的输入框，再下方并排放「队长总结 / 观点讨论 / 独立迭代」。
 - 「队长总结」按钮展开队长、深度与总结结果。观点讨论可不填要求；独立迭代仍须填写本轮原文。
-- 去掉结果页的新问题按钮和底部 AI 分段切换，保留圆桌 / 历史 / 设置主导航及设置中的恢复入口。
+- 右上角「新会话」回到空白提问页，旧讨论保留在历史中；仍在回答时先确认停止等待。底部保留圆桌 / 历史 / 设置主导航，不再放新问题按钮或 AI 分段切换。
 
 ## 队长总结（0.11.0）
 
@@ -164,9 +164,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.12.0`，`versionCode=18`。
-- 下一次小修复示例：`0.12.1 / versionCode 19`。
-- 下一次向后兼容新功能示例：`0.13.0 / versionCode 19`（与上例二选一，实际发布时继续递增）。
+- 当前基线：`versionName=0.12.1`，`versionCode=19`。
+- 下一次小修复示例：`0.12.2 / versionCode 20`。
+- 下一次向后兼容新功能示例：`0.13.0 / versionCode 20`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：
