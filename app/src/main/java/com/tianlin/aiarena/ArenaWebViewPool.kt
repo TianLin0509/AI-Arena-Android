@@ -48,20 +48,23 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val confirmedSignedIn = mutableSetOf<ArenaService>()
     private val explicitLoginProbeCounts = mutableMapOf<ArenaService, Int>()
     private var uiSelectedService: ArenaService? = null
-    private var automationService: ArenaService? = null
-    /**
-     * 每次进入自动化都会递增。看门狗和各级回调靠它判断"我还是当前这一次吗"，
-     * 避免迟到的回调结束掉后来的自动化。
-     */
-    private var automationToken = 0L
+    private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit) {
+        var watchdog: Runnable? = null
+        var parked = false
+        var sending = false
+    }
+    private val automations = mutableMapOf<ArenaService, Automation>()
+    private val serviceEpochs = mutableMapOf<ArenaService, Long>()
     private var cancellationEpoch = 0L
-    private var activeSendRequest: String? = null
     private val fileBroker = ArenaFileChooserBroker(activity)
     private val manualFileCallbacks = mutableMapOf<WebView, ValueCallback<Array<Uri>>>()
     private val attachmentExecutor = Executors.newSingleThreadExecutor()
-    private var automationWatchdog: Runnable? = null
-    private var automationOnTimeout: (() -> Unit)? = null
-    private var backgroundProbeInProgress = false
+    private var backgroundProbeService: ArenaService? = null
+    private var backgroundProbeGeneration = 0L
+    private class FocusAction(val service: ArenaService, val requestId: String, val block: (() -> Unit) -> Unit)
+    private val focusQueue = ArrayDeque<FocusAction>()
+    private var focusAction: FocusAction? = null
+    private var focusWatchdog: Runnable? = null
     private var destroyed = false
     private var textZoomPercent = 100
     private var preloadGeneration = 0L
@@ -121,28 +124,30 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         // Compose 的 AndroidView.update 每次重组都会重跑，show() 因此被高频调用。
         // 没有真正切换时直接返回；否则每次重组都排一个 600ms 的登录探针，
         // 探针写回 statuses 又触发重组，形成自激循环。
-        if (service == uiSelectedService && automationService == null) return
+        if (service == uiSelectedService) return
         uiSelectedService = service
-        if (automationService != null) return
-        applyVisibility(service, hiddenAutomation = false)
+        refreshVisibility()
         if (service != null) handler.postDelayed({ probe(service) }, 600)
         else handler.post { drainBackgroundProbes() }
     }
 
-    private fun applyVisibility(service: ArenaService?, hiddenAutomation: Boolean) {
+    /** Keep each uploading page laid out; only a short input/touch action borrows the front surface. */
+    private fun refreshVisibility() {
         if (destroyed) return
-        container.visibility = if (service == null) View.GONE else View.VISIBLE
-        container.alpha = if (hiddenAutomation) 0.01f else 1f
-        container.isClickable = service != null && !hiddenAutomation
-        container.isFocusable = service != null && !hiddenAutomation
+        val front = focusAction?.service ?: uiSelectedService ?: backgroundProbeService ?: automations.keys.firstOrNull()
+        val hidden = focusAction != null || uiSelectedService == null
+        container.visibility = if (front == null) View.GONE else View.VISIBLE
+        container.alpha = if (hidden) 0.01f else 1f
+        container.isClickable = front != null && !hidden
+        container.isFocusable = front != null && !hidden
         ArenaService.entries.forEach { candidate ->
             val webView = webViews[candidate]
-            if (candidate == service) {
-                ensureWebView(candidate)?.visibility = View.VISIBLE
-            } else {
-                webView?.visibility = View.GONE
-            }
+            val active = candidate == front || candidate == uiSelectedService || candidate in automations || candidate == backgroundProbeService
+            val visible = active && automations[candidate]?.parked != true
+            webView?.visibility = if (visible) View.VISIBLE else View.GONE
+            webView?.alpha = if (candidate == front) 1f else 0.01f
         }
+        webViews[front]?.bringToFront()
     }
 
     fun open(service: ArenaService) {
@@ -161,7 +166,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      * 不碰 Cookie，登录态不会丢。轮次进行中不允许，否则会打断正在收的回答。
      */
     fun reloadAll(): Int {
-        if (destroyed || automationService != null) return 0
+        if (destroyed || automations.isNotEmpty()) return 0
         val targets = (desiredServices + webViews.keys).toList()
         targets.forEach { service ->
             val existing = webViews[service]
@@ -177,7 +182,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     fun reloadFailed(): Int {
         if (destroyed) return 0
         val failed = webViews.keys.filter { service ->
-            service != automationService && statuses[service]?.state == ConnectionState.ERROR
+            service !in automations && statuses[service]?.state == ConnectionState.ERROR
         }
         failed.forEach { service -> webViews[service]?.reload() }
         return failed.size
@@ -231,7 +236,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun navigate(service: ArenaService, webView: WebView, url: String, callback: (Boolean) -> Unit) {
         // 自动化进行中不能换页面：会把正在收的回答和在途的 JS 回调一起弄丢
-        if (automationService == service) return callback(false)
+        if (service in automations) return callback(false)
         pendingLoads.remove(service)?.invoke(false)
         var settled = false
         val timeout = Runnable {
@@ -301,6 +306,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             return callback(SendOutcome(false, requestId, "${service.displayName} 暂不支持圆桌附件，请换用 DeepSeek、豆包或 Kimi"))
         }
         val epoch = cancellationEpoch
+        val serviceEpoch = serviceEpochs[service] ?: 0L
         if (destroyed) return callback(SendOutcome(false, requestId, "网页已关闭"))
         attachmentExecutor.execute {
             val checked = runCatching {
@@ -308,9 +314,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 attachments.map { it to store.verify(it) }
             }
             handler.post {
-                if (destroyed || epoch != cancellationEpoch) return@post
+                if (!submissionCurrent(service, epoch, serviceEpoch)) return@post
                 checked.fold(
-                    onSuccess = { sendPromptInternal(service, prompt, requestId, callback, false, it, epoch) },
+                    onSuccess = { sendPromptInternal(service, prompt, requestId, callback, false, it, epoch, serviceEpoch) },
                     onFailure = { callback(SendOutcome(false, requestId, it.message ?: "附件无法读取，请重新选择")) },
                 )
             }
@@ -325,8 +331,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         reloadedOnce: Boolean,
         attachmentFiles: List<Pair<ArenaAttachment, File>> = emptyList(),
         epoch: Long = cancellationEpoch,
+        serviceEpoch: Long = serviceEpochs[service] ?: 0L,
     ) {
-        if (destroyed || epoch != cancellationEpoch) return
+        if (!submissionCurrent(service, epoch, serviceEpoch)) return
         if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn) {
             callback(SendOutcome(false, requestId, "${service.displayName} 尚未登录"))
             return
@@ -339,8 +346,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             val target = failedPage.url?.takeIf { it.startsWith("https://") } ?: service.url
             navigate(service, failedPage, target) { ok ->
                 if (ok) {
-                    sendPromptInternal(service, prompt, requestId, callback, true, attachmentFiles, epoch)
-                } else {
+                    sendPromptInternal(service, prompt, requestId, callback, true, attachmentFiles, epoch, serviceEpoch)
+                } else if (submissionCurrent(service, epoch, serviceEpoch)) {
                     callback(SendOutcome(false, requestId, "${service.displayName} 网页打不开，请确认网络正常后再试"))
                 }
             }
@@ -349,20 +356,22 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val fullPrompt = prompt.trim()
         activateForAutomation(
             service = service,
-            epoch = epoch,
+            requestId = requestId,
             timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
             onTimeout = {
-                finishSend(SendOutcome(false, requestId, "${service.displayName} 网页输入框加载超时"), callback)
+                callback(SendOutcome(false, requestId, "${service.displayName} 网页发送超时，请检查原网页后重试"))
             },
+            onBusy = { callback(SendOutcome(false, requestId, "${service.displayName} 仍有发送任务，请等待或停止后重试")) },
+            onInterrupted = { detail -> callback(SendOutcome(false, requestId, detail)) },
         ) { webView ->
-            val token = automationToken
-            activeSendRequest = requestId
+            val token = automations[service]
             webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId)) {
-                if (destroyed || token != automationToken || epoch != cancellationEpoch) return@evaluateJavascript
+                if (!isCurrent(service, token)) return@evaluateJavascript
                 if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
-                else ArenaAttachmentTransport(handler, fileBroker).upload(webView, service, requestId, attachmentFiles, { !destroyed && token == automationToken && epoch == cancellationEpoch }) { error ->
-                    if (destroyed || token != automationToken || epoch != cancellationEpoch) return@upload
-                    if (error != null) finishSend(SendOutcome(false, requestId, error), callback)
+                else ArenaAttachmentTransport(handler, fileBroker) { action -> withFocus(service, requestId, action) }
+                    .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
+                    if (!isCurrent(service, token)) return@upload
+                    if (error != null) finishSend(service, SendOutcome(false, requestId, error), callback)
                     else sendStandard(webView, service, fullPrompt, requestId, callback)
                 }
             }
@@ -407,129 +416,145 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
     }
 
+    private fun submissionCurrent(service: ArenaService, epoch: Long, serviceEpoch: Long) =
+        !destroyed && epoch == cancellationEpoch && serviceEpoch == (serviceEpochs[service] ?: 0L)
+
+    private fun isCurrent(service: ArenaService, token: Automation?) =
+        !destroyed && token != null && automations[service] === token
+
     override fun cancelAutomation() {
         cancellationEpoch++
+        automations.keys.toList().forEach { service -> finishAutomation(service) }
+        focusQueue.clear()
         fileBroker.cancelAll()
         manualFileCallbacks.keys.toList().forEach(::cancelManualChooser)
-        if (destroyed) return
-        val request = activeSendRequest
-        if (request != null) webViews[automationService]?.evaluateJavascript(
-            "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(request)}]=true;" + ArenaAttachmentScript.cancel(request), null,
-        )
-        // 让所有在途回调因 token 失配而失效，并把界面可见性立刻复位。
-        finishAutomation()
+        backgroundProbeGeneration++
+        backgroundProbeService = null
+        refreshVisibility()
+    }
+
+    override fun cancelAutomation(service: ArenaService) {
+        serviceEpochs[service] = (serviceEpochs[service] ?: 0L) + 1L
+        finishAutomation(service)
+        webViews[service]?.let { fileBroker.cancel(it) }
     }
 
     private fun activateForAutomation(
         service: ArenaService,
+        requestId: String,
         onTimeout: () -> Unit,
-        waited: Long = 0L,
-        epoch: Long = cancellationEpoch,
+        onBusy: () -> Unit,
+        onInterrupted: (String) -> Unit,
         timeoutMillis: Long = AUTOMATION_HARD_TIMEOUT_MS,
         block: (WebView) -> Unit,
     ) {
-        if (epoch != cancellationEpoch) return
-        if (destroyed) {
-            onTimeout()
-            return
-        }
-        // 后台探针或上一次自动化还没结束时排队等待，而不是直接覆盖 automationService。
-        // 覆盖会让先前那条链在结束时把后来这条的可见性和键盘状态一并复位。
-        if (backgroundProbeInProgress || automationService != null) {
-            if (waited >= AUTOMATION_QUEUE_TIMEOUT_MS) {
-                onTimeout()
-                return
-            }
-            handler.postDelayed(
-                {
-                    activateForAutomation(
-                        service = service,
-                        onTimeout = onTimeout,
-                        waited = waited + AUTOMATION_QUEUE_INTERVAL_MS,
-                        epoch = epoch,
-                        timeoutMillis = timeoutMillis,
-                        block = block,
-                    )
-                },
-                AUTOMATION_QUEUE_INTERVAL_MS,
-            )
-            return
-        }
-        val webView = ensureWebView(service)
-        if (webView == null) {
-            onTimeout()
-            return
-        }
-        automationService = service
-        val token = ++automationToken
-        automationOnTimeout = onTimeout
-        // 兜底看门狗：WebView 渲染进程被杀时，已投递的 evaluateJavascript 回调会被
-        // Chromium 静默丢弃，既不抛异常也不回调。没有这个超时，automationService
-        // 会永远非空，之后所有发送和网页显示全部死锁，只能杀掉进程。
+        if (destroyed) return onTimeout()
+        if (service in automations) return onBusy()
+        val webView = ensureWebView(service) ?: return onTimeout()
+        val token = Automation(requestId, onTimeout, onInterrupted)
+        automations[service] = token
         val watchdog = Runnable {
-            if (token != automationToken) return@Runnable
-            val pending = automationOnTimeout
-            finishAutomation()
-            pending?.invoke()
+            if (!isCurrent(service, token)) return@Runnable
+            finishAutomation(service)
+            onTimeout()
         }
-        automationWatchdog = watchdog
+        token.watchdog = watchdog
         handler.postDelayed(watchdog, timeoutMillis)
-        applyVisibility(service, hiddenAutomation = true)
+        refreshVisibility()
         webView.onResume()
         handler.postDelayed({
-            if (token != automationToken) return@postDelayed
-            waitForPromptInput(webView, service, attempt = 0, onTimeout = onTimeout, onReady = block)
-        }, 650)
+            if (isCurrent(service, token)) waitForPromptInput(webView, service, token, 0, block)
+        }, 650L)
     }
 
     private fun waitForPromptInput(
         webView: WebView,
         service: ArenaService,
+        token: Automation,
         attempt: Int,
-        onTimeout: () -> Unit,
         onReady: (WebView) -> Unit,
     ) {
-        val token = automationToken
         val selectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val probe = "(function() { ${selectorHelperScript()} return !!arenaFirstMatch($selectors); })();"
         webView.evaluateJavascript(probe) { raw ->
-            if (destroyed || token != automationToken) return@evaluateJavascript
-            if (raw == "true") {
-                onReady(webView)
-            } else if (attempt + 1 < AUTOMATION_READY_ATTEMPTS) {
-                handler.postDelayed({
-                    if (destroyed || token != automationToken) return@postDelayed
-                    waitForPromptInput(webView, service, attempt + 1, onTimeout, onReady)
-                }, AUTOMATION_READY_INTERVAL_MS)
-            } else {
-                onTimeout()
+            if (!isCurrent(service, token)) return@evaluateJavascript
+            if (raw == "true") onReady(webView)
+            else if (attempt + 1 < AUTOMATION_READY_ATTEMPTS) handler.postDelayed({
+                if (isCurrent(service, token)) waitForPromptInput(webView, service, token, attempt + 1, onReady)
+            }, AUTOMATION_READY_INTERVAL_MS)
+            else {
+                finishAutomation(service)
+                token.onTimeout()
             }
         }
     }
 
-    private fun finishAutomation() {
-        activeSendRequest?.let { request ->
-            webViews[automationService]?.evaluateJavascript(
-                "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(request)}]=true;" + ArenaAttachmentScript.cancel(request), null,
-            )
+    /** A lease ends after input injection or one native tap, never after upload/parse/send acknowledgement. */
+    private fun withFocus(service: ArenaService, requestId: String, block: (() -> Unit) -> Unit) {
+        if (automations[service]?.requestId != requestId || destroyed) return
+        focusQueue.addLast(FocusAction(service, requestId, block))
+        drainFocusQueue()
+    }
+
+    private fun drainFocusQueue() {
+        if (destroyed || focusAction != null) return
+        while (focusQueue.isNotEmpty()) {
+            val action = focusQueue.removeFirst()
+            val token = automations[action.service]
+            if (token == null || token.requestId != action.requestId) continue
+            val webView = webViews[action.service] ?: continue
+            focusAction = action
+            refreshVisibility()
+            webView.requestFocus()
+            val watchdog = Runnable {
+                if (focusAction !== action) return@Runnable
+                releaseFocus(action)
+                if (isCurrent(action.service, token)) {
+                    finishAutomation(action.service)
+                    token.onInterrupted("${action.service.displayName} 网页输入操作响应超时，请检查原网页后重试")
+                }
+            }
+            focusWatchdog = watchdog
+            handler.postDelayed(watchdog, FOCUS_ACTION_TIMEOUT_MS)
+            // Let Android apply the front view's layout before querying native touch coordinates.
+            handler.postDelayed({
+                if (focusAction !== action || !isCurrent(action.service, token)) return@postDelayed
+                action.block { releaseFocus(action) }
+            }, 80L)
+            return
         }
-        activeSendRequest = null
-        fileBroker.cancelAll()
-        automationWatchdog?.let(handler::removeCallbacks)
-        automationWatchdog = null
-        automationOnTimeout = null
-        automationToken += 1
-        val service = automationService ?: return
-        webViews[service]?.let(::hideAutomationKeyboard)
-        automationService = null
+    }
+
+    private fun releaseFocus(action: FocusAction) {
+        if (focusAction !== action) return
+        focusWatchdog?.let(handler::removeCallbacks)
+        focusWatchdog = null
+        webViews[action.service]?.let(::hideAutomationKeyboard)
+        focusAction = null
+        refreshVisibility()
+        handler.post { drainFocusQueue() }
+    }
+
+    private fun finishAutomation(service: ArenaService) {
+        val token = automations.remove(service) ?: return
+        token.watchdog?.let(handler::removeCallbacks)
+        webViews[service]?.let { view ->
+            view.evaluateJavascript(
+                "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(token.requestId)}]=true;" + ArenaAttachmentScript.cancel(token.requestId), null,
+            )
+            fileBroker.cancel(view, token.requestId)
+        }
+        focusQueue.removeAll { it.service == service && it.requestId == token.requestId }
+        focusAction?.takeIf { it.service == service && it.requestId == token.requestId }?.let(::releaseFocus)
         if (destroyed) return
-        applyVisibility(uiSelectedService, hiddenAutomation = false)
+        refreshVisibility()
         trimUndesiredWebViews()
         handler.post { drainBackgroundProbes() }
     }
 
-    private fun finishSend(outcome: SendOutcome, callback: (SendOutcome) -> Unit) {
-        finishAutomation()
+    private fun finishSend(service: ArenaService, outcome: SendOutcome, callback: (SendOutcome) -> Unit) {
+        if (automations[service]?.requestId != outcome.requestId) return
+        finishAutomation(service)
         callback(outcome)
     }
 
@@ -541,7 +566,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     ) {
         webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId), null)
         sentSinceLoad += service
-        finishSend(SendOutcome(true, requestId, "已发送"), callback)
+        finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
     }
 
     private fun sendStandard(
@@ -551,60 +576,66 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         requestId: String,
         callback: (SendOutcome) -> Unit,
     ) {
-        val token = automationToken
+        val token = automations[service]
         var scriptCallbackConsumed = false
         val scriptCallbackTimeout = Runnable {
-            if (destroyed || token != automationToken) return@Runnable
+            if (!isCurrent(service, token)) return@Runnable
             if (scriptCallbackConsumed) return@Runnable
             scriptCallbackConsumed = true
-            finishSend(SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
+            finishSend(service, SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
         }
-        handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
-        webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
-            if (destroyed || token != automationToken) return@evaluateJavascript
-            if (scriptCallbackConsumed) return@evaluateJavascript
-            scriptCallbackConsumed = true
-            handler.removeCallbacks(scriptCallbackTimeout)
-            val result = decodeJsValue(raw)
-            if (!result.startsWith("sent")) {
-                finishSend(SendOutcome(false, requestId, result.ifBlank { "注入失败" }), callback)
-                return@evaluateJavascript
-            }
-            if (service == ArenaService.DOUBAO) {
-                // Doubao's current mobile web build accepts the same programmatic click
-                // once the host WebView is no longer the visible automation surface.
-                // Keep the page alive, but hide the Android view before issuing clicks.
-                applyVisibility(null, hiddenAutomation = false)
-                verifyDoubaoSend(webView, requestId, callback)
-                return@evaluateJavascript
-            }
-            // Rich editors (especially Doubao's ProseMirror) update their framework state
-            // asynchronously. Give the scheduled, guarded click/retry enough time to run
-            // before deciding that a send failed.
-            val verifyDelayMs = 2_500L
-            handler.postDelayed({
-                if (destroyed || token != automationToken) return@postDelayed
-                var verifyCallbackConsumed = false
-                val verifyCallbackTimeout = Runnable {
-                    if (destroyed || token != automationToken) return@Runnable
-                    if (verifyCallbackConsumed) return@Runnable
-                    verifyCallbackConsumed = true
-                    finishSend(SendOutcome(false, requestId, "网页发送确认超时"), callback)
+        withFocus(service, requestId) { release ->
+            handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
+            token?.sending = true
+            webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
+                // Rich-editor insertText can commit on a later task; release before the guarded send click.
+                handler.postDelayed({ release() }, 220L)
+                if (!isCurrent(service, token)) return@evaluateJavascript
+                if (scriptCallbackConsumed) return@evaluateJavascript
+                scriptCallbackConsumed = true
+                handler.removeCallbacks(scriptCallbackTimeout)
+                val result = decodeJsValue(raw)
+                if (!result.startsWith("sent")) {
+                    finishSend(service, SendOutcome(false, requestId, result.ifBlank { "注入失败" }), callback)
+                    return@evaluateJavascript
                 }
-                handler.postDelayed(verifyCallbackTimeout, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
-                webView.evaluateJavascript(verifySendScript(service, requestId)) { verifyRaw ->
-                    if (destroyed || token != automationToken) return@evaluateJavascript
-                    if (verifyCallbackConsumed) return@evaluateJavascript
-                    verifyCallbackConsumed = true
-                    handler.removeCallbacks(verifyCallbackTimeout)
-                    val sent = verifyRaw == "true"
-                    if (sent) {
-                        finishSuccessfulSend(webView, service, requestId, callback)
-                    } else {
-                        finishSend(SendOutcome(false, requestId, "发送后未检测到新消息"), callback)
+                if (service == ArenaService.DOUBAO) {
+                    // Doubao's current mobile web build accepts the same programmatic click
+                    // once the host WebView is no longer the visible automation surface.
+                    // Keep the page alive, but hide the Android view before issuing clicks.
+                    token?.parked = true
+                    refreshVisibility()
+                    verifyDoubaoSend(webView, requestId, callback)
+                    return@evaluateJavascript
+                }
+                // Rich editors (especially Doubao's ProseMirror) update their framework state
+                // asynchronously. Give the scheduled, guarded click/retry enough time to run
+                // before deciding that a send failed.
+                val verifyDelayMs = 2_500L
+                handler.postDelayed({
+                    if (!isCurrent(service, token)) return@postDelayed
+                    var verifyCallbackConsumed = false
+                    val verifyCallbackTimeout = Runnable {
+                        if (!isCurrent(service, token)) return@Runnable
+                        if (verifyCallbackConsumed) return@Runnable
+                        verifyCallbackConsumed = true
+                        finishSend(service, SendOutcome(false, requestId, "网页发送确认超时"), callback)
                     }
-                }
-            }, verifyDelayMs)
+                    handler.postDelayed(verifyCallbackTimeout, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                    webView.evaluateJavascript(verifySendScript(service, requestId)) { verifyRaw ->
+                        if (!isCurrent(service, token)) return@evaluateJavascript
+                        if (verifyCallbackConsumed) return@evaluateJavascript
+                        verifyCallbackConsumed = true
+                        handler.removeCallbacks(verifyCallbackTimeout)
+                        val sent = verifyRaw == "true"
+                        if (sent) {
+                            finishSuccessfulSend(webView, service, requestId, callback)
+                        } else {
+                            finishSend(service, SendOutcome(false, requestId, "发送后未检测到新消息"), callback)
+                        }
+                    }
+                }, verifyDelayMs)
+            }
         }
     }
 
@@ -620,23 +651,24 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
         attempt: Int = 0,
     ) {
-        val token = automationToken
+        val service = ArenaService.DOUBAO
+        val token = automations[service]
         val clickDelayMs = if (attempt == 0) 900L else 1_400L
         handler.postDelayed({
-            if (destroyed || token != automationToken) return@postDelayed
+            if (!isCurrent(service, token)) return@postDelayed
             webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) {
-                if (destroyed || token != automationToken) return@evaluateJavascript
+                if (!isCurrent(service, token)) return@evaluateJavascript
                 handler.postDelayed({
-                    if (destroyed || token != automationToken) return@postDelayed
+                    if (!isCurrent(service, token)) return@postDelayed
                     webView.evaluateJavascript(verifySendScript(ArenaService.DOUBAO, requestId)) { raw ->
-                        if (destroyed || token != automationToken) return@evaluateJavascript
+                        if (!isCurrent(service, token)) return@evaluateJavascript
                         if (raw == "true") {
                             finishSuccessfulSend(webView, ArenaService.DOUBAO, requestId, callback)
                         } else if (attempt + 1 < DOUBAO_SEND_ATTEMPTS) {
                             verifyDoubaoSend(webView, requestId, callback, attempt + 1)
                         } else {
                             finishSend(
-                                SendOutcome(false, requestId, "豆包发送按钮未响应，请稍后重试"),
+                                service, SendOutcome(false, requestId, "豆包发送按钮未响应，请稍后重试"),
                                 callback,
                             )
                         }
@@ -674,7 +706,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 service !in desiredServices &&
                     service !in protectedServices &&
                     service != uiSelectedService &&
-                    service != automationService
+                    service !in automations
             }
             .toList()
             .forEach(::disposeWebView)
@@ -713,7 +745,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            visibility = if (uiSelectedService == service || automationService == service) View.VISIBLE else View.GONE
+            visibility = if (uiSelectedService == service || service in automations) View.VISIBLE else View.GONE
 
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
@@ -754,7 +786,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     fileChooserParams: FileChooserParams,
                 ): Boolean {
                     if (fileBroker.handle(webView, filePathCallback, fileChooserParams)) return true
-                    if (destroyed || automationService != null || !ArenaFileChooserBroker.trusted(service, webView.url)) {
+                    if (destroyed || service in automations || !ArenaFileChooserBroker.trusted(service, webView.url)) {
                         filePathCallback.onReceiveValue(null)
                         return true
                     }
@@ -803,6 +835,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
                     if (destroyed || webViews[service] !== view) return
+                    val active = automations[service]
+                    // A successful first send may navigate within the provider. Uploads must stay in
+                    // their original document; a send may continue its cursor verification on-site.
+                    if (active != null && (!active.sending || !ArenaFileChooserBroker.trusted(service, url))) {
+                        finishAutomation(service)
+                        active.onInterrupted("${service.displayName} 网页已切换，当前发送已停止，请检查原网页后重试")
+                    }
                     fileBroker.navigated(view)
                     cancelManualChooser(view)
                     val decision = LoginTrustPolicy.duringNavigation(service in confirmedSignedIn)
@@ -847,7 +886,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 }
 
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                    if (destroyed) return true
+                    if (destroyed || webViews[service] !== view) return true
                     fileBroker.destroyed(view)
                     cancelManualChooser(view)
                     statuses[service] = ServiceStatus(
@@ -863,11 +902,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     view.destroy()
                     // 这个 WebView 上所有在途的 JS 回调都不会再回来。
                     // 立刻结束自动化并让调用方失败，不必等 45 秒看门狗。
-                    if (automationService == service) {
-                        val pending = automationOnTimeout
-                        backgroundProbeInProgress = false
-                        finishAutomation()
-                        pending?.invoke()
+                    val pending = automations[service]?.onInterrupted
+                    finishAutomation(service)
+                    pending?.invoke("${service.displayName} 网页进程已退出，请重新加载后重试")
+                    if (backgroundProbeService == service) {
+                        backgroundProbeGeneration++
+                        backgroundProbeService = null
+                        refreshVisibility()
+                        handler.post { drainBackgroundProbes() }
                     }
                     return true
                 }
@@ -905,7 +947,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private fun probe(service: ArenaService) {
         val webView = webViews[service] ?: return
         if (webView.url.isNullOrBlank() || webView.url == "about:blank") return
-        if (uiSelectedService != service || automationService != null) {
+        if (uiSelectedService != service || service in automations) {
             pendingBackgroundProbes += service
             drainBackgroundProbes()
             return
@@ -914,22 +956,25 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun drainBackgroundProbes() {
-        if (backgroundProbeInProgress || automationService != null || uiSelectedService != null) return
+        if (destroyed || backgroundProbeService != null || automations.isNotEmpty() || uiSelectedService != null) return
         val service = pendingBackgroundProbes.firstOrNull() ?: return
         pendingBackgroundProbes.remove(service)
         val webView = webViews[service] ?: return
         if (webView.url.isNullOrBlank() || webView.url == "about:blank") return
-
-        backgroundProbeInProgress = true
-        automationService = service
-        applyVisibility(service, hiddenAutomation = true)
+        backgroundProbeService = service
+        val generation = ++backgroundProbeGeneration
+        refreshVisibility()
         webView.onResume()
         handler.postDelayed({
+            if (destroyed || generation != backgroundProbeGeneration) return@postDelayed
             evaluateLoginState(service) {
-                backgroundProbeInProgress = false
-                finishAutomation()
+                if (generation == backgroundProbeGeneration) {
+                    backgroundProbeService = null
+                    refreshVisibility()
+                    handler.post { drainBackgroundProbes() }
+                }
             }
-        }, 650)
+        }, 650L)
     }
 
     private fun evaluateLoginState(service: ArenaService, onComplete: () -> Unit = {}) {
@@ -939,7 +984,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             return
         }
         // 与自动化链同理：探针的 JS 回调也会随渲染进程一起消失。
-        // 没有兜底的话 backgroundProbeInProgress 会永久为 true，后续自动化全部排队饿死。
+        // 探针超时只结束自身；发送任务不再等待探针，也不借用它的标识。
         var consumed = false
         val timeout = Runnable {
             if (consumed) return@Runnable
@@ -1562,11 +1607,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
-        private const val AUTOMATION_QUEUE_INTERVAL_MS = 200L
-        private const val AUTOMATION_QUEUE_TIMEOUT_MS = 20_000L
+        private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
         private const val MODE_PROBE_TIMEOUT_MS = 4_000L
-        /** 开新对话 / 切历史对话的整页加载上限；超过就放弃等待，直接尝试发送。 */
+        /** 开新对话 / 切历史对话的整页加载上限；超时向调用方报告失败。 */
         private const val NAVIGATION_TIMEOUT_MS = 20_000L
         /** onPageFinished 之后再等一会儿，让单页应用把输入框画出来。 */
         private const val NAVIGATION_SETTLE_MS = 900L

@@ -292,13 +292,13 @@ class ArenaSessionController(
         schedulePersist()
         val sendTimeout = Runnable {
             if (isSummaryActive(execution) && summary.phase == ParticipantPhase.SENDING) {
-                pool.cancelAutomation()
+                pool.cancelAutomation(judge)
                 summary = summary.copy(phase = ParticipantPhase.ERROR, detail = "总结发送超时，已停止；可打开原网页确认")
                 summaryExecution = null
                 schedulePersist()
             }
         }
-        handler.postDelayed(sendTimeout, if (attachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
+        handler.postDelayed(sendTimeout, if (attachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
         pool.sendPromptWithAttachments(judge, prompt, requestId, attachments) { outcome ->
             if (!isSummaryActive(execution)) return@sendPromptWithAttachments
             handler.removeCallbacks(sendTimeout)
@@ -529,14 +529,11 @@ class ArenaSessionController(
             RoundKind.DEBATE -> SessionStage.DEBATE
         }
         sessionMessage = when (answerMode) {
-            AnswerMode.PARALLEL -> "正在快速发送第 $roundNumber 轮，${services.size} 家将并行生成"
+            AnswerMode.PARALLEL -> "第 $roundNumber 轮：${services.size} 家正在独立发送和回答"
             AnswerMode.SERIAL -> "正在串行执行第 $roundNumber 轮"
         }
 
-        val dispatchOrder = when (answerMode) {
-            AnswerMode.PARALLEL -> services.sortedBy { if (it == ArenaService.DOUBAO) 1 else 0 }
-            AnswerMode.SERIAL -> services
-        }
+        val dispatchOrder = services
         val execution = RoundExecution(
             epoch = sessionEpoch,
             number = roundNumber,
@@ -550,8 +547,7 @@ class ArenaSessionController(
             startedAtMillis = System.currentTimeMillis(),
             requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
         )
-        // 点下按钮的这一刻，所有参与者一起进入"已排队"：网页池只能逐家发送，
-        // 以前排在后面的成员要等前面发完才有动静，用户以为只有第一家收到了命令。
+        // 所有参与者立即有请求号和准备状态；并行发送不等其他成员的发送回调。
         ArenaService.entries.forEach { service ->
             runs[service] = if (service in services) {
                 ParticipantRun(
@@ -568,60 +564,55 @@ class ArenaSessionController(
         activeExecution = execution
         pool.setProtectedServices(services.toSet())
         schedulePersist()
-        val dispatch = {
+        if (kind == RoundKind.INITIAL) {
+            // 新问题必须发进干净的新对话，否则 AI 带着上一题的上下文作答
+            prepareFreshConversations(execution)
+        } else {
             when (answerMode) {
                 AnswerMode.PARALLEL -> dispatchParallel(execution)
                 AnswerMode.SERIAL -> dispatchSerialNext(execution)
             }
         }
-        if (kind == RoundKind.INITIAL) {
-            // 新问题必须发进干净的新对话，否则 AI 带着上一题的上下文作答
-            prepareFreshConversations(execution, dispatch)
-        } else {
-            dispatch()
-        }
         return true
     }
 
-    /** 排队中的成员显示自己排在第几位，让"还没轮到"和"卡住了"能区分开。 */
+    /** 准备网页与串行等待是两种状态，不再给并行成员标发送排位。 */
     private fun queuedDetail(execution: RoundExecution, service: ArenaService): String {
         val position = execution.dispatchOrder.indexOf(service) + 1
         return when {
+            execution.answerMode == AnswerMode.PARALLEL -> "已收到，准备独立发送"
             position <= 1 -> "已收到，马上发送"
-            execution.answerMode == AnswerMode.SERIAL -> "已收到，等上一家答完再发"
-            else -> "已收到，排第 $position 位发送"
+            else -> "已收到，等上一家答完再发"
         }
     }
 
     /**
-     * 让每家网页先回到新对话，都就绪（或超时）后再开始发送。
-     * 页面加载互不影响，所以是同时发起、一起等，不会把新问题的启动时间乘以成员数。
+     * 每家独立开新对话，就绪的一家可立即发送；失败与丢失回调只影响本家。
+     * 不在新对话尚未确认时冒险发送，否则可能串入上一个问题。
      */
-    private fun prepareFreshConversations(execution: RoundExecution, then: () -> Unit) {
-        val pending = execution.services.toMutableSet()
-        var finished = false
-        val proceed = {
-            if (!finished && isActive(execution)) {
-                finished = true
-                execution.services.forEach { service ->
-                    val run = runs.getValue(service)
-                    if (run.phase == ParticipantPhase.QUEUED) {
-                        runs[service] = run.copy(detail = queuedDetail(execution, service))
-                    }
-                }
-                then()
-            }
-        }
+    private fun prepareFreshConversations(execution: RoundExecution) {
         execution.services.forEach { service ->
             runs[service] = runs.getValue(service).copy(detail = "已收到，正在打开新对话…")
-            pool.openFreshConversation(service) {
-                if (!isActive(execution)) return@openFreshConversation
-                pending.remove(service)
-                if (pending.isEmpty()) proceed()
+            var settled = false
+            fun ready(ok: Boolean) {
+                if (settled || !isActive(execution)) return
+                settled = true
+                execution.freshReadiness[service] = ok
+                when (execution.answerMode) {
+                    AnswerMode.PARALLEL -> dispatchParallelService(execution, service)
+                    AnswerMode.SERIAL -> {
+                        runs[service] = runs.getValue(service).copy(detail = queuedDetail(execution, service))
+                        dispatchSerialNext(execution)
+                    }
+                }
+            }
+            val timeout = Runnable { ready(false) }
+            handler.postDelayed(timeout, timing.freshConversationTimeoutMillis)
+            pool.openFreshConversation(service) { ok ->
+                handler.removeCallbacks(timeout)
+                ready(ok)
             }
         }
-        // 网页池自己有加载超时；这里再兜一层，防止某个回调彻底丢失把整轮卡死
-        handler.postDelayed({ proceed() }, FRESH_CONVERSATION_TIMEOUT_MILLIS)
     }
 
     private fun rememberConversationUrl(service: ArenaService) {
@@ -676,33 +667,61 @@ class ArenaSessionController(
             pollRecovery(execution)
             return true
         }
+        var sendSettled = false
         val sendTimeout = Runnable {
             if (isRecoveryActive(execution) && runs[service]?.phase == ParticipantPhase.SENDING) {
-                pool.cancelAutomation()
+                sendSettled = true
+                pool.cancelAutomation(service)
                 finishRecovery(execution, runs.getValue(service).copy(phase = ParticipantPhase.ERROR, detail = "重发超时，已停止；请打开原网页确认"))
             }
         }
-        handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
-        pool.sendPromptWithAttachments(service, prompt.orEmpty(), requestId, lastRoundAttachments) { outcome ->
-            if (!isRecoveryActive(execution)) return@sendPromptWithAttachments
-            handler.removeCallbacks(sendTimeout)
-            if (outcome.success) {
-                runs[service] = runs.getValue(service).copy(
-                    phase = ParticipantPhase.WAITING,
-                    detail = "重发成功，等待回答",
-                )
-                schedulePersist()
-                pollRecovery(execution)
-            } else {
-                finishRecovery(
-                    execution,
-                    runs.getValue(service).copy(
-                        phase = ParticipantPhase.ERROR,
-                        detail = "重发失败：${outcome.detail.take(100)}",
-                    ),
-                )
+        handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
+        val send = send@{
+            if (sendSettled || !isRecoveryActive(execution)) return@send
+            pool.sendPromptWithAttachments(service, prompt.orEmpty(), requestId, lastRoundAttachments) { outcome ->
+                if (sendSettled || !isRecoveryActive(execution)) return@sendPromptWithAttachments
+                sendSettled = true
+                handler.removeCallbacks(sendTimeout)
+                if (outcome.success) {
+                    runs[service] = runs.getValue(service).copy(
+                        phase = ParticipantPhase.WAITING,
+                        detail = "重发成功，等待回答",
+                    )
+                    schedulePersist()
+                    pollRecovery(execution)
+                } else {
+                    finishRecovery(
+                        execution,
+                        runs.getValue(service).copy(
+                            phase = ParticipantPhase.ERROR,
+                            detail = "重发失败：${outcome.detail.take(100)}",
+                        ),
+                    )
+                }
             }
         }
+        if (currentRoundKind == RoundKind.INITIAL) {
+            runs[service] = runs.getValue(service).copy(detail = "重发前正在确认新对话")
+            var freshSettled = false
+            fun ready(ok: Boolean) {
+                if (freshSettled || sendSettled || !isRecoveryActive(execution)) return
+                freshSettled = true
+                if (ok) send() else {
+                    sendSettled = true
+                    handler.removeCallbacks(sendTimeout)
+                    finishRecovery(execution, runs.getValue(service).copy(
+                        phase = ParticipantPhase.ERROR,
+                        detail = "重发前新对话未能就绪，未发送；请打开原网页确认",
+                    ))
+                }
+            }
+            val freshTimeout = Runnable { ready(false) }
+            handler.postDelayed(freshTimeout, timing.freshConversationTimeoutMillis)
+            pool.openFreshConversation(service) { ok ->
+                handler.removeCallbacks(freshTimeout)
+                ready(ok)
+            }
+        } else send()
         return true
     }
 
@@ -849,28 +868,28 @@ class ArenaSessionController(
     }
 
     private fun dispatchParallel(execution: RoundExecution) {
-        if (!isActive(execution)) return
-        val service = execution.dispatchOrder.getOrNull(execution.nextDispatchIndex)
-        if (service == null) {
-            execution.dispatchComplete = true
-            sessionMessage = "第 ${execution.number} 轮已全部送达，正在并行等待回答"
-            maybeFinishRound(execution)
-            return
-        }
-        execution.nextDispatchIndex += 1
+        execution.dispatchOrder.forEach { dispatchParallelService(execution, it) }
+    }
+
+    private fun dispatchParallelService(execution: RoundExecution, service: ArenaService) {
+        if (!isActive(execution) || !execution.dispatchedServices.add(service)) return
+        execution.dispatchComplete = execution.dispatchedServices.size == execution.services.size
         sendService(execution, service) {
-            dispatchParallel(execution)
+            maybeFinishRound(execution)
         }
     }
 
     private fun dispatchSerialNext(execution: RoundExecution) {
         if (!isActive(execution)) return
+        // 其他成员的网页可能先加载好，但串行模式仍须等待当前成员回答结束。
+        if (execution.services.any { runs.getValue(it).phase in setOf(ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING) }) return
         val service = execution.dispatchOrder.getOrNull(execution.nextDispatchIndex)
         if (service == null) {
             execution.dispatchComplete = true
             maybeFinishRound(execution)
             return
         }
+        if (execution.kind == RoundKind.INITIAL && service !in execution.freshReadiness) return
         execution.nextDispatchIndex += 1
         sessionMessage = "串行模式：正在发送给 ${service.displayName}"
         sendService(execution, service) { sent ->
@@ -890,14 +909,24 @@ class ArenaSessionController(
     ) {
         if (!isActive(execution)) return
         val requestId = execution.requestIds.getValue(service)
+        if (execution.kind == RoundKind.INITIAL && execution.freshReadiness[service] != true) {
+            runs[service] = ParticipantRun(
+                phase = ParticipantPhase.ERROR,
+                requestId = requestId,
+                detail = "新对话未能就绪，未发送；请打开原网页确认后重试",
+            )
+            onSendFinished(false)
+            schedulePersist()
+            maybeFinishRound(execution)
+            return
+        }
         runs[service] = ParticipantRun(
             phase = ParticipantPhase.SENDING,
             requestId = requestId,
             detail = "正在发送",
         )
         schedulePersist()
-        // 并行模式下一家是在上一家 send 回调之后才发的，所以任何一次回调丢失
-        // 都会让整轮永远停在"正在发送"。这里做控制器侧的兜底。
+        // 每家独立兜底，不能因一家丢失回调而取消其他成员的在途上传和发送。
         var sendSettled = false
         val sendTimeout = Runnable {
             if (sendSettled) return@Runnable
@@ -909,12 +938,12 @@ class ArenaSessionController(
                 requestId = requestId,
                 detail = "发送无响应，已停止等待",
             )
-            pool.cancelAutomation()
+            pool.cancelAutomation(service)
             onSendFinished(false)
             schedulePersist()
             maybeFinishRound(execution)
         }
-        handler.postDelayed(sendTimeout, if (execution.attachments.isEmpty()) SEND_HARD_TIMEOUT_MILLIS else ATTACHMENT_SEND_TIMEOUT_MILLIS)
+        handler.postDelayed(sendTimeout, if (execution.attachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
         pool.sendPromptWithAttachments(
             service = service,
             prompt = execution.prompts.getValue(service),
@@ -1444,6 +1473,8 @@ class ArenaSessionController(
         val startedAtMillis: Long,
         /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示"已排队"。 */
         val requestIds: Map<ArenaService, String>,
+        val freshReadiness: MutableMap<ArenaService, Boolean> = mutableMapOf(),
+        val dispatchedServices: MutableSet<ArenaService> = mutableSetOf(),
         var nextDispatchIndex: Int = 0,
         var dispatchComplete: Boolean = false,
     )
@@ -1487,12 +1518,6 @@ class ArenaSessionController(
     private companion object {
         // 流式回答期间事件间隔约 500ms，250ms 的去抖等于没有去抖。
         const val PERSIST_DEBOUNCE_MILLIS = 1_200L
-
-        /** 单家发送的端到端上限，比 WebView 池自身的看门狗更宽，只做最后兜底。 */
-        const val SEND_HARD_TIMEOUT_MILLIS = 60_000L
-        const val ATTACHMENT_SEND_TIMEOUT_MILLIS = 200_000L
-        /** 新问题前等各家网页开好新对话的上限；超时就直接发，发不进去会走原有的失败路径。 */
-        const val FRESH_CONVERSATION_TIMEOUT_MILLIS = 25_000L
 
         /** 超过这个秒数还一个字都没读到，就把文案换成可操作的排查提示。 */
         const val STALL_HINT_SECONDS = 75L

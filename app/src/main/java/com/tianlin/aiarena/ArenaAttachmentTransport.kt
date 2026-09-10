@@ -8,7 +8,11 @@ import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.File
 
-internal class ArenaAttachmentTransport(private val handler: Handler, private val fileBroker: ArenaFileChooserBroker) {
+internal class ArenaAttachmentTransport(
+    private val handler: Handler,
+    private val fileBroker: ArenaFileChooserBroker,
+    private val withFocus: (((() -> Unit) -> Unit) -> Unit) = { action -> action {} },
+) {
     fun upload(
         webView: WebView,
         service: ArenaService,
@@ -43,26 +47,33 @@ internal class ArenaAttachmentTransport(private val handler: Handler, private va
                 if (delivered) "${service.displayName} 附件上传或解析未确认完成，未发送问题；请到原网页查看后重试"
                 else "${service.displayName} 未提供可用的附件上传入口，未发送问题；请登录并检查网页是否支持附件",
             )
-            val script = if (delivered) ArenaAttachmentScript.readiness(requestId, service) else ArenaAttachmentScript.nextControl(requestId, service)
-            webView.evaluateJavascript(script) { raw ->
-                if (!current()) return@evaluateJavascript
-                val result = try { JSONObject(decode(raw)) } catch (_: Exception) { return@evaluateJavascript finish("网页附件状态无法读取，未发送问题") }
-                if (result.has("error")) return@evaluateJavascript finish(result.optString("error"))
-                if (delivered && result.optBoolean("ready")) return@evaluateJavascript finish(null)
-                if (!delivered && result.has("x")) {
-                    val ratio = webView.width / result.optDouble("width", 1.0)
-                    val x = (result.getDouble("x") * ratio).toFloat()
-                    val y = (result.getDouble("y") * ratio).toFloat()
-                    if (x < 0 || y < 0 || x > webView.width || y > webView.height) return@evaluateJavascript finish("附件入口超出网页显示区域，请打开原网页重试")
-                    val downAt = SystemClock.uptimeMillis()
-                    MotionEvent.obtain(downAt, downAt, MotionEvent.ACTION_DOWN, x, y, 0).let { event -> webView.dispatchTouchEvent(event); event.recycle() }
-                    handler.postDelayed({
-                        if (!current()) return@postDelayed
-                        MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0).let { event -> webView.dispatchTouchEvent(event); event.recycle() }
-                    }, 100L)
+            fun inspect(release: () -> Unit) {
+                if (!current()) { release(); return }
+                val script = if (delivered) ArenaAttachmentScript.readiness(requestId, service) else ArenaAttachmentScript.nextControl(requestId, service)
+                webView.evaluateJavascript(script) { raw ->
+                    if (!current()) { release(); return@evaluateJavascript }
+                    val result = try { JSONObject(decode(raw)) } catch (_: Exception) { release(); return@evaluateJavascript finish("网页附件状态无法读取，未发送问题") }
+                    if (result.has("error")) { release(); return@evaluateJavascript finish(result.optString("error")) }
+                    if (delivered && result.optBoolean("ready")) { release(); return@evaluateJavascript finish(null) }
+                    if (!delivered && result.has("x")) {
+                        val ratio = webView.width / result.optDouble("width", 1.0)
+                        val x = (result.getDouble("x") * ratio).toFloat()
+                        val y = (result.getDouble("y") * ratio).toFloat()
+                        if (x < 0 || y < 0 || x > webView.width || y > webView.height) { release(); return@evaluateJavascript finish("附件入口超出网页显示区域，请打开原网页重试") }
+                        val downAt = SystemClock.uptimeMillis()
+                        MotionEvent.obtain(downAt, downAt, MotionEvent.ACTION_DOWN, x, y, 0).let { event -> webView.dispatchTouchEvent(event); event.recycle() }
+                        handler.postDelayed({
+                            // A cancelled lease may already have been replaced on this same WebView.
+                            // Never deliver an old UP/CANCEL to the newer gesture (or a destroyed view).
+                            if (!current()) { release(); return@postDelayed }
+                            MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0).let { event -> webView.dispatchTouchEvent(event); event.recycle() }
+                            release()
+                        }, 100L)
+                    } else release()
+                    handler.postDelayed({ poll() }, 650L)
                 }
-                handler.postDelayed({ poll() }, 650L)
             }
+            if (delivered) inspect {} else withFocus(::inspect)
         }
         webView.evaluateJavascript(ArenaAttachmentScript.prepare(requestId, files.map { it.first }, service)) { raw ->
             if (current()) {

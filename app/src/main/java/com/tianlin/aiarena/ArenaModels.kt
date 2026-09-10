@@ -123,11 +123,7 @@ object LoginTrustPolicy {
 enum class ParticipantPhase {
     IDLE,
     /**
-     * 本轮已经把它算上、请求号已分配，只是还没轮到它发送。
-     *
-     * 网页池同一时刻只能驱动一个页面，所谓"并行"其实是逐家发送；此前排在后面的成员
-     * 在轮到自己之前一直是 IDLE，卡片上什么都不显示，用户以为"只有第一家收到了命令"。
-     * 有了这个状态，点下「开始讨论」的那一刻三家一起动起来。
+     * 请求号已分配，正在准备该成员的新对话；串行模式下也用于等待上一家答完。
      */
     QUEUED,
     SENDING,
@@ -162,7 +158,7 @@ data class ParticipantRun(
 enum class AnswerMode(val displayName: String, val description: String) {
     PARALLEL(
         displayName = "并行回答",
-        description = "快速依次送达，三家生成过程相互重叠",
+        description = "各家独立发送和回答，慢的一家不拖住其他成员",
     ),
     SERIAL(
         displayName = "串行回答",
@@ -319,6 +315,9 @@ interface ArenaGateway {
      */
     fun cancelAutomation() = Unit
 
+    /** 仅停止这一家的发送；不能撤销其他成员的上传、焦点任务或超时看门狗。 */
+    fun cancelAutomation(service: ArenaService) = Unit
+
     /**
      * 声明这些成员的网页在本轮结束前不能被回收。
      *
@@ -349,6 +348,10 @@ data class ControllerTiming(
     val responseTimeoutMillis: Long = 300_000L,
     val maxConsecutiveReadErrors: Int = 5,
     val requiredStablePolls: Int = 2,
+    /** 控制器端到端兜底，须比网页池内部超时宽；测试可缩短以验证失联回调。 */
+    val sendTimeoutMillis: Long = 60_000L,
+    val attachmentSendTimeoutMillis: Long = 200_000L,
+    val freshConversationTimeoutMillis: Long = 25_000L,
 )
 
 object ArenaLimits {

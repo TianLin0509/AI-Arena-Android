@@ -320,6 +320,262 @@ class ArenaSessionControllerInstrumentedTest {
     }
 
     @Test
+    fun parallelModeStartsEverySendBeforeAnySendAcknowledgement() {
+        val gateway = DeferredSendGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                assertTrue(controller.startInitial("parallel dispatch", ArenaService.defaultMembers, AnswerMode.PARALLEL))
+                assertEquals(ArenaService.defaultMembers.toSet(), gateway.sentServices.toSet())
+                assertEquals(3, gateway.sentServices.size)
+                assertTrue(ArenaService.defaultMembers.all { controller.runs.getValue(it).phase == ParticipantPhase.SENDING })
+            }
+        } finally {
+            onMain { controller.destroy() }
+        }
+    }
+
+    @Test
+    fun slowFreshConversationDoesNotDelayOtherMembersOrDispatchTwice() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                assertTrue(controller.startInitial("fresh independently", ArenaService.defaultMembers))
+                assertEquals(setOf(ArenaService.DOUBAO, ArenaService.KIMI), gateway.sentServices.toSet())
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitProviderPhase(controller, ArenaService.DOUBAO, ParticipantPhase.COMPLETE)
+            awaitProviderPhase(controller, ArenaService.KIMI, ParticipantPhase.COMPLETE)
+            onMain {
+                assertEquals(ParticipantPhase.QUEUED, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertTrue(controller.history.isEmpty())
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                assertEquals(3, gateway.sentServices.size)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitHistorySize(controller, 1)
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun failedOrMissingFreshConversationNeverSendsIntoTheOldConversation() {
+        val gateway = ControlledGateway(heldFresh = ArenaService.defaultMembers.toSet())
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(freshConversationTimeoutMillis = 180)) }
+        try {
+            onMain {
+                controller.startInitial("fresh failure", ArenaService.defaultMembers)
+                gateway.completeFresh(ArenaService.DOUBAO, false)
+                gateway.completeFresh(ArenaService.KIMI, true)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain {
+                assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.KIMI).phase)
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                gateway.completeFresh(ArenaService.DOUBAO, true)
+                assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
+                assertEquals(1, controller.history.size)
+            }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun retryOfFailedInitialFreshConversationStillRequiresANewConversation() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(freshConversationTimeoutMillis = 180)) }
+        try {
+            onMain {
+                controller.startInitial("retry initial safely", ArenaService.defaultMembers)
+                gateway.completeFresh(ArenaService.DEEPSEEK, false)
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain {
+                assertTrue(controller.retrySend(ArenaService.DEEPSEEK))
+                assertEquals(setOf(ArenaService.DOUBAO, ArenaService.KIMI), gateway.sentServices.toSet())
+                gateway.completeFresh(ArenaService.DEEPSEEK, false)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertTrue(controller.retrySend(ArenaService.DEEPSEEK))
+            }
+            // A missing retry navigation callback must stop, rather than falling through to send.
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.ERROR)
+            onMain {
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                assertEquals(2, gateway.sentServices.size)
+                assertTrue(controller.retrySend(ArenaService.DEEPSEEK))
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                assertEquals(3, gateway.sentServices.size)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun iterationRetryAndExtractionKeepTheExistingConversation() {
+        val gateway = ControlledGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                controller.startInitial("initial conversation", ArenaService.defaultMembers)
+                ArenaService.defaultMembers.forEach { gateway.completeSend(it) }
+            }
+            awaitHistorySize(controller, 1)
+            onMain {
+                controller.startIteration(guidance = "followup in the same conversation")
+                gateway.completeSend(ArenaService.DEEPSEEK, false)
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 2)
+            onMain {
+                assertTrue(controller.retryExtraction(ArenaService.DEEPSEEK))
+                assertEquals(6, gateway.sentServices.size)
+                assertEquals(3, gateway.freshCalls.size)
+            }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+            onMain {
+                assertTrue(controller.retrySend(ArenaService.DEEPSEEK))
+                assertEquals(7, gateway.sentServices.size)
+                assertEquals(3, gateway.freshCalls.size)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun attachmentSendTimeoutCancelsOnlyItsMemberAndIgnoresItsLateAcknowledgement() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DOUBAO, ArenaService.KIMI))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(attachmentSendTimeoutMillis = 1_000)) }
+        try {
+            onMain { controller.startInitial("parallel attachment", ArenaService.defaultMembers, attachments = listOf(attachmentFixture)) }
+            Thread.sleep(500)
+            onMain {
+                gateway.completeFresh(ArenaService.DOUBAO, true)
+                gateway.completeFresh(ArenaService.KIMI, true)
+                assertEquals(3, gateway.sentServices.size)
+                assertTrue(gateway.attachments.values.all { it == listOf(attachmentFixture) })
+            }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.ERROR)
+            onMain {
+                assertEquals(listOf(ArenaService.DEEPSEEK), gateway.cancelledServices)
+                assertEquals(0, gateway.globalCancels)
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.KIMI).phase)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain { assertEquals(2, controller.completedCount) }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun oneSendFailureLeavesTheOtherConcurrentSendsRunning() {
+        val gateway = ControlledGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                controller.startInitial("one failed send", ArenaService.defaultMembers)
+                gateway.completeSend(ArenaService.DEEPSEEK, false)
+                assertEquals(3, gateway.sentServices.size)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                assertEquals(0, gateway.globalCancels)
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain { assertEquals(2, controller.completedCount) }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun stopAndNewRoundIgnoreEveryOldSendAndFreshCallback() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.KIMI))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                controller.startInitial("old round", ArenaService.defaultMembers)
+                val oldSends = gateway.pendingSends.values.toList()
+                val oldFresh = gateway.freshCallbacks.getValue(ArenaService.KIMI)
+                controller.cancelCurrentRound()
+                assertEquals(1, gateway.globalCancels)
+                assertEquals(1, controller.history.size)
+                controller.reset()
+                assertEquals(2, gateway.globalCancels)
+                controller.startInitial("new round", ArenaService.defaultMembers)
+                val newIds = controller.runs.mapValues { it.value.requestId }
+                oldSends.forEach { (id, callback) -> callback(SendOutcome(true, id, "late old round")) }
+                oldFresh(true)
+                assertEquals(newIds, controller.runs.mapValues { it.value.requestId })
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals(ParticipantPhase.QUEUED, controller.runs.getValue(ArenaService.KIMI).phase)
+                gateway.completeFresh(ArenaService.KIMI, true)
+                ArenaService.defaultMembers.forEach { gateway.completeSend(it) }
+            }
+            awaitHistorySize(controller, 1)
+            onMain {
+                assertEquals("new round", controller.originalQuestion)
+                assertEquals(3, controller.completedCount)
+            }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun serialModeKeepsOrderWhenFreshPagesBecomeReadyOutOfOrder() {
+        val gateway = ControlledGateway(heldFresh = ArenaService.defaultMembers.toSet())
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                controller.startInitial("serial freshness", ArenaService.defaultMembers, AnswerMode.SERIAL)
+                gateway.completeFresh(ArenaService.KIMI, true)
+                gateway.completeFresh(ArenaService.DOUBAO, true)
+                assertTrue(gateway.sentServices.isEmpty())
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                assertEquals(listOf(ArenaService.DEEPSEEK), gateway.sentServices)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitProviderPhase(controller, ArenaService.DOUBAO, ParticipantPhase.SENDING)
+            onMain {
+                assertEquals(listOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO), gateway.sentServices)
+                gateway.completeSend(ArenaService.DOUBAO)
+            }
+            awaitProviderPhase(controller, ArenaService.KIMI, ParticipantPhase.SENDING)
+            onMain { gateway.completeSend(ArenaService.KIMI) }
+            awaitHistorySize(controller, 1)
+            onMain { assertEquals(ArenaService.defaultMembers, gateway.sentServices) }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun parallelDispatchIncludesAllFourSelectedMembers() {
+        val members = ArenaService.defaultMembers + ArenaService.QWEN
+        val gateway = ControlledGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming) }
+        try {
+            onMain {
+                controller.startInitial("four independent sends", members)
+                assertEquals(members.toSet(), gateway.sentServices.toSet())
+                assertEquals(4, gateway.sentServices.size)
+                members.reversed().forEach { gateway.completeSend(it) }
+            }
+            awaitHistorySize(controller, 1)
+            onMain { assertEquals(4, controller.completedCount) }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
     fun parallelModeDispatchesAllBeforeResponsesFinish() {
         val gateway = FakeGateway()
         val controller = onMain { ArenaSessionController(gateway, fastTiming) }
@@ -327,7 +583,7 @@ class ArenaSessionControllerInstrumentedTest {
         onMain {
             assertTrue(controller.startInitial("并行测试", ArenaService.defaultMembers, AnswerMode.PARALLEL))
             assertEquals(
-                listOf(ArenaService.DEEPSEEK, ArenaService.KIMI, ArenaService.DOUBAO),
+                ArenaService.defaultMembers,
                 gateway.sentServices.toList(),
             )
             assertEquals(SessionStage.INITIAL, controller.stage)
@@ -1051,6 +1307,45 @@ class ArenaSessionControllerInstrumentedTest {
                 )
             }
         }
+    }
+
+    private class ControlledGateway(private val heldFresh: Set<ArenaService> = emptySet()) : ArenaGateway {
+        val pendingSends = mutableMapOf<ArenaService, Pair<String, (SendOutcome) -> Unit>>()
+        val freshCallbacks = mutableMapOf<ArenaService, (Boolean) -> Unit>()
+        val freshCalls = mutableListOf<ArenaService>()
+        val sentServices = mutableListOf<ArenaService>()
+        val attachments = mutableMapOf<ArenaService, List<ArenaAttachment>>()
+        val cancelledServices = mutableListOf<ArenaService>()
+        var globalCancels = 0
+
+        override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) {
+            freshCalls += service
+            freshCallbacks[service] = callback
+            if (service !in heldFresh) callback(true)
+        }
+
+        fun completeFresh(service: ArenaService, ok: Boolean) = freshCallbacks.getValue(service)(ok)
+        fun completeSend(service: ArenaService, ok: Boolean = true) {
+            val (id, callback) = pendingSends.getValue(service)
+            callback(SendOutcome(ok, id, if (ok) "acknowledged" else "upload rejected"))
+        }
+
+        override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+            attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+            this.attachments[service] = attachments.toList()
+            sendPrompt(service, prompt, requestId, callback)
+        }
+
+        override fun sendPrompt(service: ArenaService, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
+            sentServices += service
+            pendingSends[service] = requestId to callback
+        }
+
+        override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) =
+            callback(ResponseSnapshot(found = true, text = "${service.name} independent answer", streaming = false))
+
+        override fun cancelAutomation() { globalCancels += 1 }
+        override fun cancelAutomation(service: ArenaService) { cancelledServices += service }
     }
 
     private class DeferredSendGateway : ArenaGateway {
