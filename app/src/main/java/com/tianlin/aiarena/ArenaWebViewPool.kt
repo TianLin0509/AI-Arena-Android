@@ -144,10 +144,22 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             val webView = webViews[candidate]
             val active = candidate == front || candidate == uiSelectedService || candidate in automations || candidate == backgroundProbeService
             val visible = active && automations[candidate]?.parked != true
+            if (webView != null) updateWebViewInteraction(candidate, webView, visible)
             webView?.visibility = if (visible) View.VISIBLE else View.GONE
             webView?.alpha = if (candidate == front) 1f else 0.01f
         }
         webViews[front]?.bringToFront()
+    }
+
+    private fun updateWebViewInteraction(service: ArenaService, webView: WebView, visible: Boolean) {
+        val userPage = visible && focusAction == null && uiSelectedService == service
+        val acceptsFocus = visible && (userPage || focusAction?.service == service)
+        // Alpha only hides drawing: a laid-out background page can still request Android focus.
+        // Keep probes/upload waits non-focusable without hiding a user's Compose keyboard.
+        webView.isFocusableInTouchMode = acceptsFocus
+        webView.isFocusable = acceptsFocus
+        webView.importantForAccessibility = if (userPage) View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+            else View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
     }
 
     fun open(service: ArenaService) {
@@ -916,6 +928,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             }
         }
 
+        updateWebViewInteraction(service, webView, webView.visibility == View.VISIBLE)
         webViews[service] = webView
         container.addView(webView)
         webView.loadUrl(service.url)

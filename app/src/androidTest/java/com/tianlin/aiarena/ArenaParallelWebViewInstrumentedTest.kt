@@ -5,6 +5,23 @@ import android.os.SystemClock
 import android.view.View
 import android.webkit.WebView
 import android.widget.FrameLayout
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.unit.dp
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import org.json.JSONArray
@@ -16,6 +33,7 @@ import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Production pool/client/broker/scripts, with isolated pages shaped like the three provider editors. */
 class ArenaParallelWebViewInstrumentedTest {
@@ -23,6 +41,87 @@ class ArenaParallelWebViewInstrumentedTest {
     private val context get() = instrumentation.targetContext
     private val members = ArenaService.defaultMembers
     private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
+
+    @Test fun backgroundProbeCannotAcquireNativeFocusOrExposeHiddenWebContent() {
+        withPool(emptyMap()) { pool, views, _ ->
+            startBackgroundProbe(pool)
+            onMain {
+                val service = field(pool, "backgroundProbeService") as ArenaService
+                val view = views.getValue(service)
+                assertEquals(View.VISIBLE, view.visibility)
+                assertFalse("Hidden probe must reject native focus", view.requestFocus())
+                assertFalse(view.hasFocus())
+                assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS, view.importantForAccessibility)
+                pool.show(service)
+                assertTrue("Opening original page must restore native focus", view.requestFocus())
+                assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, view.importantForAccessibility)
+            }
+        }
+    }
+
+    @Test fun backgroundProbePreservesTheUsersComposeFocusAndOpenKeyboard() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val editorFocus = FocusRequester()
+            val editorFocused = AtomicBoolean(false)
+            val ready = AtomicBoolean(false)
+            var showKeyboard: () -> Unit = {}
+            lateinit var compose: ComposeView
+            onMain {
+                pool.show(ArenaService.KIMI)
+                pool.cancelAutomation()
+                val host = pool.container.parent as FrameLayout
+                compose = ComposeView(host.context)
+                host.addView(compose, FrameLayout.LayoutParams(-1, -1))
+                compose.setContent {
+                    val value = remember { mutableStateOf("") }
+                    val keyboard = LocalSoftwareKeyboardController.current
+                    SideEffect { showKeyboard = { keyboard?.show() }; ready.set(true) }
+                    Box(Modifier.fillMaxSize()) {
+                        BasicTextField(
+                            value = value.value,
+                            onValueChange = { value.value = it },
+                            modifier = Modifier.fillMaxWidth().height(80.dp)
+                                .focusRequester(editorFocus).onFocusChanged { editorFocused.set(it.isFocused) },
+                        )
+                    }
+                }
+            }
+            waitUntil("Compose input mounted") { ready.get() }
+            onMain { editorFocus.requestFocus(); showKeyboard() }
+            fun imeVisible(): Boolean {
+                var visible = false
+                onMain { visible = ViewCompat.getRootWindowInsets(compose)?.isVisible(WindowInsetsCompat.Type.ime()) == true }
+                return visible
+            }
+            waitUntil("User keyboard opened") { editorFocused.get() && imeVisible() }
+            startBackgroundProbe(pool)
+            onMain {
+                val probing = field(pool, "backgroundProbeService") as ArenaService
+                assertFalse("Probe cannot steal the Compose editor", views.getValue(probing).requestFocus())
+            }
+            waitUntil("background probes finish") {
+                var complete = false
+                onMain { complete = field(pool, "backgroundProbeService") == null }
+                complete
+            }
+            assertTrue("User Compose editor keeps focus", editorFocused.get())
+            assertTrue("Probe completion must not hide the user's keyboard", imeVisible())
+        }
+    }
+
+    private fun startBackgroundProbe(pool: ArenaWebViewPool) {
+        onMain {
+            pool.show(ArenaService.KIMI)
+            pool.cancelAutomation()
+            pool.probeAll()
+            pool.show(null)
+        }
+        waitUntil("background probe started") {
+            var active = false
+            onMain { active = field(pool, "backgroundProbeService") != null }
+            active
+        }
+    }
 
     @Test fun slowUploadDoesNotBlockOtherProvidersAndTabChangesKeepFilesAndPromptsSeparate() {
         withPool(mapOf(ArenaService.DEEPSEEK to 8_000L)) { pool, views, attachment ->
