@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.View
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
@@ -52,6 +53,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         var watchdog: Runnable? = null
         var parked = false
         var sending = false
+        var cancelNativeTouch: (() -> Unit)? = null
+        var nativeUpPending = false
     }
     private val automations = mutableMapOf<ArenaService, Automation>()
     private val serviceEpochs = mutableMapOf<ArenaService, Long>()
@@ -384,7 +387,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
                     if (!isCurrent(service, token)) return@upload
                     if (error != null) finishSend(service, SendOutcome(false, requestId, error), callback)
-                    else sendStandard(webView, service, fullPrompt, requestId, callback)
+                    else sendStandard(webView, service, fullPrompt, requestId, callback, nativeAttachmentSend = service == ArenaService.DOUBAO)
                 }
             }
         }
@@ -549,10 +552,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun finishAutomation(service: ArenaService) {
         val token = automations.remove(service) ?: return
+        val cancelTouch = token.cancelNativeTouch
+        token.cancelNativeTouch = null
+        cancelTouch?.invoke()
         token.watchdog?.let(handler::removeCallbacks)
         webViews[service]?.let { view ->
             view.evaluateJavascript(
-                "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(token.requestId)}]=true;" + ArenaAttachmentScript.cancel(token.requestId), null,
+                "window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[${ArenaJs.quote(token.requestId)}]=true;" + ArenaAttachmentScript.cancel(token.requestId) + nativeDoubaoCleanupScript(token.requestId, token.nativeUpPending), null,
             )
             fileBroker.cancel(view, token.requestId)
         }
@@ -587,7 +593,12 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         fullPrompt: String,
         requestId: String,
         callback: (SendOutcome) -> Unit,
+        nativeAttachmentSend: Boolean = false,
     ) {
+        if (nativeAttachmentSend && service == ArenaService.DOUBAO) {
+            sendDoubaoAttachmentNative(webView, fullPrompt, requestId, callback)
+            return
+        }
         val token = automations[service]
         var scriptCallbackConsumed = false
         val scriptCallbackTimeout = Runnable {
@@ -656,6 +667,203 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val inputMethodManager = activity.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         inputMethodManager?.hideSoftInputFromWindow(webView.windowToken, 0)
     }
+
+    /** Doubao attachments use one trusted foreground gesture; delivery checks never click again. */
+    private fun sendDoubaoAttachmentNative(webView: WebView, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
+        val service = ArenaService.DOUBAO
+        val token = automations[service] ?: return
+        val origin = webView.url
+        val generation = fileBroker.generation(webView)
+        var issued = false
+        var geometryFailures = 0
+        var preparationDeadline = 0L
+        fun current() = isCurrent(service, token)
+        fun sameDocument() = current() && fileBroker.generation(webView) == generation && webView.url == origin && ArenaFileChooserBroker.trusted(service, webView.url)
+        fun fail(detail: String) { if (current()) finishSend(service, SendOutcome(false, requestId, detail), callback) }
+        fun read(raw: String): JSONObject? = try { JSONObject(decodeJsValue(raw)) } catch (_: Exception) { null }
+        fun verify(deadline: Long) {
+            if (!current()) return
+            if (!ArenaFileChooserBroker.trusted(service, webView.url)) return fail("豆包网页已切换，发送已停止")
+            webView.evaluateJavascript(verifySendScript(service, requestId)) { raw ->
+                if (!current()) return@evaluateJavascript
+                if (raw == "true") finishSuccessfulSend(webView, service, requestId, callback)
+                else if (SystemClock.elapsedRealtime() >= deadline) fail("豆包发送后未检测到新消息，请查看原网页；未重复点击发送")
+                else handler.postDelayed({ verify(deadline) }, 250L)
+            }
+        }
+        fun awaitClick(release: () -> Unit) {
+            var settled = false
+            lateinit var timeout: Runnable
+            fun settle() {
+                if (settled) return
+                settled = true
+                handler.removeCallbacks(timeout)
+                release()
+                if (current()) {
+                    val deadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                    handler.postDelayed({ fail("豆包发送确认响应超时，请查看原网页；未重复点击发送") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                    verify(deadline)
+                }
+            }
+            timeout = Runnable { settle() }
+            handler.postDelayed(timeout, 1_500L)
+            fun poll() {
+                if (settled) return
+                if (!current() || !sameDocument()) return settle()
+                webView.evaluateJavascript("!!(window.__aiArenaNativeSend?.id===${ArenaJs.quote(requestId)}&&window.__aiArenaNativeSend.completed)") { raw ->
+                    if (settled) return@evaluateJavascript
+                    if (raw == "true") token.nativeUpPending = false
+                    if (!current() || raw == "true") settle() else handler.postDelayed({ poll() }, 50L)
+                }
+            }
+            handler.postDelayed({ poll() }, 25L)
+        }
+        fun prepareTouch() {
+            if (!current() || issued) return
+            if (!sameDocument()) return fail("豆包网页已切换，未发送问题")
+            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail("豆包发送按钮或当前正文尚未就绪，未发送问题")
+            webView.evaluateJavascript(nativeDoubaoControlScript(requestId, arm = false)) probe@{ raw ->
+                if (!current() || issued) return@probe
+                val ready = read(raw) ?: return@probe fail("豆包发送控件状态无法读取，未发送问题")
+                if (ready.has("error")) return@probe fail(ready.optString("error"))
+                if (!ready.optBoolean("ready")) {
+                    handler.postDelayed({ prepareTouch() }, 250L)
+                    return@probe
+                }
+                withFocus(service, requestId) { release ->
+                    if (!sameDocument()) { release(); fail("豆包网页已切换，未发送问题"); return@withFocus }
+                    if (issued) { release(); return@withFocus }
+                    val widthBefore = webView.width
+                    val heightBefore = webView.height
+                    webView.evaluateJavascript(nativeDoubaoControlScript(requestId, arm = true)) control@{ rawControl ->
+                        if (!current()) { release(); return@control }
+                        if (!sameDocument()) { release(); return@control fail("豆包网页已切换，未发送问题") }
+                        val control = read(rawControl)
+                        if (control == null || control.has("error")) { release(); return@control fail(control?.optString("error") ?: "豆包发送控件状态无法读取，未发送问题") }
+                        if (!control.optBoolean("ready")) { release(); handler.postDelayed({ prepareTouch() }, 250L); return@control }
+                        val cssWidth = control.optDouble("width", Double.NaN)
+                        val cssHeight = control.optDouble("height", Double.NaN)
+                        val scale = widthBefore / cssWidth
+                        val x = (control.optDouble("x", Double.NaN) * scale).toFloat()
+                        val y = (control.optDouble("y", Double.NaN) * scale).toFloat()
+                        if (!cssWidth.isFinite() || !cssHeight.isFinite() || cssWidth <= 0 || cssHeight <= 0 || !scale.isFinite() || !x.isFinite() || !y.isFinite() ||
+                            widthBefore <= 0 || heightBefore <= 0 || widthBefore != webView.width || heightBefore != webView.height || x < 0 || y < 0 || x > webView.width || y > webView.height) {
+                            release()
+                            if (++geometryFailures >= 3) fail("豆包发送按钮布局持续变化，未发送问题")
+                            else handler.postDelayed({ prepareTouch() }, 250L)
+                            return@control
+                        }
+                        if (issued || webView.visibility != View.VISIBLE || !webView.hasFocus()) { release(); return@control fail("豆包发送页面尚未获得焦点，未发送问题") }
+                        issued = true // Never return the send budget after a native DOWN.
+                        var down = true
+                        val downAt = SystemClock.uptimeMillis()
+                        fun touch(action: Int) { MotionEvent.obtain(downAt, SystemClock.uptimeMillis(), action, x, y, 0).let { event -> webView.dispatchTouchEvent(event); event.recycle() } }
+                        token.cancelNativeTouch = {
+                            if (down) { down = false; if (!destroyed && webViews[service] === webView) touch(MotionEvent.ACTION_CANCEL) }
+                        }
+                        touch(MotionEvent.ACTION_DOWN)
+                        handler.postDelayed({
+                            if (!current()) { release(); return@postDelayed }
+                            if (!sameDocument()) { fail("豆包网页已切换，未发送问题"); release(); return@postDelayed }
+                            if (!down) { release(); return@postDelayed }
+                            down = false
+                            token.cancelNativeTouch = null
+                            token.nativeUpPending = true
+                            touch(MotionEvent.ACTION_UP)
+                            if (current()) awaitClick(release) else release()
+                        }, 100L)
+                    }
+                }
+            }
+        }
+        var injectionFinished = false
+        val injectionTimeout = Runnable { if (!injectionFinished) { injectionFinished = true; fail("豆包正文注入响应超时，未发送问题") } }
+        withFocus(service, requestId) { release ->
+            token.sending = true
+            handler.postDelayed(injectionTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
+            webView.evaluateJavascript(nativeDoubaoSetupScript(requestId, prompt) + sendScript(service, ArenaJs.quote(prompt), requestId, scheduleSubmit = false, browserInputOnly = true)) { raw ->
+                handler.postDelayed({ release() }, 220L)
+                if (!current() || injectionFinished) return@evaluateJavascript
+                injectionFinished = true
+                handler.removeCallbacks(injectionTimeout)
+                val result = decodeJsValue(raw)
+                if (!result.startsWith("sent")) return@evaluateJavascript fail(result.ifBlank { "豆包正文注入失败，未发送问题" })
+                preparationDeadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                handler.postDelayed({ if (!issued) fail("豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                handler.postDelayed({ prepareTouch() }, 220L)
+            }
+        }
+    }
+
+    private fun nativeDoubaoSetupScript(requestId: String, prompt: String): String = """
+        (()=>{
+          ${sendControlHelperScript()}
+          const previous=window.__aiArenaNativeSend;if(previous?.cleanup)previous.cleanup();
+          window.__aiArenaNativeSendRequests=window.__aiArenaNativeSendRequests||{};
+          window.__aiArenaNativeSendRequests[${ArenaJs.quote(requestId)}]=true;
+          const normalize=text=>String(text||'').replace(/\s+/g,' ').trim();
+          const native={id:${ArenaJs.quote(requestId)},expected:normalize(${ArenaJs.quote(prompt)}),target:null,input:null,armedAt:Infinity,down:null,up:null,completed:false};
+          const alive=()=>window.__aiArenaNativeSend===native&&!window.__aiArenaCancelledRequests?.[native.id];
+          const buttonFor=e=>e.target?.closest?.('button#flow-end-msg-send');
+          native.pointer=e=>{
+            if(!alive()){
+              // Preserve the guard for the queued old UP/click, but an actual new user gesture is allowed.
+              if(native.cancelledAt!==undefined&&e.type==='pointerdown'&&e.isTrusted&&e.timeStamp>=native.cancelledAt){native.cleanup();if(window.__aiArenaNativeSend===native)window.__aiArenaNativeSend=null;}
+              return;
+            }
+            if(!e.isTrusted||buttonFor(e)!==native.target||e.timeStamp<native.armedAt)return;
+            if(e.type==='pointerdown'){native.down=e.timeStamp;native.up=null;}
+            else if(native.down!==null)native.up=e.timeStamp;
+          };
+          native.click=e=>{
+            const button=buttonFor(e);if(!button||!button.closest('.guidance-input-surface,#input-engine-container'))return;
+            if(native.cancelledAt!==undefined&&!alive()){
+              // This branch has no scheduled JS send; do not intercept a later ordinary text-only JS send.
+              if(!e.isTrusted)return;
+              e.preventDefault();e.stopImmediatePropagation();native.cleanup();if(window.__aiArenaNativeSend===native)window.__aiArenaNativeSend=null;return;
+            }
+            const valid=alive()&&e.isTrusted&&button===native.target&&arenaSendEnabled(button)&&native.down!==null&&native.up!==null&&e.timeStamp>=native.down&&
+              native.input?.isConnected&&normalize(native.input.value||native.input.innerText||native.input.textContent)===native.expected;
+            if(!valid){e.preventDefault();e.stopImmediatePropagation();return;}
+            window.__aiArenaSendClicks=window.__aiArenaSendClicks||{};
+            if(window.__aiArenaSendClicks[native.id]){e.preventDefault();e.stopImmediatePropagation();return;}
+            window.__aiArenaSendClicks[native.id]=Date.now();
+            setTimeout(()=>{if(alive())native.completed=true;},0);
+          };
+          native.cleanup=()=>{document.removeEventListener('pointerdown',native.pointer,true);document.removeEventListener('pointerup',native.pointer,true);document.removeEventListener('click',native.click,true);};
+          document.addEventListener('pointerdown',native.pointer,true);document.addEventListener('pointerup',native.pointer,true);document.addEventListener('click',native.click,true);
+          window.__aiArenaNativeSend=native;
+        })();
+    """.trimIndent()
+
+    private fun nativeDoubaoControlScript(requestId: String, arm: Boolean): String = """
+        (()=>{
+          ${sendControlHelperScript()}
+          const native=window.__aiArenaNativeSend;
+          if(!native||native.id!==${ArenaJs.quote(requestId)}||window.__aiArenaCancelledRequests?.[native.id])return JSON.stringify({error:'豆包发送请求已取消'});
+          if(window.__aiArenaSendClicks?.[native.id])return JSON.stringify({error:'豆包已点击发送，未重复提交'});
+          const shown=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>2&&r.height>2&&s.display!=='none'&&s.visibility!=='hidden'};
+          const buttons=Array.from(document.querySelectorAll('button#flow-end-msg-send')).filter(shown);
+          if(buttons.length>1)return JSON.stringify({error:'无法确认豆包唯一发送按钮，未发送问题'});
+          const target=buttons[0],scope=target?.closest('.guidance-input-surface,#input-engine-container');
+          if(!scope||!arenaSendEnabled(target))return JSON.stringify({ready:false});
+          const inputs=Array.from(scope.querySelectorAll('textarea,[contenteditable=true]')).filter(shown);
+          if(inputs.length!==1)return JSON.stringify({ready:false});
+          const input=inputs[0],text=String(input.value||input.innerText||input.textContent||'').replace(/\s+/g,' ').trim();
+          if(!text||text!==native.expected)return JSON.stringify({ready:false});
+          const rect=target.getBoundingClientRect(),x=rect.left+rect.width/2,y=rect.top+rect.height/2,hit=document.elementFromPoint(x,y);
+          if(!hit||!(hit===target||target.contains(hit)))return JSON.stringify({ready:false});
+          if($arm){native.target=target;native.input=input;native.armedAt=performance.now();native.down=null;native.up=null;}
+          return JSON.stringify({ready:true,x,y,width:innerWidth,height:innerHeight});
+        })();
+    """.trimIndent()
+
+    private fun nativeDoubaoCleanupScript(requestId: String, pendingUp: Boolean): String = """
+        (()=>{const native=window.__aiArenaNativeSend;if(native?.id===${ArenaJs.quote(requestId)}){
+          if($pendingUp&&!window.__aiArenaSendClicks?.[native.id])native.cancelledAt=performance.now();
+          else {native.cleanup();window.__aiArenaNativeSend=null;}
+        }})();
+    """.trimIndent()
 
     private fun verifyDoubaoSend(
         webView: WebView,
@@ -798,7 +1006,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     fileChooserParams: FileChooserParams,
                 ): Boolean {
                     if (fileBroker.handle(webView, filePathCallback, fileChooserParams)) return true
-                    if (destroyed || service in automations || !ArenaFileChooserBroker.trusted(service, webView.url)) {
+                    if (destroyed || service in automations || uiSelectedService != service || !ArenaFileChooserBroker.trusted(service, webView.url)) {
                         filePathCallback.onReceiveValue(null)
                         return true
                     }
@@ -1166,13 +1374,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             (function() {
               $stateBootstrap
               $selectorHelper
+              ${sendControlHelperScript()}
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
+              if (window.__aiArenaNativeSendRequests?.[requestId]) return 'native_managed';
+              if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return 'awaiting_confirmation';
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
               const send = arenaFirstMatch($sendSelectors);
-              if (!send || send.disabled || send.getAttribute('aria-disabled') === 'true') return 'not_ready';
+              if (!arenaSendEnabled(send)) return 'not_ready';
               window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
               window.__aiArenaSendClicks[requestId] = Date.now();
               send.click();
@@ -1181,7 +1392,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
     }
 
-    private fun sendScript(service: ArenaService, quotedPrompt: String, requestId: String): String {
+    private fun sendScript(service: ArenaService, quotedPrompt: String, requestId: String): String = sendScript(service, quotedPrompt, requestId, scheduleSubmit = true)
+
+    private fun sendScript(service: ArenaService, quotedPrompt: String, requestId: String, scheduleSubmit: Boolean, browserInputOnly: Boolean = false): String {
         val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val sendSelectors = ArenaJs.quoteArray(sendButtonSelectors(service))
         val selectorHelper = selectorHelperScript()
@@ -1206,7 +1419,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         } else {
             ""
         }
-        val scheduleClicks = if (service == ArenaService.ZHIPU) {
+        val scheduleClicks = if (service == ArenaService.ZHIPU || !scheduleSubmit) {
             ""
         } else {
             """
@@ -1224,13 +1437,20 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
                 if (cancelled()) return 'cancelled';
                 $selectorHelper
+                ${sendControlHelperScript()}
                 $qwenFetchHook
                 $zhipuMessageDispatch
                 const input = arenaFirstMatch($inputSelectors);
                 if (!input) return 'no_input';
                 $focusInput
                 let needsSyntheticInput = true;
-                if (input.editor && input.editor.commands && typeof input.editor.commands.setContent === 'function') {
+                if ($browserInputOnly) {
+                  // Doubao attachments must pass through the browser's editing/input path.
+                  // Do not substitute its private setter or a synthetic input event here.
+                  document.execCommand('selectAll', false, null);
+                  if (!document.execCommand('insertText', false, text)) return '豆包正文浏览器输入失败，未发送问题';
+                  needsSyntheticInput = false;
+                } else if (input.editor && input.editor.commands && typeof input.editor.commands.setContent === 'function') {
                   const paragraphs = text.split(/\r?\n/).map(function(line) {
                     return { type: 'paragraph', content: line ? [{ type: 'text', text: line }] : [] };
                   });
@@ -1309,11 +1529,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 };
                 const attemptSend = function() {
                   if (cancelled()) return;
+                  if (window.__aiArenaNativeSendRequests?.[requestId]) return;
                   if ($conversationAdvanced) return;
+                  if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return;
                   if (!currentInputText().trim()) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
-                  if (send && !send.disabled && send.getAttribute('aria-disabled') !== 'true') {
+                  if (send) {
+                    if (!arenaSendEnabled(send)) return;
                     window.__aiArenaSendClicks[requestId] = Date.now();
                     send.click();
                   } else {
@@ -1330,6 +1553,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             })();
         """.trimIndent()
     }
+
+    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
+    private fun sendControlHelperScript(): String = """
+        const arenaSendEnabled = function(send) {
+          if (!send) return false;
+          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
+          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
+          for(let node=send;node&&node!==document.body;node=node.parentElement){
+            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
+          }
+          return true;
+        };
+    """.trimIndent()
 
     /**
      * 输入框候选，**按优先级从精确到兜底排列**。
@@ -1476,6 +1712,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[aria-label*='发送']",
             )
             ArenaService.KIMI -> listOf(
+                ".chat-editor .send-button-container",
                 "button[class*='send']",
                 "button[aria-label*='发送']",
                 "button[type='submit']",

@@ -27,8 +27,12 @@ internal class ArenaFileChooserBroker(private val context: Context) {
 
     fun handle(view: WebView, callback: ValueCallback<Array<Uri>>, params: WebChromeClient.FileChooserParams): Boolean {
         val request = requests[view] ?: return false
+        if (request.consumed) {
+            // A delayed second chooser must not reissue files or abort the first accepted upload.
+            callback.onReceiveValue(null)
+            return true
+        }
         val error = when {
-            request.consumed -> "网页重复请求附件，已阻止重复上传"
             request.generation != generation(view) || request.url != view.url || !trusted(request.service, view.url) -> "网页已切换，已取消附件上传"
             params.mode != WebChromeClient.FileChooserParams.MODE_OPEN && params.mode != WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE -> "网页文件选择模式暂不支持"
             params.mode == WebChromeClient.FileChooserParams.MODE_OPEN && request.files.size > 1 -> "${request.service.displayName} 当前入口一次只接受一个文件，请减少附件后重试"
@@ -46,6 +50,11 @@ internal class ArenaFileChooserBroker(private val context: Context) {
         }
         return true
     }
+
+    fun canDeliver(view: WebView, requestId: String): Boolean = requests[view]?.let { request ->
+        request.requestId == requestId && !request.consumed && request.generation == generation(view) &&
+            request.url == view.url && trusted(request.service, view.url)
+    } == true
 
     fun generation(view: WebView): Long = generations[view] ?: 0L
     fun navigated(view: WebView) { generations[view] = generation(view) + 1; cancel(view) }

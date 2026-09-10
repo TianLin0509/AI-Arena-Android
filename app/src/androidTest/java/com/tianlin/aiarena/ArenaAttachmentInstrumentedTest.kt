@@ -97,7 +97,7 @@ class ArenaAttachmentInstrumentedTest {
                 const card=document.createElement('div');card.className='_25c7358';card.style='height:40px';card.innerHTML='<span class="e70accd6">probe.txt</span>';newcard.appendChild(card);
                 const root={tag:3,stateNode:{}},oldRoot={tag:3,stateNode:root.stateNode};root.stateNode.current=root;
                 window.currentFile={fileName:'probe.txt',fileSize:40,id:'remote-id',status:'PENDING'};
-                const current={memoizedProps:{file:currentFile},return:root},stale={memoizedProps:{file:{...currentFile,status:'SUCCESS'}},return:oldRoot,alternate:current};current.alternate=stale;card['__reactFiber${'$'}fixture']=stale;true;
+                const current=fixtureFiber(card,{file:currentFile},root),stale=fixtureNode({file:{...currentFile,status:'SUCCESS'}},oldRoot,card);stale.alternate=current;current.alternate=stale;card['__reactFiber${'$'}fixture']=stale;true;
             """.trimIndent())
             assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("vendor", ArenaService.DEEPSEEK))).getBoolean("ready"))
             evaluate(view, "currentFile.status='SUCCESS';true")
@@ -111,7 +111,7 @@ class ArenaAttachmentInstrumentedTest {
             evaluate(view, """
                 window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
                 window.fileState={fileName:'probe.txt',size:40,type:'file',fileKey:'remote',localKey:'local',status:'Normal',parseState:3,reviewState:0};
-                area['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:[fileState]},return:root};true;
+                fixtureFiber(area,{attachmentStates:[fileState]},root);true;
             """.trimIndent())
             assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("doubao", ArenaService.DOUBAO))).getBoolean("ready"))
             evaluate(view, "fileState.parseState=1;true")
@@ -133,6 +133,201 @@ class ArenaAttachmentInstrumentedTest {
             evaluate(view, "area.firstChild.className='image-thumbnail error';true")
             assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi", ArenaService.KIMI))).has("error"))
             assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.prepare("old-draft", listOf(attachment), ArenaService.KIMI))).has("error"))
+        }
+    }
+
+    @Test fun doubaoUploadedImageKeepsBlobPreviewWhileRemoteKeyConfirmsUpload() {
+        withView("<div data-testid='attachment_area' id='area'></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("blob-image", listOf(attachment), ArenaService.DOUBAO))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.fileState={fileName:'photo.png',size:4096,type:'image',fileKey:'remote-upload-key',localKey:'local-file-key',status:'Normal',parseState:0,reviewState:0,
+                  imageList:[{key:'remote-upload-key',image_ori:{url:'blob:https://www.doubao.com/local-preview'},image_thumb:{url:'blob:https://www.doubao.com/local-preview'}}]};
+                fixtureFiber(area,{attachmentStates:[fileState]},root);true;
+            """.trimIndent())
+            assertTrue("Current Doubao upload state retains blob previews after successful upload", JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.status='Uploading';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.status='Normal';fileState.fileKey='';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.fileKey='unrelated-upload-key';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.fileKey='remote-upload-key';fileState.reviewState=3;true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.reviewState=2;true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).has("error"))
+        }
+    }
+
+    @Test fun deepSeekImageThumbnailUsesCommittedFileMetadataWithoutDocumentCaption() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("ds-image", listOf(attachment), ArenaService.DEEPSEEK))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.imageFile={fileName:'photo.png',fileSize:4096,isImage:true,id:'remote-file-id',localId:'local_file_7',signedPath:'/remote/image',status:'SUCCESS',auditResult:'pass'};
+                const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';card.innerHTML='<img alt="photo.png" src="blob:https://chat.deepseek.com/local-preview">';
+                fixtureFiber(card,{fileName:'photo.png'},fixtureNode({file:imageFile,fileUploadInfo:{isUploading:false,failed:false},fileErrorState:{hasError:false}},root));cards.appendChild(card);true;
+            """.trimIndent())
+            assertTrue("DeepSeek image thumbnails have no document caption element", JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "imageFile.status='PARSING';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "imageFile.status='SUCCESS';imageFile.auditResult='reject';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).has("error"))
+            assertTrue("Existing unsent image must block accidental duplicate upload", JSONObject(evaluate(view, ArenaAttachmentScript.prepare("next-image", listOf(attachment), ArenaService.DEEPSEEK))).has("error"))
+        }
+    }
+
+    @Test fun deepSeekDeepReactTreesReadOnlyTheCommittedBranchAndRejectCycles() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.webp", "image/webp", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("deep-fiber", listOf(attachment), ArenaService.DEEPSEEK))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;
+                window.installTree=depth=>{
+                  cards.innerHTML='';window.rootState={};window.primaryRoot={tag:3,stateNode:rootState};window.alternateRoot={tag:3,stateNode:rootState};rootState.current=alternateRoot;
+                  const file=status=>({fileName:'photo.webp',fileSize:4096,isImage:true,id:'remote-id',localId:'local-id',status,auditResult:'pass'});
+                  window.primaryProps={file:file('SUCCESS')};window.alternateProps={file:file('PENDING')};
+                  const chain=(root,props)=>{let parent=root;for(let i=1;i<depth;i++)parent=fixtureNode({},parent);return fixtureNode(props,parent);};
+                  window.primaryFiber=chain(primaryRoot,primaryProps);window.alternateFiber=chain(alternateRoot,alternateProps);primaryFiber.alternate=alternateFiber;alternateFiber.alternate=primaryFiber;
+                  const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';card['__reactFiber${'$'}fixture']=primaryFiber;primaryFiber.stateNode=card;alternateFiber.stateNode=card;cards.appendChild(card);
+                };true;
+            """.trimIndent())
+            fun ready() = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("deep-fiber", ArenaService.DEEPSEEK))).getBoolean("ready")
+            listOf(104, 256).forEach { depth ->
+                evaluate(view, "installTree($depth);true")
+                assertFalse("Uncommitted SUCCESS must not override the current pending branch at depth $depth", ready())
+                evaluate(view, "alternateProps.file.status='SUCCESS';true")
+                assertTrue("Committed attachment remains readable at depth $depth", ready())
+                evaluate(view, "primaryProps.file.status='PENDING';rootState.current=primaryRoot;true")
+                assertFalse("Changing HostRoot.current must invalidate the old successful alternate", ready())
+                evaluate(view, "primaryProps.file.status='SUCCESS';true")
+                assertTrue(ready())
+            }
+            evaluate(view, "primaryFiber.return=primaryFiber;alternateFiber.return=alternateFiber;true")
+            assertFalse("Cyclic return links must fail closed without hanging", ready())
+            evaluate(view, "installTree(513);alternateProps.file.status='SUCCESS';true")
+            assertFalse("Trees beyond the traversal bound must fail closed", ready())
+        }
+    }
+
+    @Test fun modernDoubaoOnlyUsesTheComposerLinkedLocalUploadMenu() {
+        withView(modernDoubaoFixture()) { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("modern-menu", listOf(attachment), ArenaService.DOUBAO))
+            val trigger = JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("modern-menu", ArenaService.DOUBAO)))
+            assertTrue("Current guidance composer must offer its upload menu", trigger.has("x"))
+            assertEquals("local-trigger", evaluate(view, "document.elementFromPoint(${trigger.getDouble("x")},${trigger.getDouble("y")}).closest('[data-slot=dropdown-menu-trigger]').id"))
+            evaluate(view, "document.getElementById('local-menu').style.display='block';true")
+            val item = JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("modern-menu", ArenaService.DOUBAO)))
+            assertTrue(item.has("x"))
+            assertEquals("local-upload", evaluate(view, "document.elementFromPoint(${item.getDouble("x")},${item.getDouble("y")}).closest('[role=menuitem]').id"))
+            // The matching item is now consumed. Other menus, cloud items and avatar controls must stay untouched.
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("modern-menu", ArenaService.DOUBAO))).has("x"))
+        }
+    }
+
+    @Test fun currentTreeRejectsUnmountedCyclesDuplicateHostsAndOversizedTrees() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 40, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("invalid-tree", listOf(attachment), ArenaService.DEEPSEEK))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;
+                window.installCurrentTree=()=>{
+                  cards.innerHTML='<div class="_25c7358" style="height:50px"><span class="e70accd6">probe.txt</span></div>';
+                  window.treeRoot={tag:3,stateNode:{}};treeRoot.stateNode.current=treeRoot;
+                  window.treeLeaf=fixtureFiber(cards.firstChild,{file:{fileName:'probe.txt',fileSize:40,id:'remote',status:'SUCCESS'}},treeRoot);
+                };installCurrentTree();true;
+            """.trimIndent())
+            fun ready() = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("invalid-tree", ArenaService.DEEPSEEK))).getBoolean("ready")
+            assertTrue("The valid current tree must be readable before corruption", ready())
+            listOf(
+                "treeRoot.child=null" to "Unmounted fiber with a still-valid return chain",
+                "treeLeaf.child=treeLeaf" to "Cycle in actual current child edges",
+                "fixtureNode({},treeRoot,treeLeaf.stateNode)" to "Two current fibers claiming the same DOM host",
+                "let previous=treeLeaf;for(let i=0;i<25000;i++){const next={memoizedProps:{},return:treeRoot};previous.sibling=next;previous=next;}" to "Current tree beyond the bounded index"
+            ).forEach { (corrupt, reason) ->
+                evaluate(view, "installCurrentTree();$corrupt;true")
+                assertFalse("$reason must fail closed without using stale SUCCESS", ready())
+            }
+        }
+    }
+
+    @Test fun currentTreeIndexIsSharedWithinReadAndRefreshedAfterObserverCommit() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+            val attachments = listOf("first.webp", "second.webp").map { ArenaAttachment(it, it, "image/webp", 40, "a".repeat(64)) }
+            evaluate(view, ArenaAttachmentScript.prepare("observer-tree", attachments, ArenaService.DEEPSEEK))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;
+                window.treeRoot={tag:3,stateNode:{}};treeRoot.stateNode.current=treeRoot;
+                window.rootChildReads=0;let actualChild=null;
+                Object.defineProperty(treeRoot,'child',{get(){rootChildReads++;return actualChild},set(value){actualChild=value}});
+                window.appendCommittedImage=name=>{
+                  const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:60px;width:60px';
+                  fixtureFiber(card,{file:{fileName:name,fileSize:40,isImage:true,id:'remote-'+name,localId:'local-'+name,status:'SUCCESS',auditResult:'pass'}},treeRoot);
+                  cards.appendChild(card);
+                };appendCommittedImage('first.webp');true;
+            """.trimIndent())
+            // evaluateJavascript calls are separate renderer tasks; MutationObserver has committed in between.
+            assertEquals("local-first.webp", evaluate(view, "window.__arenaAttachment.deepSeekLocalIds[0]"))
+            evaluate(view, "appendCommittedImage('second.webp');true")
+            assertEquals("local-second.webp", evaluate(view, "window.__arenaAttachment.deepSeekLocalIds[1]"))
+            evaluate(view, "rootChildReads=0;true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("observer-tree", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            assertEquals("Two cards must share one root index in one readiness evaluation", "2", evaluate(view, "rootChildReads"))
+        }
+    }
+
+    @Test fun modernDoubaoReadsCommittedAttachmentAreaAndRejectsExistingDraft() {
+        withView(modernDoubaoFixture()) { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("modern-card", listOf(attachment), ArenaService.DOUBAO))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.modernFile={fileName:'photo.png',size:4096,type:'image',fileKey:'remote-key',localKey:'local-key',status:'Normal',imageList:[{key:'remote-key',image_ori:{url:'blob:https://www.doubao.com/preview'}}]};
+                const card=document.createElement('div');card.className='container-tJHWhP flex flex-col pl-12 pr-2';card.style='height:80px;width:180px';
+                fixtureFiber(card,{},fixtureNode({attachmentStates:[modernFile]},root));document.getElementById('upload-slot').appendChild(card);true;
+            """.trimIndent())
+            assertTrue("Modern upload area has no legacy attachment_area test ID", JSONObject(evaluate(view, ArenaAttachmentScript.readiness("modern-card", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "modernFile.status='Uploading';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("modern-card", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "modernFile.status='Retry';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("modern-card", ArenaService.DOUBAO))).has("error"))
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.prepare("next-modern", listOf(attachment), ArenaService.DOUBAO))).has("error"))
+        }
+    }
+
+    @Test fun deepSeekMobileWebpConversionRequiresObservedOriginalLocalIdentity() {
+        val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+        listOf(true, false).forEach { observeOriginal ->
+            withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+                evaluate(view, ArenaAttachmentScript.prepare("ds-converted", listOf(attachment), ArenaService.DEEPSEEK))
+                evaluate(view, """
+                    window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                    window.imageFile={fileName:'${if (observeOriginal) "photo.png" else "other.png"}',fileSize:4096,isImage:true,id:'local_file_9',localId:'local_file_9',status:'PENDING'};
+                    window.imageProps={file:imageFile,fileUploadInfo:{isUploading:true,failed:false},fileErrorState:{hasError:false},isForking:false};
+                    const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';card.innerHTML='<img alt="photo.png">';
+                    fixtureFiber(card,{fileName:imageFile.fileName},fixtureNode(imageProps,root));cards.appendChild(card);true;
+                """.trimIndent())
+                // The committed original draft is visible to MutationObserver before the asynchronous conversion.
+                evaluate(view, "Object.assign(imageFile,{fileName:'photo.webp',fileSize:1234,id:'remote-image-9',status:'SUCCESS',auditResult:'pass',signedPath:'/remote/9'});imageProps.fileUploadInfo.isUploading=false;true")
+                val converted = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK)))
+                if (observeOriginal) assertTrue("Observed original file retains its identity after conversion", converted.getBoolean("ready"))
+                else assertTrue("Missing original identity must produce an explicit diagnostic", converted.has("error"))
+                if (observeOriginal) {
+                    evaluate(view, "imageFile.localId='unrelated-local-id';true")
+                    assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).has("error"))
+                    evaluate(view, "imageFile.localId='local_file_9';imageFile.fileName='other.webp';true")
+                    assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).has("error"))
+                    evaluate(view, "imageFile.fileName='photo.webp';imageProps.fileUploadInfo.isUploading=true;true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageProps.fileUploadInfo.isUploading=false;imageFile.auditResult='unknown';true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageFile.auditResult='pass';imageProps.fileUploadInfo.failed=true;true")
+                    assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).has("error"))
+                }
+            }
         }
     }
 
@@ -194,6 +389,95 @@ class ArenaAttachmentInstrumentedTest {
         store.discardImported(attachments)
     }
 
+    @Test fun deepSeekBatchedConversionUsesExactChooserAndUniqueStableLocalId() {
+        listOf("valid", "reordered", "same-stem", "old-id", "extra", "wrong-name", "changed-id").forEach { case ->
+            withView("<div class='_77cefa5'><textarea></textarea><input type='file' id='picker' multiple style='display:none'><div id='cards'></div></div>") { view, _ ->
+                val selected = mutableListOf(ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64)))
+                if (case == "same-stem") selected += ArenaAttachment("second", "photo.jpg", "image/jpeg", 8192, "b".repeat(64))
+                if (case == "reordered") selected += ArenaAttachment("second", "second.png", "image/png", 8192, "b".repeat(64))
+                evaluate(view, """
+                    window.reactRoot={tag:3,stateNode:{}};reactRoot.stateNode.current=reactRoot;
+                    const old=document.createElement('div');old.className='d5fa3d1b';old.style='height:80px;width:80px;visibility:hidden';fixtureFiber(old,{file:{fileName:'old.png',fileSize:40,localId:'old-local'}},reactRoot);cards.appendChild(old);true;
+                """.trimIndent())
+                evaluate(view, ArenaAttachmentScript.prepare("batched-$case", selected, ArenaService.DEEPSEEK))
+                val fileCreation = selected.joinToString(";") { "transfer.items.add(new File([new Uint8Array(${it.sizeBytes})],${ArenaJs.quote(it.name)},{type:${ArenaJs.quote(it.mimeType)}}))" }
+                evaluate(view, """
+                    const transfer=new DataTransfer();$fileCreation;picker.files=transfer.files;picker.dispatchEvent(new Event('change',{bubbles:true}));
+                    window.batchedFiles=[];window.addConverted=(name,localId)=>{const file={fileName:name,fileSize:1234,localId,id:'remote-'+localId,isImage:true,status:'SUCCESS',auditResult:'pass'};batchedFiles.push(file);const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';fixtureFiber(card,{file,fileUploadInfo:{isUploading:false,failed:false},fileErrorState:{hasError:false}},reactRoot);cards.appendChild(card);};
+                    ${if (case == "reordered") "addConverted('second.webp','second-local');" else ""}
+                    addConverted('${if (case == "wrong-name") "other.webp" else "photo.webp"}','${if (case == "old-id") "old-local" else "new-local"}');
+                    ${if (case == "same-stem") "addConverted('photo.webp','second-local');" else ""}
+                    ${if (case == "extra") "addConverted('unexpected.webp','unexpected-local');" else ""}
+                    true;
+                """.trimIndent())
+                val first = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("batched-$case", ArenaService.DEEPSEEK)))
+                if (case in listOf("valid", "reordered", "changed-id")) {
+                    assertFalse("$case must wait for a second stable observation: $first", first.has("error"))
+                    assertFalse(first.getBoolean("ready"))
+                    if (case == "changed-id") evaluate(view, "batchedFiles[0].localId='replacement-local';batchedFiles[0].id='replacement-remote';true")
+                    Thread.sleep(700)
+                    val second = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("batched-$case", ArenaService.DEEPSEEK)))
+                    if (case == "changed-id") assertTrue("Replacing a provisional identity must fail", second.has("error"))
+                    else assertTrue("$case should bind by the unique selected name and stable ID: $second", second.getBoolean("ready"))
+                } else assertTrue("$case must produce a diagnostic and not send: $first", first.has("error"))
+            }
+        }
+    }
+
+    @Test fun kimiDocumentIconExtensionIdentifiesErrorsAndRejectsAmbiguousCards() {
+        listOf("error", "success", "conflict", "multiple-icons", "wrong-name", "wrong-extension", "missing", "old", "duplicate").forEach { case ->
+            withView("<div data-testid='input-attachment-list' id='cards'></div>") { view, _ ->
+                val attachment = ArenaAttachment("fixture", "notes.txt", "text/plain", 64, "a".repeat(64))
+                if (case == "old") evaluate(view, "cards.innerHTML='<div class=\"file-card-container error\" style=\"height:70px;width:160px;visibility:hidden\"><p class=\"file-card-info-name\">notes</p><img class=\"file-card-icon\" alt=\"txt\"></div>';true")
+                evaluate(view, ArenaAttachmentScript.prepare("kimi-icon-$case", listOf(attachment), ArenaService.KIMI))
+                evaluate(view, """
+                    window.__arenaAttachment.chosen=true;
+                    ${if (case == "old") "cards.firstElementChild.style.visibility='visible';" else """
+                    const card=document.createElement('div');card.className='file-card-container normal ${if (case == "error") "error" else "success"}';card.style='height:70px;width:160px';
+                    card.innerHTML='<p class="file-card-info-name">${if (case == "wrong-name") "unrelated" else "notes"}</p>${if (case == "missing") "" else "<img class=\"file-card-icon\" alt=\"${if (case == "wrong-extension") "pdf" else "txt"}\">"}${if (case == "conflict") "<span class=\"file-ext\">PDF</span>" else ""}${if (case == "multiple-icons") "<img class=\"file-card-icon\" alt=\"txt\">" else ""}<div class="file-card-info-status">${if (case == "error") "Upload failed" else "64 Bytes"}</div>';
+                    cards.appendChild(card);${if (case == "duplicate") "cards.appendChild(card.cloneNode(true));" else ""}
+                    """}
+                    true;
+                """.trimIndent())
+                val result = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi-icon-$case", ArenaService.KIMI)))
+                when (case) {
+                    "error" -> assertTrue("A new failed file card has icon alt but no file-ext: $result", result.optString("error").contains("Kimi"))
+                    "success" -> assertTrue("A unique icon extension can identify a successful current file: $result", result.getBoolean("ready"))
+                    else -> assertFalse("$case must not authorize sending: $result", result.optBoolean("ready"))
+                }
+            }
+        }
+    }
+
+    @Test fun kimiBoundInputListenersRejectReplacementAndAreRemovedOnCancelOrSupersession() {
+        listOf("cancel", "supersede").forEach { mode ->
+            withView("""
+                <button class="toolkit-trigger-btn" id="toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="true">Add</button>
+                <div role="menu" id="menu" aria-labelledby="toolkit"><label class="toolkit-item" role="menuitem" style="display:block;width:180px;height:60px">Upload<input id="picker" type="file" style="display:none"></label></div>
+            """.trimIndent()) { view, _ ->
+                val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 4, "a".repeat(64))
+                evaluate(view, """
+                    window.originalInput=document.getElementById('picker');window.captureListeners=new Set();
+                    const add=originalInput.addEventListener.bind(originalInput),remove=originalInput.removeEventListener.bind(originalInput);
+                    originalInput.addEventListener=(type,listener,capture)=>{if(type==='change'&&capture===true)captureListeners.add(listener);add(type,listener,capture);};
+                    originalInput.removeEventListener=(type,listener,capture)=>{if(type==='change'&&capture===true)captureListeners.delete(listener);remove(type,listener,capture);};
+                    window.choose=input=>{const transfer=new DataTransfer();transfer.items.add(new File(['test'],'probe.txt',{type:'text/plain'}));input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));};true;
+                """.trimIndent())
+                assertEquals("true", evaluate(view, ArenaAttachmentScript.prepare("bound-$mode", listOf(attachment), ArenaService.KIMI)))
+                assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("bound-$mode", ArenaService.KIMI))).has("x"))
+                evaluate(view, "window.previousState=window.__arenaAttachment;const replacement=originalInput.cloneNode();originalInput.replaceWith(replacement);choose(replacement);true")
+                assertEquals("A new input cannot confirm the original bound picker", "false", evaluate(view, "window.__arenaAttachment.chosen"))
+                assertEquals("Capture listener belongs to the original selected input", "1", evaluate(view, "captureListeners.size"))
+                if (mode == "cancel") evaluate(view, ArenaAttachmentScript.cancel("bound-$mode"))
+                else assertEquals("true", evaluate(view, ArenaAttachmentScript.prepare("replacement", listOf(attachment), ArenaService.KIMI)))
+                assertEquals("Old detached input listener must be removed", "0", evaluate(view, "captureListeners.size"))
+                evaluate(view, "choose(originalInput);true")
+                assertEquals("A late old input event cannot mutate the old request", "false", evaluate(view, "previousState.chosen"))
+                assertEquals("A late old input event cannot confirm a replacement request", "false", evaluate(view, "window.__arenaAttachment?.chosen||false"))
+            }
+        }
+    }
+
     @Test fun parseFailureStopsBeforeSendAndBareFileSelectionIsNotReady() {
         withView(fixture(fail = true)) { view, broker ->
             val files = imported()
@@ -234,6 +518,27 @@ class ArenaAttachmentInstrumentedTest {
                 broker.cancelAll()
             }
             supplied!!.forEach { uri -> assertTrue(runCatching { context.contentResolver.openInputStream(uri)!!.use { it.read() } }.isFailure) }
+            store.discardImported(files)
+        }
+    }
+
+    @Test fun lateDuplicateChooserCannotAbortFirstDeliveryOrIssueMoreUris() {
+        withView(fixture()) { view, broker ->
+            val files = imported()
+            val store = ArenaAttachmentStore(context)
+            val delivered = mutableListOf<String?>()
+            var first: Array<Uri>? = null
+            onMain {
+                broker.prepare(view, ArenaService.DEEPSEEK, "one-delivery", files.map { it to store.verify(it) }) { delivered += it }
+                assertTrue(broker.handle(view, ValueCallback { first = it }, params()))
+                assertTrue(broker.handle(view, ValueCallback { assertNull("Duplicate chooser receives no URI", it) }, params()))
+                assertEquals("Late duplicate must not turn the first accepted upload into a failure", listOf<String?>(null), delivered)
+            }
+            assertEquals(files.size, first!!.size)
+            first!!.forEachIndexed { i, uri ->
+                assertArrayEquals(store.verify(files[i]).readBytes(), context.contentResolver.openInputStream(uri)!!.use { it.readBytes() })
+            }
+            onMain { broker.cancel(view) }
             store.discardImported(files)
         }
     }
@@ -286,7 +591,7 @@ class ArenaAttachmentInstrumentedTest {
                         return true
                     }
                 }
-                view.loadDataWithBaseURL(ArenaService.DEEPSEEK.url, html, "text/html", "UTF-8", ArenaService.DEEPSEEK.url)
+                view.loadDataWithBaseURL(ArenaService.DEEPSEEK.url, "<script>${ArenaReactFixture.script}</script>$html", "text/html", "UTF-8", ArenaService.DEEPSEEK.url)
             }
             assertTrue(loaded.await(15, TimeUnit.SECONDS))
             try { block(view, broker) } finally { onMain { broker.cancelAll(); view.destroy() } }
@@ -304,24 +609,26 @@ class ArenaAttachmentInstrumentedTest {
     private fun fixture(fail: Boolean = false, service: ArenaService = ArenaService.DEEPSEEK): String {
         val kind = service.name
         val controls = if (service == ArenaService.KIMI) """
-            <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; multiple style=&quot;display:none&quot;></label>';document.getElementById('upload').onchange=handle;">Add</button><div id="menu"></div>
+            <button class="toolkit-trigger-btn" id="fixture-toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; multiple style=&quot;display:none&quot;></label>';document.getElementById('upload').onchange=handle;">Add</button><div id="menu" role="menu" aria-labelledby="fixture-toolkit"></div>
         """.trimIndent() else """
             <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" multiple accept="image/*,.pdf,.txt" style="display:none">
         """.trimIndent()
         return """
             <meta name="viewport" content="width=device-width,initial-scale=1"><div class="_77cefa5"><textarea></textarea>$controls<div id="cards" data-testid="${if(service == ArenaService.KIMI) "input-attachment-list" else "attachment_area"}"></div></div>
             <script>
+            ${ArenaReactFixture.script}
             window.received=[];window.fileStates=[];const root={tag:3,stateNode:{}};root.stateNode.current=root;
-            cards['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:fileStates},return:root};
+            fixtureFiber(cards,{attachmentStates:fileStates},root);
             function handle(){for(const file of document.getElementById('upload').files){
               const image=file.type.startsWith('image/'),card=document.createElement('div');card.style='height:80px;width:180px';
-              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
-              if('$kind'==='DEEPSEEK'){card.className='_25c7358';card.innerHTML='<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
+              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,localId:'local-'+file.name,isImage:image,auditResult:'pass',fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
+              if('$kind'==='DEEPSEEK'){card.className=image?'d5fa3d1b':'_25c7358';card.innerHTML=image?'<img alt="'+file.name+'" src="blob:https://chat.deepseek.com/local-preview">':'<span class="e70accd6">'+file.name+'</span>';fixtureFiber(card,{file:state},root);}
               else if('$kind'==='KIMI'){card.className=image?'image-thumbnail loading':'file-card-container parsing';card.innerHTML=image?'<img src="https://fixture.invalid/p.png">':'<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">'+file.name.split('.').pop()+'</span>';}
               else {card.setAttribute('data-testid','attachment_file_item');card.textContent=file.name;}
               cards.appendChild(card);const reader=new FileReader();reader.onload=()=>{received.push({name:file.name,data:reader.result});setTimeout(()=>{
                 state.status=${if(fail) "'FAILED'" else if(service == ArenaService.DOUBAO) "'Normal'" else "'SUCCESS'"};state.parseState=${if(fail) 2 else 1};
-                state.imageList=[{key:state.fileKey,image_ori:{url:'https://fixture.invalid/p.png'}}];
+                if('$kind'==='DEEPSEEK'&&image&&${!fail}){state.fileName=file.name.replace(/\.[^.]+${'$'}/,'')+'.webp';state.fileSize=Math.max(1,file.size-1);}
+                state.imageList=[{key:state.fileKey,image_ori:{url:'blob:https://www.doubao.com/local-preview'}}];
                 if('$kind'==='KIMI')card.className=(image?'image-thumbnail ':'file-card-container ')+${if(fail) "'error'" else "'success'"};
               },150);};reader.readAsDataURL(file);
             }}
@@ -329,4 +636,19 @@ class ArenaAttachmentInstrumentedTest {
             </script>
         """.trimIndent()
     }
+
+    private fun modernDoubaoFixture(): String = """
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <style>button,[role=menuitem],label{min-width:100px;min-height:40px;display:block}textarea{height:50px}#local-menu{display:none}</style>
+        <label>Upload avatar<input type="file" style="display:none"></label>
+        <div class="guidance-input-surface"><div class="relative" id="upload-slot"><input type="file" multiple accept="image/*,.txt" style="display:none"></div><textarea></textarea>
+          <div class="guidance-input-actions"><button id="local-trigger" data-slot="dropdown-menu-trigger" aria-haspopup="menu"></button>
+            <div data-slot="dropdown-menu-trigger" aria-haspopup="menu"><button data-dbx-name="button">Model</button></div>
+          </div>
+        </div>
+        <div role="menu" data-slot="dropdown-menu-content" aria-labelledby="avatar-trigger"><div role="menuitem" data-slot="dropdown-menu-item">上传文件或图片</div></div>
+        <div role="menu" data-slot="dropdown-menu-content" aria-labelledby="local-trigger" style="display:none"><input type="file"><div role="menuitem" data-slot="dropdown-menu-item">上传文件或图片</div></div>
+        <div id="local-menu" role="menu" data-slot="dropdown-menu-content" aria-labelledby="local-trigger"><div role="menuitem" data-slot="dropdown-menu-item">选择云盘文件</div><div role="menuitem" data-slot="dropdown-menu-item" id="local-upload">上传文件或图片</div></div>
+        <script>const button=document.createElement('button');button.setAttribute('data-dbx-name','button');button.setAttribute('aria-haspopup','menu');button.textContent='+';document.getElementById('local-trigger').appendChild(button);</script>
+    """.trimIndent()
 }
