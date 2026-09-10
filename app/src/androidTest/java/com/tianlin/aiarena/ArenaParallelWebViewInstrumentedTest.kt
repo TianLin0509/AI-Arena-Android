@@ -168,6 +168,79 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun kimiCurrentDivSendControlActuallySubmitsAfterAttachment() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                document.querySelector('._77cefa5').classList.add('chat-editor');
+                const old=document.querySelector('.send-msg-btn'),sendControl=document.createElement('div');sendControl.className='send-button-container';sendControl.style='height:40px;width:80px';sendControl.innerHTML='<svg class="send-icon"></svg>';sendControl.onclick=send;old.replaceWith(sendControl);true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "current-send-control", "current-kimi", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue("Current Kimi div send control must confirm the submission: ${outcome.get()}", outcome.get().success)
+            verifyBytes(view, attachment)
+            assertEquals("1", evaluate(view, "window.sendCount"))
+            assertEquals("current-send-control", evaluate(view, "window.sentText"))
+        }
+    }
+
+    @Test fun bothSendScriptsRespectDisabledContainersWithoutEnterFallback() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                document.querySelector('._77cefa5').classList.add('chat-editor');
+                const old=document.querySelector('.send-msg-btn');window.disabledControl=document.createElement('div');disabledControl.className='send-button-container disabled';disabledControl.style='height:40px;width:80px';
+                window.disabledClicks=0;window.enterKeys=0;disabledControl.onclick=()=>disabledClicks++;old.replaceWith(disabledControl);document.querySelector('textarea').addEventListener('keydown',e=>{if(e.key==='Enter')enterKeys++});true;
+            """.trimIndent())
+            val initial = ArenaWebViewPool::class.java.getDeclaredMethod("sendScript", ArenaService::class.java, String::class.java, String::class.java).apply { isAccessible = true }
+            val retry = ArenaWebViewPool::class.java.getDeclaredMethod("clickSendScript", ArenaService::class.java, String::class.java).apply { isAccessible = true }
+            val states = listOf("disabledControl.className='send-button-container disabled'", "disabledControl.className='send-button-container';disabledControl.setAttribute('aria-disabled','true')", "disabledControl.removeAttribute('aria-disabled');disabledControl.setAttribute('data-disabled','true')")
+            states.forEachIndexed { index, state ->
+                evaluate(view, "$state;true")
+                evaluate(view, initial.invoke(pool, ArenaService.KIMI, ArenaJs.quote("blocked-$index"), "disabled-$index") as String)
+                assertEquals("not_ready", evaluate(view, retry.invoke(pool, ArenaService.KIMI, "disabled-$index") as String))
+                Thread.sleep(1_550)
+                assertEquals("0", evaluate(view, "window.disabledClicks"))
+                assertEquals("0", evaluate(view, "window.enterKeys"))
+            }
+        }
+    }
+
+    @Test fun kimiClosedToolkitRetriesLostTapWithABoundAndNeverRetogglesOpenMenu() {
+        listOf("recover", "exhausted", "open").forEach { mode ->
+            withPool(emptyMap()) { pool, views, attachment ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const trigger=document.querySelector('.toolkit-trigger-btn'),original=trigger.onclick;
+                    trigger.id='fixture-toolkit';trigger.setAttribute('aria-haspopup','menu');trigger.setAttribute('aria-controls','menu');trigger.setAttribute('aria-expanded','false');
+                    menu.setAttribute('role','menu');menu.setAttribute('aria-labelledby',trigger.id);window.toolkitTaps=0;
+                    trigger.onclick=()=>{toolkitTaps++;
+                      if('$mode'==='recover'&&toolkitTaps>1){trigger.setAttribute('aria-expanded','true');original.call(trigger);}
+                      if('$mode'==='open'){trigger.setAttribute('aria-expanded','true');menu.innerHTML='<div role="menuitem" style="height:40px">Loading menu</div>';}
+                    };true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "retry-$mode", "retry-$mode", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                if (mode == "open") {
+                    waitUntil("toolkit opened") { evaluate(view, "window.toolkitTaps") == "1" }
+                    Thread.sleep(3_000)
+                    assertEquals("An open menu must never be toggled by retry", "1", evaluate(view, "window.toolkitTaps"))
+                    assertEquals(1L, done.count)
+                    onMain { pool.cancelAutomation(ArenaService.KIMI) }
+                } else {
+                    assertTrue("$mode must settle after a bounded menu retry", done.await(15, TimeUnit.SECONDS))
+                    assertEquals(if (mode == "recover") "2" else "3", evaluate(view, "window.toolkitTaps"))
+                    assertEquals(mode == "recover", outcome.get().success)
+                    if (mode == "recover") { verifyBytes(view, attachment); assertEquals("1", evaluate(view, "window.sendCount")) }
+                    else assertEquals("0", evaluate(view, "window.sendCount"))
+                }
+            }
+        }
+    }
+
     @Test fun cancellingOneUploadRevokesOnlyItsLeasesAndDoesNotFinishOrCancelOtherTasks() {
         withPool(members.associateWith { 30_000L }) { pool, views, attachment ->
             val done = CountDownLatch(2)
@@ -327,7 +400,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 views = (field(pool, "webViews") as Map<ArenaService, WebView>).toMap()
                 views.forEach { (service, view) ->
                     view.stopLoading()
-                    view.loadDataWithBaseURL(service.url, fixture(service, delays[service] ?: 150L), "text/html", "UTF-8", service.url)
+                    view.loadDataWithBaseURL(service.url, fixture(service, delays[service] ?: 150L, attachment.mimeType.startsWith("image/")), "text/html", "UTF-8", service.url)
                 }
                 pool.show(null)
             }
@@ -367,29 +440,38 @@ class ArenaParallelWebViewInstrumentedTest {
 
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
-    private fun fixture(service: ArenaService, delay: Long): String {
+    private fun fixture(service: ArenaService, delay: Long, currentImageUi: Boolean): String {
+        val modernDoubao = currentImageUi && service == ArenaService.DOUBAO
+        val area = if (modernDoubao) "<div id='cards' class='container-tJHWhP flex flex-col pl-12 pr-2'></div>"
+            else "<div id='cards' data-testid='${if (service == ArenaService.KIMI) "input-attachment-list" else "attachment_area"}'></div>"
         val controls = if (service == ArenaService.KIMI) """
             <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; style=&quot;display:none&quot;></label>';upload.onchange=handle;">Add</button><div id="menu"></div>
+        """ else if (modernDoubao) """
+            <div class="relative"><input id="upload" type="file" accept="image/*" style="display:none">$area</div>
+            <div class="guidance-input-actions"><button id="upload-trigger" data-slot="dropdown-menu-trigger" aria-haspopup="menu" onclick="document.getElementById('upload-menu').style.display='block'"></button></div>
         """ else """
             <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" accept=".txt,image/*" style="display:none">
         """
         return """
             <meta name="viewport" content="width=device-width,initial-scale=1">
             <style>textarea{height:70px;width:240px}button{height:48px;min-width:110px}</style>
-            <div class="_77cefa5"><textarea id="chat-input" placeholder="Message"></textarea>$controls
-            <button class="send-msg-btn" aria-label="发送" onclick="send()">Send</button>
-            <div id="cards" data-testid="${if(service == ArenaService.KIMI) "input-attachment-list" else "attachment_area"}"></div></div>
+            <div class="_77cefa5 chat-editor ${if (modernDoubao) "guidance-input-surface" else ""}"><textarea id="chat-input" placeholder="Message"></textarea>$controls
+            ${if (currentImageUi && service == ArenaService.KIMI) "<div class='send-button-container' style='width:80px;height:40px' onclick='send()'>Send<svg class='send-icon'></svg></div>" else "<button class='send-msg-btn' aria-label='发送' onclick='send()'>Send</button>"}
+            ${if (modernDoubao) "" else area}</div>
+            ${if (modernDoubao) "<div id='upload-menu' role='menu' data-slot='dropdown-menu-content' aria-labelledby='upload-trigger' style='display:none'><div role='menuitem' data-slot='dropdown-menu-item' style='height:48px;width:180px'>选择云盘文件</div><div role='menuitem' data-slot='dropdown-menu-item' style='height:48px;width:180px' onclick=\"upload.click();document.getElementById('upload-menu').style.display='none'\">上传文件或图片</div></div>" else ""}
             <script>
+            ${if (modernDoubao) "const plus=document.createElement('button');plus.setAttribute('data-dbx-name','button');plus.setAttribute('aria-haspopup','menu');plus.textContent='+';document.getElementById('upload-trigger').appendChild(plus);" else ""}
             window.fixtureReady=true;window.received=[];window.fileStates=[];window.sendCount=0;window.sentText='';
             const root={tag:3,stateNode:{}};root.stateNode.current=root;
             cards['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:fileStates},return:root};
             window.completeFixture=()=>{fileStates.forEach(f=>{f.status='${if(service == ArenaService.DOUBAO) "Normal" else "SUCCESS"}';f.parseState=1;
-              if('${service.name}'==='DEEPSEEK'&&f.isImage){f.fileName=f.fileName.replace(/\.[^.]+${'$'}/,'')+'.webp';f.fileSize=Math.max(1,f.fileSize-1);}
+              if('${service.name}'==='DEEPSEEK'&&f.isImage&&!f.fileName.endsWith('.webp')){f.fileName=f.fileName.replace(/\.[^.]+${'$'}/,'')+'.webp';f.fileSize=Math.max(1,f.fileSize-1);}
               f.imageList=[{key:f.fileKey,image_ori:{url:'blob:https://www.doubao.com/local-preview'}}];});
               Array.from(cards.children).forEach(c=>{if('${service.name}'==='KIMI')c.className=(c.classList.contains('image-thumbnail')?'image-thumbnail ':'file-card-container ')+'success';});};
             function handle(){for(const file of upload.files){
               const image=file.type.startsWith('image/');
               const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,localId:'local-'+file.name,isImage:image,auditResult:'pass',fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
+              if('${service.name}'==='DEEPSEEK'&&image&&$currentImageUi){state.fileName=file.name.replace(/\.[^.]+${'$'}/,'')+'.webp';state.fileSize=Math.max(1,file.size-1);}
               const card=document.createElement('div');card.style='height:60px;width:180px';
               if('${service.name}'==='DEEPSEEK'){card.className=image?'d5fa3d1b':'_25c7358';card.innerHTML=image?'<img alt="'+file.name+'" src="blob:https://chat.deepseek.com/local-preview">':'<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
               else if('${service.name}'==='KIMI'){card.className=image?'image-thumbnail loading':'file-card-container parsing';card.innerHTML=image?'<img src="https://fixture.invalid/p.png">':'<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">txt</span>';}

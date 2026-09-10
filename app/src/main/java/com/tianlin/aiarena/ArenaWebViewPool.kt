@@ -1166,13 +1166,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             (function() {
               $stateBootstrap
               $selectorHelper
+              ${sendControlHelperScript()}
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
               const send = arenaFirstMatch($sendSelectors);
-              if (!send || send.disabled || send.getAttribute('aria-disabled') === 'true') return 'not_ready';
+              if (!arenaSendEnabled(send)) return 'not_ready';
               window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
               window.__aiArenaSendClicks[requestId] = Date.now();
               send.click();
@@ -1224,6 +1225,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
                 if (cancelled()) return 'cancelled';
                 $selectorHelper
+                ${sendControlHelperScript()}
                 $qwenFetchHook
                 $zhipuMessageDispatch
                 const input = arenaFirstMatch($inputSelectors);
@@ -1313,7 +1315,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (!currentInputText().trim()) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
-                  if (send && !send.disabled && send.getAttribute('aria-disabled') !== 'true') {
+                  if (send) {
+                    if (!arenaSendEnabled(send)) return;
                     window.__aiArenaSendClicks[requestId] = Date.now();
                     send.click();
                   } else {
@@ -1330,6 +1333,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             })();
         """.trimIndent()
     }
+
+    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
+    private fun sendControlHelperScript(): String = """
+        const arenaSendEnabled = function(send) {
+          if (!send) return false;
+          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
+          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
+          for(let node=send;node&&node!==document.body;node=node.parentElement){
+            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
+          }
+          return true;
+        };
+    """.trimIndent()
 
     /**
      * 输入框候选，**按优先级从精确到兜底排列**。
@@ -1476,6 +1492,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[aria-label*='发送']",
             )
             ArenaService.KIMI -> listOf(
+                ".chat-editor .send-button-container",
                 "button[class*='send']",
                 "button[aria-label*='发送']",
                 "button[type='submit']",

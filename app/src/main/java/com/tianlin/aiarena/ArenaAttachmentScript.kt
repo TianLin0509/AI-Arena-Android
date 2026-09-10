@@ -2,6 +2,7 @@ package com.tianlin.aiarena
 
 /** Read-only readiness probes deliberately fail closed when a vendor changes its upload UI. */
 internal object ArenaAttachmentScript {
+    private const val doubaoAreaSelector = "[data-testid=attachment_area],.guidance-input-surface > .relative > .container-tJHWhP"
     fun prepare(requestId: String, files: List<ArenaAttachment>, service: ArenaService): String {
         val expected = files.joinToString(",", "[", "]") { "{name:${ArenaJs.quote(it.name)},size:${it.sizeBytes},mime:${ArenaJs.quote(it.mimeType)}}" }
         return """
@@ -15,13 +16,13 @@ internal object ArenaAttachmentScript {
               const existing=Array.from(document.querySelectorAll(${ArenaJs.quote(when(service) {
                 ArenaService.DEEPSEEK -> "._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b"
                 ArenaService.KIMI -> "[data-testid=input-attachment-list] .file-card-container,[data-testid=input-attachment-list] .image-thumbnail,.chat-editor-attachment-area .file-card-container,.chat-editor-attachment-area .image-thumbnail"
-                ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_]"
+                ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_],.guidance-input-surface > .relative > .container-tJHWhP"
                 else -> "[data-arena-no-attachment-support]"
               })})).filter(shown);
-              const doubaoArea=document.querySelector('[data-testid=attachment_area]');
-              if(doubaoArea){const props=reactProps(doubaoArea,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(doubaoArea);}
+              document.querySelectorAll(${ArenaJs.quote(doubaoAreaSelector)}).forEach(area=>{const props=reactProps(area,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(area);});
               if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，请先到原网页移除后重试，避免重复上传'});
-              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,clicked:new WeakSet(),baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[]};
+              const previousLocalIds=new Set(Array.from(document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b')).map(card=>reactProps(card,'file')?.file?.localId).filter(id=>typeof id==='string'&&id));
+              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,clicked:new WeakSet(),menuAttempts:new Map(),baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
               const rememberImages=()=>{
                 document.querySelectorAll('[data-testid="input-attachment-list"] .image-thumbnail,.chat-editor-attachment-area .image-thumbnail').forEach(card=>{
                   if(!state.baseline.has(card)&&card.classList.contains('loading'))state.imageWasLoading.add(card);
@@ -34,6 +35,7 @@ internal object ArenaAttachmentScript {
                 if (window.__arenaAttachment !== state || !e.target || e.target.type !== 'file') return;
                 const actual = Array.from(e.target.files || []);
                 state.chosen = actual.length === state.expected.length && state.expected.every(f => actual.some(a => a.name === f.name && a.size === f.size));
+                state.selectionConfirmed = state.chosen;
                 if (!state.chosen) state.error = '网页收到的附件与所选附件不一致';
               };
               document.addEventListener('change', state.listener, true);
@@ -52,7 +54,12 @@ internal object ArenaAttachmentScript {
     private val reactHelpers: String get() = """
         const currentFiber = element => {
           let fiber=element[Object.keys(element).find(k=>k.startsWith('__reactFiber${'$'}'))];
-          const isCurrent=f=>{if(!f)return false;let root=f,guard=0;while(root.return&&guard++<100)root=root.return;return root.tag===3&&root.stateNode&&root.stateNode.current===root;};
+          const isCurrent=f=>{
+            if(!f)return false;
+            let root=f,depth=0;const seen=new Set();
+            while(root.return){if(seen.has(root)||depth++>=512)return false;seen.add(root);root=root.return;}
+            return root.tag===3&&root.stateNode&&root.stateNode.current===root;
+          };
           if(isCurrent(fiber))return fiber;
           if(fiber&&isCurrent(fiber.alternate))return fiber.alternate;
           return null;
@@ -60,8 +67,8 @@ internal object ArenaAttachmentScript {
         const reactProps=(element,key)=>{let fiber=currentFiber(element);for(let depth=0;fiber&&depth<15;depth++,fiber=fiber.return){if(fiber.memoizedProps&&fiber.memoizedProps[key])return fiber.memoizedProps;}return null;};
     """.trimIndent()
 
-    // DeepSeek may asynchronously convert mobile PNG/JPEG files to WebP. Bind the original
-    // committed name/size to its stable localId before accepting changed server metadata.
+    // Prefer binding original metadata before DeepSeek's WebP conversion; readiness also
+    // handles batched conversion after exact chooser confirmation and stable unique matching.
     private val deepSeekIdentityHelpers = """
         const rememberDeepSeekFiles=state=>{
           if(!state.chosen)return;
@@ -69,7 +76,7 @@ internal object ArenaAttachmentScript {
           document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b').forEach(card=>{
             if(state.baseline.has(card))return;
             const props=reactProps(card,'file'),file=props&&props.file;
-            if(!file||typeof file.localId!=='string'||!file.localId||reserved.has(file.localId))return;
+            if(!file||typeof file.localId!=='string'||!file.localId||reserved.has(file.localId)||state.previousLocalIds.has(file.localId))return;
             const index=state.expected.findIndex((expected,i)=>!state.deepSeekLocalIds[i]&&expected.mime.startsWith('image/')&&file.fileName===expected.name&&Number(file.fileSize)===expected.size);
             if(index>=0){state.deepSeekLocalIds[index]=file.localId;reserved.add(file.localId);}
           });
@@ -83,13 +90,29 @@ internal object ArenaAttachmentScript {
           const candidates = [];
           ${when(service) {
               ArenaService.DEEPSEEK -> "const input=Array.from(document.querySelectorAll('textarea')).find(visible);const scope=input&&input.closest('._77cefa5');if(!scope)return JSON.stringify({waiting:true});"
-              ArenaService.DOUBAO -> "const trigger=document.querySelector('[data-testid=upload_file_button]');if(trigger)candidates.push(trigger);const scope=document;"
+              ArenaService.DOUBAO -> """
+                const surfaces=Array.from(document.querySelectorAll('.guidance-input-surface')).filter(e=>visible(e)&&e.querySelector('textarea,[contenteditable=true]')&&e.querySelector('input[type=file]'));
+                const scope=surfaces.length===1?surfaces[0]:document;
+                if(surfaces.length===1){
+                  const triggers=Array.from(scope.querySelectorAll('.guidance-input-actions button[data-slot=dropdown-menu-trigger][aria-haspopup=menu]')).filter(e=>visible(e)&&e.id&&e.querySelector('button[data-dbx-name=button][aria-haspopup=menu]'));
+                  if(triggers.length===1){
+                    const trigger=triggers[0];
+                    const menus=Array.from(document.querySelectorAll('[role=menu][data-slot=dropdown-menu-content]')).filter(e=>visible(e)&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id));
+                    if(menus.length===1){
+                      const local=Array.from(menus[0].querySelectorAll('[role=menuitem][data-slot=dropdown-menu-item]')).filter(e=>e.closest('[role=menu]')===menus[0]&&(e.textContent||'').replace(/\s+/g,'')==='上传文件或图片');
+                      if(local.length===1)candidates.push(local[0]);
+                    }else if(menus.length===0)candidates.push(trigger.querySelector('button[data-dbx-name=button][aria-haspopup=menu]'));
+                  }
+                }else if(surfaces.length===0){
+                  document.querySelectorAll('[data-testid=upload_file_button]').forEach(e=>candidates.push(e));
+                }
+              """.trimIndent()
               ArenaService.KIMI -> "const trigger=document.querySelector('.toolkit-trigger-btn');if(trigger)candidates.push(trigger);const scope=document;"
               else -> "return JSON.stringify({error:'该成员暂不支持附件'});const scope=document;"
           }}
           scope.querySelectorAll('input[type=file]').forEach(input => {
             ${if(service == ArenaService.KIMI) "if(!input.closest('label.toolkit-item[role=menuitem]'))return;" else ""}
-            ${if(service == ArenaService.DOUBAO) "if(!input.closest('[data-testid=upload_file_button],[role=menu],[role=menuitem],label'))return;" else ""}
+            ${if(service == ArenaService.DOUBAO) "if(!input.matches('[data-testid=upload-file-input]')&&!input.closest('[data-testid=upload_file_button]'))return;" else ""}
             if (visible(input)) candidates.push(input);
             if(input.id) document.querySelectorAll('label').forEach(label => { if(label.htmlFor===input.id) candidates.push(label); });
             const parent=input.parentElement;
@@ -101,14 +124,29 @@ internal object ArenaAttachmentScript {
               else sibling.querySelectorAll('button,[role=button]').forEach(e=>candidates.push(e));
             }
           });
-          const target=candidates.find(e=>visible(e)&&getComputedStyle(e).pointerEvents!=='none'&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!state.clicked.has(e));
-          if(!target) return JSON.stringify({waiting:true});
+          const kimiTrigger=e=>${if (service == ArenaService.KIMI) "e.matches('.toolkit-trigger-btn')&&e.id&&e.getAttribute('aria-haspopup')==='menu'" else "false"};
+          const closedToolkit=e=>{
+            if(!kimiTrigger(e)||state.chosen||e.getAttribute('aria-expanded')!=='false'||document.querySelector('label.toolkit-item[role=menuitem] input[type=file]'))return false;
+            const controls=(e.getAttribute('aria-controls')||'').split(/\s+/);
+            return !Array.from(document.querySelectorAll('[role=menu]')).some(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\s+/).includes(e.id)));
+          };
+          const eligible=candidates.filter(e=>visible(e)&&getComputedStyle(e).pointerEvents!=='none'&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!['','true'].includes(e.getAttribute('data-disabled'))&&!e.classList.contains('disabled'));
+          const target=eligible.find(e=>{
+            const attempt=kimiTrigger(e)&&state.menuAttempts.get(e.id);
+            if(!state.clicked.has(e)&&!attempt)return true;
+            return attempt&&attempt.count<3&&Date.now()-attempt.at>=2000&&closedToolkit(e);
+          });
+          if(!target){
+            if(eligible.some(e=>{const attempt=kimiTrigger(e)&&state.menuAttempts.get(e.id);return attempt&&attempt.count>=3&&Date.now()-attempt.at>=2000&&closedToolkit(e);}))return JSON.stringify({error:'Kimi 附件菜单连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
+            return JSON.stringify({waiting:true});
+          }
           target.scrollIntoView({block:'nearest',inline:'nearest'});
           const r=target.getBoundingClientRect(); const x=r.left+r.width/2,y=r.top+r.height/2;
           if(x<0||y<0||x>innerWidth||y>innerHeight) return JSON.stringify({waiting:true});
           const hit=document.elementFromPoint(x,y);
           if(!hit || !(target===hit || target.contains(hit) || hit.contains(target))) return JSON.stringify({waiting:true});
           state.clicked.add(target);
+          if(kimiTrigger(target)){const previous=state.menuAttempts.get(target.id);state.menuAttempts.set(target.id,{count:(previous?.count||0)+1,at:Date.now()});}
           return JSON.stringify({x,y,width:innerWidth,height:innerHeight});
         })();
     """.trimIndent()
@@ -132,32 +170,55 @@ internal object ArenaAttachmentScript {
           const composer=input&&input.closest('._77cefa5');
           const cards=composer?Array.from(composer.querySelectorAll('._25c7358,.d5fa3d1b')).filter(e=>visible(e)&&!state.baseline.has(e)):[];
           if(cards.length) {
+            const allEntries=cards.map(card=>({card,props:reactProps(card,'file')})).filter(entry=>entry.props&&entry.props.file);
+            const localIds=allEntries.map(({props})=>props.file.localId).filter(id=>typeof id==='string'&&id);
+            if(cards.length>state.expected.length||localIds.some(id=>state.previousLocalIds.has(id))||new Set(localIds).size!==localIds.length)return JSON.stringify({error:'DeepSeek 出现额外、重复或旧附件身份，未发送问题'});
+            const canConvert=expected=>expected.mime.startsWith('image/')&&(/\.(jpe?g|png|heic|heif)${'$'}/i.test(expected.name)||['image/jpeg','image/png','image/heic','image/heif'].includes(expected.mime));
+            const webpName=expected=>{const dot=expected.name.lastIndexOf('.');return (dot>0?expected.name.slice(0,dot):expected.name)+'.webp';};
             let complete=0;const used=new Set();
             for(const [index,expected] of state.expected.entries()) {
               const localId=state.deepSeekLocalIds[index],isImage=expected.mime.startsWith('image/');
-              const convertible=isImage&&(/\.(jpe?g|png|heic|heif)${'$'}/i.test(expected.name)||['image/jpeg','image/png','image/heic','image/heif'].includes(expected.mime));
-              const dot=expected.name.lastIndexOf('.'),convertedName=(dot>0?expected.name.slice(0,dot):expected.name)+'.webp';
-              const entries=cards.filter(card=>!used.has(card)).map(card=>({card,props:reactProps(card,'file')})).filter(entry=>entry.props&&entry.props.file);
-              const entry=entries.find(({props})=>{
+              const convertible=canConvert(expected),convertedName=webpName(expected);
+              const entries=allEntries.filter(({card})=>!used.has(card));
+              let deferredIdentity=false;
+              let entry=entries.find(({props})=>{
                 const file=props.file,exact=file.fileName===expected.name&&Number(file.fileSize)===expected.size;
                 if(localId&&file.localId!==localId)return false;
                 return exact||(convertible&&localId&&file.isImage===true&&file.fileName===convertedName&&Number(file.fileSize)>0);
               });
+              if(!entry&&convertible&&!localId){
+                const converted=entries.filter(({props})=>props.file.fileName===convertedName&&props.file.isImage===true);
+                if(converted.length){
+                  const originals=state.expected.filter(other=>other.name===convertedName||(canConvert(other)&&webpName(other)===convertedName));
+                  if(!state.selectionConfirmed||originals.length!==1||converted.length!==1)return JSON.stringify({error:expected.name+'：DeepSeek 图片转换身份不唯一或选图未确认，未发送问题'});
+                  entry=converted[0];deferredIdentity=true;
+                }
+              }
               if(!entry){
-                if(convertible&&!localId&&entries.some(({props})=>props.file.fileName===convertedName&&props.file.status==='SUCCESS'))return JSON.stringify({error:expected.name+'：无法核对 DeepSeek 图片转换前的文件身份，请在原网页确认附件后手动发送'});
+                if(allEntries.length===state.expected.length&&allEntries.every(({props})=>props.file.status==='SUCCESS'))return JSON.stringify({error:expected.name+'：DeepSeek 附件名称或身份不匹配，未发送问题'});
                 continue;
               }
               const {card,props}=entry,file=props.file;used.add(card);
               if(card.querySelector('._6e3a316,.a1310f97,._8753412')) return JSON.stringify({error:expected.name+'：DeepSeek 附件解析失败'});
               if(['FAILED','ERROR','REJECTED','CONTENT_FILTER','CONTENT_TOO_LONG','CANCELLED','CONTENT_EMPTY','_CUSTOM_SYSTEM_ERROR_FAIL'].includes(file.status)||file.auditResult==='reject'||props.fileUploadInfo?.failed||props.fileErrorState?.hasError)return JSON.stringify({error:expected.name+'：DeepSeek 附件上传、解析或审核失败'});
               if(props.fileUploadInfo?.isUploading||props.isForking)continue;
-              if(file.status==='SUCCESS'&&file.id&&file.id!==file.localId&&(!isImage||(file.isImage===true&&[null,'pass'].includes(file.auditResult??null))))complete++;
+              if(file.status!=='SUCCESS'||!file.id||file.id===file.localId||(isImage&&(file.isImage!==true||![null,'pass'].includes(file.auditResult??null))))continue;
+              if(deferredIdentity){
+                if(allEntries.length!==state.expected.length||localIds.length!==state.expected.length||!Number.isSafeInteger(Number(file.fileSize))||Number(file.fileSize)<=0)continue;
+                const signature=JSON.stringify([file.localId,file.id,file.fileName,Number(file.fileSize)]),previous=state.deepSeekCandidates[index];
+                if(previous&&previous.signature!==signature)return JSON.stringify({error:expected.name+'：DeepSeek 图片确认期间身份发生变化，未发送问题'});
+                if(!previous){state.deepSeekCandidates[index]={signature,at:Date.now()};continue;}
+                if(Date.now()-previous.at<500)continue;
+                state.deepSeekLocalIds[index]=file.localId;
+              }
+              complete++;
             }
             return JSON.stringify({ready:complete===state.expected.length&&cards.length===state.expected.length,detail:'DeepSeek 已确认 '+complete+'/'+state.expected.length+' 个附件解析完成'});
           }
         """.trimIndent()
         ArenaService.DOUBAO -> """
-          const area=document.querySelector('[data-testid="attachment_area"]');
+          const areas=Array.from(document.querySelectorAll(${ArenaJs.quote(doubaoAreaSelector)}));
+          const area=areas.length===1?areas[0]:null;
           if(area) {
             const props=reactProps(area,'attachmentStates'),files=props&&props.attachmentStates;
             if(!Array.isArray(files))return JSON.stringify({ready:false,detail:'无法确认豆包附件处理状态'});
