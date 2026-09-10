@@ -24,7 +24,7 @@ internal object ArenaAttachmentScript {
               document.querySelectorAll(${ArenaJs.quote(doubaoAreaSelector)}).forEach(area=>{const props=reactProps(area,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(area);});
               if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，请先到原网页移除后重试，避免重复上传'});
               const previousLocalIds=new Set(Array.from(document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b')).map(card=>reactProps(card,'file')?.file?.localId).filter(id=>typeof id==='string'&&id));
-              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,selectionInput:null,clicked:new WeakSet(),menuAttempts:new Map(),fileControlAttempt:null,controlSequence:0,pendingControl:null,baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
+              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,selectionInput:null,clicked:new WeakSet(),menuAttempts:new Map(),fileControlAttempt:null,deepSeekControlAttempt:null,controlSequence:0,pendingControl:null,baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
               const rememberImages=()=>{
                 document.querySelectorAll('[data-testid="input-attachment-list"] .image-thumbnail,.chat-editor-attachment-area .image-thumbnail').forEach(card=>{
                   if(!state.baseline.has(card)&&card.classList.contains('loading'))state.imageWasLoading.add(card);
@@ -91,9 +91,20 @@ internal object ArenaAttachmentScript {
           $helpers
           if (!state || state.id !== ${ArenaJs.quote(requestId)}) return JSON.stringify({error:'附件请求已取消'});
           const candidates = [];
-          let doubaoMenuTrigger=null,doubaoMenuTarget=null,kimiFileLabel=null,kimiFileInput=null,kimiFileTrigger=null;
+          let doubaoMenuTrigger=null,doubaoMenuTarget=null,kimiFileLabel=null,kimiFileInput=null,kimiFileTrigger=null,deepSeekInput=null,deepSeekTarget=null;
           ${when(service) {
-              ArenaService.DEEPSEEK -> "const input=Array.from(document.querySelectorAll('textarea')).find(visible);const scope=input&&input.closest('._77cefa5');if(!scope)return JSON.stringify({waiting:true});"
+              ArenaService.DEEPSEEK -> """
+                if(state.deepSeekControlAttempt?.count>=3&&Date.now()-state.deepSeekControlAttempt.at>=2000)return JSON.stringify({error:'DeepSeek 本地附件入口连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
+                const scopes=Array.from(new Set(Array.from(document.querySelectorAll('textarea')).filter(visible).map(input=>input.closest('._77cefa5')).filter(Boolean)));
+                if(scopes.length>1)return JSON.stringify({error:'无法确认 DeepSeek 唯一附件输入区，未发送问题'});
+                const scope=scopes[0];if(!scope)return JSON.stringify({waiting:true});
+                const inputs=Array.from(scope.querySelectorAll('input[type=file]'));
+                if(inputs.length>1)return JSON.stringify({error:'无法确认 DeepSeek 唯一附件入口，未发送问题'});
+                deepSeekInput=inputs[0];if(!deepSeekInput)return JSON.stringify({waiting:true});
+                const previous=state.deepSeekControlAttempt;
+                if(previous&&(previous.scope!==scope||previous.input!==deepSeekInput))return JSON.stringify({error:'DeepSeek 附件入口已变化，未发送问题；请打开原网页检查后重试'});
+                if(state.chosen||deepSeekInput.disabled||!deepSeekInput.files||deepSeekInput.files.length)return JSON.stringify({waiting:true});
+              """.trimIndent()
               ArenaService.DOUBAO -> """
                 const surfaces=Array.from(document.querySelectorAll('.guidance-input-surface')).filter(e=>visible(e)&&e.querySelector('textarea,[contenteditable=true]')&&e.querySelector('input[type=file]'));
                 const scope=surfaces.length===1?surfaces[0]:document;
@@ -137,7 +148,7 @@ internal object ArenaAttachmentScript {
             ${if(service == ArenaService.KIMI) "return; // Kimi local input is only eligible through the unique bound open menu above." else ""}
             ${if(service == ArenaService.DOUBAO) "if(!input.matches('[data-testid=upload-file-input]')&&!input.closest('[data-testid=upload_file_button]'))return;" else ""}
             if (visible(input)) candidates.push(input);
-            if(input.id) document.querySelectorAll('label').forEach(label => { if(label.htmlFor===input.id) candidates.push(label); });
+            if(input.id) document.querySelectorAll('label').forEach(label => { if(label.htmlFor===input.id${if(service == ArenaService.DEEPSEEK) "&&scope.contains(label)" else ""}) candidates.push(label); });
             const parent=input.parentElement;
             if(parent && parent.matches('label,button,[role=button]')) candidates.push(parent);
             // DeepSeek keeps a hidden input immediately after its visible upload control.
@@ -157,7 +168,13 @@ internal object ArenaAttachmentScript {
             return !Array.from(document.querySelectorAll('[role=menu]')).some(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id)));
           };
           const eligible=candidates.filter(e=>visible(e)&&getComputedStyle(e).pointerEvents!=='none'&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!['','true'].includes(e.getAttribute('data-disabled'))&&!e.classList.contains('disabled'));
+          ${if (service == ArenaService.DEEPSEEK) """
+            const directTargets=Array.from(new Set(eligible));
+            if(directTargets.length>1)return JSON.stringify({error:'无法确认 DeepSeek 唯一本地上传控件，未发送问题'});
+            deepSeekTarget=directTargets[0]||null;
+          """.trimIndent() else ""}
           const target=eligible.find(e=>{
+            if(e===deepSeekTarget){const attempt=state.deepSeekControlAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
             if(e===kimiFileLabel){const attempt=state.fileControlAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
             const trigger=menuTrigger(e),attempt=trigger&&state.menuAttempts.get(trigger.id);
             if(!state.clicked.has(e)&&!attempt)return true;
@@ -185,13 +202,18 @@ internal object ArenaAttachmentScript {
           hold.clickTarget.addEventListener('click',hold.clickListener,true);
           state.pendingControl=hold;
           state.clicked.add(target);
+          if(target===deepSeekTarget){
+            // This request-wide budget survives button replacement and untouched geometry rollback.
+            // A new file input or composer cannot inherit a previous input's upload authority.
+            const previous=state.deepSeekControlAttempt;state.deepSeekControlAttempt={scope,input:deepSeekInput,count:(previous?.count||0)+1,at:Date.now()};
+          }
           if(target===kimiFileLabel){
             // Kimi closes and unmounts the menu on input click, before chooser change can bubble to document.
             if(!state.selectionInput){state.selectionInput=kimiFileInput;kimiFileInput.addEventListener('change',state.listener,true);}
             const previous=state.fileControlAttempt;state.fileControlAttempt={label:target,input:kimiFileInput,triggerId:kimiFileTrigger.id,count:(previous?.count||0)+1,at:Date.now()};
           }
           if(clickedTrigger){const previous=state.menuAttempts.get(clickedTrigger.id);state.menuAttempts.set(clickedTrigger.id,{count:(previous?.count||0)+1,at:Date.now()});}
-          return JSON.stringify({x,y,width:innerWidth,height:innerHeight,controlId:hold.id,retryableTap:!!clickedTrigger||target===kimiFileLabel});
+          return JSON.stringify({x,y,width:innerWidth,height:innerHeight,controlId:hold.id,retryableTap:!!clickedTrigger||target===kimiFileLabel||target===deepSeekTarget});
         })();
     """.trimIndent()
 

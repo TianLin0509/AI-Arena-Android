@@ -36,6 +36,10 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 
 真实证据由 Merger 保存为 `artifacts/20260909-real-attachment-r9-image-native-acceptance.json` 和 `artifacts/20260909-real-attachment-r9-document-native-acceptance.json`；Author 的红绿、主机及全量设备证据保留在任务工作树 `artifacts/20260909-real-attachment-r9-*`。这些是带日期的候选记录，不能代替最终 SHA 的独立闸门，也不覆盖其他格式、多附件、其他账号 / 网页版本、正式 R8 包实传、签名升级或 API 26 发布冒烟。
 
+### 0.13.2 r10 的 Author 交接范围（2026-09-10）
+
+新增五项生产 WebViewPool 回归在同一测试包上完成 RED / GREEN；主机闸门仍为 8 项工作流、131 项 JVM、两种 lint 与构建，全部 127 项 Android instrumentation 通过。证据保留在任务工作树 `artifacts/20260909-real-attachment-r10-*`。此时 r10 最终 SHA 的独立闸门、正式 R8 包 PNG / JPEG / TXT 实传及签名 API 26 覆盖升级仍待 Merger；不得沿用 r9 的真实通过代替。
+
 ## 发布
 
 当前产品版本 `0.13.2`、versionCode `22`，折叠回答 UI 基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
@@ -53,6 +57,8 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 0.13.2 图片适配验收还须覆盖：豆包当前输入区关联菜单及附件区域、Normal 状态保留 blob 预览但远端 key 匹配；DeepSeek 原始状态被批量渲染跳过时的选图确认、唯一名称映射与两次稳定 localId 观察，以及同名歧义、旧 ID、额外卡、身份变化、上传/审核失败时不发送；Kimi 当前 DIV 发送控件和禁用时不触发回车兜底。官网账号自动上传及随机图片内容识别必须单独记录，不能用这些回归测试代替。
 
 附件兼容还须覆盖：DeepSeek 超过 100 层的 React 树、current/alternate 切换、循环和超出 512 层时拒绝读取；Kimi 菜单标识延迟初始化时不提前点击；Kimi、豆包现代菜单首次点击被吞后的有界恢复、三次无响应结束及已打开菜单不重复点击。
+
+DeepSeek 直达入口恢复须限制唯一可见输入区、唯一 file input 和唯一已关联本地控件；至少间隔 2 秒、每请求最多三次，按钮重建和未 DOWN 的几何归还不得重置预算，输入框或输入区替换不得继承。须验证首次 capture 点击被吞后真实 URI / 字节交付且正文只一次、交付后解析期间不重选、持续失败终止、另一家在本请求结束前已接收 URI 且最终成功，以及取消后真实晚 chooser 到达生产 WebChromeClient 并明确回 null。不得以未发生实际点击冒充迟到保护通过，也不要求不同成员最终回调的固定顺序。
 
 Kimi 本地上传标签恢复只允许唯一已打开且绑定到 toolkit 的菜单、同一 label/input、空 file list、本请求未交付，至少相隔 2 秒且最多三次；必须验证已打开菜单不先关闭、菜单关闭/换 input/取消后无旧尝试、native 已交付但 change 延迟时不再触摸、重复 chooser 不重复 URI 也不中止首个合法上传。其他厂商上传项不扩大重试；手动 picker 只允许当前用户打开的原网页。
 

@@ -298,6 +298,181 @@ class ArenaParallelWebViewInstrumentedTest {
         """.trimIndent())
     }
 
+    @Test fun deepSeekLostDirectTapRecoversOnceAndStopsTappingAfterUriDelivery() {
+        withPool(mapOf(ArenaService.DEEPSEEK to 30_000L), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.directTapTimes=[];
+                document.querySelector('[data-testid=upload_file_button]').addEventListener('click',event=>{
+                  directTapTimes.push(Date.now());
+                  if(directTapTimes.length===1){event.preventDefault();event.stopImmediatePropagation();}
+                },true);true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DEEPSEEK, "direct-recovery", "direct-recovery", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            waitUntil("A lost direct click must recover or return an explicit outcome") { outcome.get() != null || evaluate(view, "received.length") == "1" }
+            assertEquals("The first unacknowledged direct click must not end the request: ${outcome.get()}", "1", evaluate(view, "received.length"))
+            verifyBytes(view, attachment)
+            val times = JSONArray(evaluate(view, "JSON.stringify(directTapTimes)"))
+            assertEquals(2, times.length())
+            assertTrue("Recovery must wait at least two seconds", times.getLong(1) - times.getLong(0) >= 2_000L)
+            Thread.sleep(2_500)
+            assertEquals("A delivered URI must never trigger another local picker while parsing", "2", evaluate(view, "directTapTimes.length"))
+            assertEquals("0", evaluate(view, "sendCount"))
+            evaluate(view, "completeFixture();true")
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun deepSeekReplacedButtonsCannotResetTheRequestWideAttemptLimitOrBlockKimi() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.directTapTimes=[];
+                const arm=button=>button.addEventListener('click',event=>{
+                  event.preventDefault();event.stopImmediatePropagation();directTapTimes.push(Date.now());
+                  const replacement=button.cloneNode(true);button.replaceWith(replacement);arm(replacement);
+                },true);arm(document.querySelector('[data-testid=upload_file_button]'));true;
+            """.trimIndent())
+            val done = CountDownLatch(2)
+            val outcomes = mutableMapOf<ArenaService, SendOutcome>()
+            val completedAt = mutableMapOf<ArenaService, Long>()
+            onMain { listOf(ArenaService.DEEPSEEK, ArenaService.KIMI).forEach { service ->
+                pool.sendPromptWithAttachments(service, "bounded-direct-${service.name}", "bounded-direct-${service.name}", listOf(attachment)) {
+                    outcomes[service] = it; completedAt[service] = System.currentTimeMillis(); done.countDown()
+                }
+            } }
+            assertTrue("Three failed attempts must settle without the 120 second upload timeout", done.await(18, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(outcomes.getValue(ArenaService.DEEPSEEK).success)
+                assertTrue(outcomes.getValue(ArenaService.DEEPSEEK).detail, outcomes.getValue(ArenaService.DEEPSEEK).detail.contains("连续 3 次"))
+                assertTrue(outcomes.toString(), outcomes.getValue(ArenaService.KIMI).success)
+            }
+            val kimiReceivedAt = JSONArray(evaluate(views.getValue(ArenaService.KIMI), "JSON.stringify(received)")).getJSONObject(0).getLong("at")
+            android.util.Log.i("ArenaDirectEvidence", "kimiUriAt=$kimiReceivedAt deepSeekStoppedAt=${completedAt.getValue(ArenaService.DEEPSEEK)} kimiCompletedAt=${completedAt.getValue(ArenaService.KIMI)}")
+            assertTrue("Kimi must receive its real URI while DeepSeek is still recovering", kimiReceivedAt < completedAt.getValue(ArenaService.DEEPSEEK))
+            val times = JSONArray(evaluate(view, "JSON.stringify(directTapTimes)"))
+            assertEquals("Replacing DOM nodes cannot reset a request's attempt budget", 3, times.length())
+            (1 until times.length()).forEach { assertTrue(times.getLong(it) - times.getLong(it - 1) >= 2_000L) }
+            assertEquals("0", evaluate(view, "received.length"))
+            assertEquals("0", evaluate(view, "sendCount"))
+            verifyBytes(views.getValue(ArenaService.KIMI), attachment)
+        }
+    }
+
+    @Test fun deepSeekChangedInputOrAmbiguousComposerCannotReceiveARecoveryTap() {
+        listOf("input-replaced", "extra-composer").forEach { mode ->
+            withPool(emptyMap()) { pool, views, attachment ->
+                val view = views.getValue(ArenaService.DEEPSEEK)
+                evaluate(view, """
+                    window.directTaps=0;
+                    document.querySelector('[data-testid=upload_file_button]').addEventListener('click',event=>{
+                      event.preventDefault();event.stopImmediatePropagation();directTaps++;
+                      if('$mode'==='input-replaced'){const replacement=upload.cloneNode(true);upload.replaceWith(replacement);replacement.onchange=handle;}
+                      else {const composer=document.querySelector('._77cefa5').cloneNode(true);document.body.appendChild(composer);}
+                    },true);true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.DEEPSEEK, mode, "direct-$mode", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(12, TimeUnit.SECONDS))
+                assertFalse(outcome.get().success)
+                assertTrue(outcome.get().detail, outcome.get().detail.contains(if (mode == "input-replaced") "入口已变化" else "唯一"))
+                assertEquals("1", evaluate(view, "directTaps"))
+                assertEquals("0", evaluate(view, "received.length"))
+                assertEquals("0", evaluate(view, "sendCount"))
+            }
+        }
+    }
+
+    @Test fun deepSeekCancelledDirectTapRejectsLateChooserWithoutAffectingAnotherProvider() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.directTaps=0;window.lateInputActivations=0;
+                document.querySelector('[data-testid=upload_file_button]').addEventListener('click',event=>{
+                  event.preventDefault();event.stopImmediatePropagation();directTaps++;
+                  setTimeout(()=>{lateInputActivations++;upload.click();},220);
+                },true);true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            val oldCallbacks = AtomicInteger()
+            val cancelled = AtomicBoolean()
+            val lateChoosers = AtomicInteger()
+            val rejectedChoosers = AtomicInteger()
+            onMain {
+                val productionClient = checkNotNull(view.webChromeClient)
+                view.webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onShowFileChooser(webView: WebView, callback: android.webkit.ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                        lateChoosers.incrementAndGet()
+                        return productionClient.onShowFileChooser(webView, android.webkit.ValueCallback { uris ->
+                            if (uris == null) rejectedChoosers.incrementAndGet()
+                            callback.onReceiveValue(uris)
+                        }, params)
+                    }
+                }
+                view.setOnTouchListener { _, event ->
+                    if (event.action == android.view.MotionEvent.ACTION_UP && !cancelled.get()) view.postDelayed({
+                        cancelled.set(true)
+                        pool.cancelAutomation(ArenaService.DEEPSEEK)
+                        pool.sendPromptWithAttachments(ArenaService.KIMI, "after-direct-cancel", "after-direct-cancel", listOf(attachment)) { outcome.set(it); done.countDown() }
+                    }, 40L)
+                    false
+                }
+                pool.sendPromptWithAttachments(ArenaService.DEEPSEEK, "obsolete-direct", "obsolete-direct", listOf(attachment)) { oldCallbacks.incrementAndGet() }
+            }
+            assertTrue(done.await(12, TimeUnit.SECONDS))
+            assertTrue(cancelled.get())
+            assertEquals("1", evaluate(view, "lateInputActivations"))
+            assertEquals("The real late chooser must reach the production WebChromeClient", 1, lateChoosers.get())
+            assertEquals("The production client must explicitly reject its URI callback", 1, rejectedChoosers.get())
+            assertEquals(0, oldCallbacks.get())
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "directTaps"))
+            assertEquals("0", evaluate(view, "received.length"))
+            assertEquals("0", evaluate(view, "sendCount"))
+            verifyBytes(views.getValue(ArenaService.KIMI), attachment)
+        }
+    }
+
+    @Test fun deepSeekGeometryReservationReturnCannotReplenishTheDirectAttemptBudget() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            val restored = AtomicBoolean()
+            val geometry = GeometryFixture {
+                onMain {
+                    val left = view.left; val top = view.top; val right = view.right; val bottom = view.bottom
+                    view.layout(left, top, right, top + 1)
+                    assertEquals(1, view.height)
+                    view.postDelayed({ view.layout(left, top, right, bottom); restored.set(true) }, 200L)
+                }
+            }
+            installGeometryFixture(pool, view, geometry, ArenaService.DEEPSEEK)
+            evaluate(view, """
+                const hit=document.elementFromPoint.bind(document);window.directSnapshots=0;window.directTaps=0;
+                document.elementFromPoint=(x,y)=>{const target=hit(x,y);
+                  if(target?.closest('[data-testid=upload_file_button]')&&window.__arenaAttachment){directSnapshots++;if(directSnapshots===1)GeometryFixture.changeSize();}return target;
+                };
+                document.querySelector('[data-testid=upload_file_button]').addEventListener('click',event=>{event.preventDefault();event.stopImmediatePropagation();directTaps++;},true);true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DEEPSEEK, "direct-geometry-budget", "direct-geometry-budget", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue("Fixture layout restore must finish before teardown", restored.get())
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("连续 3 次"))
+            assertEquals("A returned untouched reservation still consumes the same request budget", "3", evaluate(view, "directSnapshots"))
+            assertEquals("The first out-of-bounds snapshot must never touch the webpage", "2", evaluate(view, "directTaps"))
+            assertEquals("0", evaluate(view, "received.length"))
+            assertEquals("0", evaluate(view, "sendCount"))
+        }
+    }
+
     @Test fun doubaoSendPathsReserveOneClickUntilLateUserDomConfirmsDelivery() {
         withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
             val view = views.getValue(ArenaService.DOUBAO)
