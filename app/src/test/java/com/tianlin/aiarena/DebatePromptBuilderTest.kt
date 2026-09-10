@@ -92,7 +92,7 @@ class DebatePromptBuilderTest {
 
     @Test
     fun `answer modes expose distinct execution contracts`() {
-        assertTrue(AnswerMode.PARALLEL.description.contains("相互重叠"))
+        assertTrue(AnswerMode.PARALLEL.description.contains("独立发送"))
         assertTrue(AnswerMode.SERIAL.description.contains("回答结束后"))
     }
 

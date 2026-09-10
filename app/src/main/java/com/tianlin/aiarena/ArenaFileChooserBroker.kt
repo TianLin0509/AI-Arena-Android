@@ -50,6 +50,9 @@ internal class ArenaFileChooserBroker(private val context: Context) {
     fun generation(view: WebView): Long = generations[view] ?: 0L
     fun navigated(view: WebView) { generations[view] = generation(view) + 1; cancel(view) }
     fun cancel(view: WebView) { requests.remove(view)?.let { ArenaAttachmentLeases.revoke(it.leaseOwner) } }
+    fun cancel(view: WebView, requestId: String) {
+        if (requests[view]?.requestId == requestId) cancel(view)
+    }
     fun cancelAll() { requests.keys.toList().forEach(::cancel) }
     fun destroyed(view: WebView) { navigated(view); generations.remove(view) }
 
