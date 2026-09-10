@@ -34,6 +34,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Production pool/client/broker/scripts, with isolated pages shaped like the three provider editors. */
 class ArenaParallelWebViewInstrumentedTest {
@@ -186,6 +187,576 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun nativeUploadKeepsFocusUntilDelayedBrowserInputActivationAndReleasesBeforeParsing() {
+        withPool(mapOf(ArenaService.KIMI to 30_000L), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            installDelayedKimiActivation(view)
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "delayed-browser-click", "delayed-browser-click", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            waitUntil("Browser must activate the real file input after the delayed label click") {
+                evaluate(view, "window.inputActivation !== null") == "true"
+            }
+            val activation = JSONObject(evaluate(view, "JSON.stringify(window.inputActivation)"))
+            val deliveryDeadline = SystemClock.elapsedRealtime() + 1_500L
+            while (JSONArray(evaluate(view, "JSON.stringify(window.received)")).length() == 0 && SystemClock.elapsedRealtime() < deliveryDeadline) Thread.sleep(50)
+            val deliveredBeforeAssertion = JSONArray(evaluate(view, "JSON.stringify(window.received)")).length()
+            android.util.Log.i("ArenaClickEvidence", "delayed input focus=${activation.getBoolean("focus")} activation=${activation.getBoolean("active")} sinceUpMs=${activation.getDouble("sinceUp")} received=$deliveredBeforeAssertion")
+            assertTrue("Input activation lost native focus: $activation", activation.getBoolean("focus"))
+            assertTrue("The native tap must supply transient user activation: $activation", activation.getBoolean("active"))
+            assertTrue("Fixture must delay browser input activation after UP: $activation", activation.getDouble("sinceUp") >= 180.0)
+            waitUntil("Real native chooser must deliver the selected URI") { JSONArray(evaluate(view, "JSON.stringify(window.received)")).length() == 1 }
+            verifyBytes(view, attachment)
+            waitUntil("Focus lease must finish without waiting for network parsing") {
+                var released = false
+                onMain { released = field(pool, "focusAction") == null }
+                released
+            }
+            assertEquals("No text before attachment parsing", "0", evaluate(view, "window.sendCount"))
+            evaluate(view, "window.completeFixture();true")
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "window.sendCount"))
+        }
+    }
+
+    @Test fun unacknowledgedNativeClickHasABoundedFocusLeaseAndDoesNotBlockOtherProviders() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val kimi = views.getValue(ArenaService.KIMI)
+            evaluate(kimi, "document.querySelector('.toolkit-trigger-btn').addEventListener('click',event=>{event.preventDefault();event.stopImmediatePropagation();},true);true")
+            val done = CountDownLatch(2)
+            val outcomes = mutableMapOf<ArenaService, SendOutcome>()
+            val started = SystemClock.elapsedRealtime()
+            onMain {
+                listOf(ArenaService.KIMI, ArenaService.DEEPSEEK).forEach { service ->
+                    pool.sendPromptWithAttachments(service, "bounded-click-${service.name}", "bounded-click-${service.name}", listOf(attachment)) {
+                        outcomes[service] = it
+                        done.countDown()
+                    }
+                }
+            }
+            assertTrue("An unacknowledged click must not hold the focus queue until upload timeout", done.await(12, TimeUnit.SECONDS))
+            onMain {
+                assertFalse(outcomes.getValue(ArenaService.KIMI).success)
+                assertTrue(outcomes.getValue(ArenaService.KIMI).detail, outcomes.getValue(ArenaService.KIMI).detail.contains("菜单连续 3 次"))
+                assertTrue(outcomes.toString(), outcomes.getValue(ArenaService.DEEPSEEK).success)
+            }
+            assertTrue(SystemClock.elapsedRealtime() - started < 12_000L)
+            assertEquals("0", evaluate(kimi, "window.sendCount"))
+            assertEquals(0, JSONArray(evaluate(kimi, "JSON.stringify(window.received)")).length())
+            verifyBytes(views.getValue(ArenaService.DEEPSEEK), attachment)
+        }
+    }
+
+    @Test fun cancellingAfterNativeUpRejectsLateChooserAndCannotReleaseAnotherProvidersFocus() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val kimi = views.getValue(ArenaService.KIMI)
+            val deepSeek = views.getValue(ArenaService.DEEPSEEK)
+            installDelayedKimiActivation(kimi)
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            val oldCallbacks = AtomicInteger()
+            val cancelled = AtomicBoolean()
+            onMain {
+                var ups = 0
+                kimi.setOnTouchListener { _, event ->
+                    if (event.action == android.view.MotionEvent.ACTION_UP && ++ups == 2) {
+                        kimi.postDelayed({
+                            pool.cancelAutomation(ArenaService.KIMI)
+                            cancelled.set(true)
+                            pool.sendPromptWithAttachments(ArenaService.DEEPSEEK, "after-delayed-cancel", "after-delayed-cancel", listOf(attachment)) { outcome.set(it); done.countDown() }
+                        }, 40L)
+                    }
+                    false
+                }
+                pool.sendPromptWithAttachments(ArenaService.KIMI, "obsolete-delayed-click", "obsolete-delayed-click", listOf(attachment)) { oldCallbacks.incrementAndGet() }
+            }
+            assertTrue(done.await(12, TimeUnit.SECONDS))
+            assertTrue(cancelled.get())
+            assertEquals(0, oldCallbacks.get())
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("0", evaluate(kimi, "window.sendCount"))
+            assertEquals(0, JSONArray(evaluate(kimi, "JSON.stringify(window.received)")).length())
+            assertEquals("after-delayed-cancel", evaluate(deepSeek, "window.sentText"))
+            verifyBytes(deepSeek, attachment)
+        }
+    }
+
+    private fun installDelayedKimiActivation(view: WebView) {
+        evaluate(view, """
+            window.inputActivation=null;window.lastUploadUp=0;
+            document.querySelector('.toolkit-trigger-btn').addEventListener('click',()=>{
+              const label=menu.querySelector('label'),input=label.querySelector('input');
+              label.addEventListener('pointerup',()=>{window.lastUploadUp=performance.now();});
+              input.addEventListener('click',()=>{window.inputActivation={focus:document.hasFocus(),active:navigator.userActivation.isActive,sinceUp:performance.now()-window.lastUploadUp};},true);
+              label.addEventListener('click',event=>{
+                if(event.target===input)return;
+                event.preventDefault();
+                setTimeout(()=>input.click(),220);
+              });
+            });true;
+        """.trimIndent())
+    }
+
+    @Test fun doubaoSendPathsReserveOneClickUntilLateUserDomConfirmsDelivery() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                window.acceptedSends=0;window.pendingSends=0;
+                window.send=()=>{
+                  const input=document.querySelector('textarea'),text=input.value;
+                  if(!text.trim())return;
+                  if(fileStates.length!==1||fileStates[0].status!=='Normal')throw Error('attachment not ready');
+                  acceptedSends++;pendingSends++;
+                  setTimeout(()=>{
+                    const row=document.createElement('div');row.className='v_list_row';row.setAttribute('data-observe-row','');
+                    const user=document.createElement('span');user.className='bg-g-send';user.textContent=text;row.appendChild(user);document.body.appendChild(row);
+                    window.sentText=text;window.sendCount++;input.value='';pendingSends--;
+                  },1800);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "unique-late-dom", "unique-late-dom", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(14, TimeUnit.SECONDS))
+            waitUntil("All fixture response DOM callbacks finish before teardown") { evaluate(view, "window.pendingSends") == "0" }
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("The website accepted more than one send while its DOM was still stale", "1", evaluate(view, "window.acceptedSends"))
+            assertEquals("1", evaluate(view, "window.sendCount"))
+            assertEquals("unique-late-dom", evaluate(view, "window.sentText"))
+            verifyBytes(view, attachment)
+        }
+    }
+
+    @Test fun disabledDoubaoSendDoesNotReserveTheOnlyClickBeforeItBecomesReady() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                const button=document.querySelector('.send-msg-btn');button.disabled=true;window.reservedWhileDisabled=null;
+                document.querySelector('textarea').addEventListener('input',()=>{
+                  setTimeout(()=>{window.reservedWhileDisabled=!!window.__aiArenaSendClicks?.['disabled-later'];},1100);
+                  setTimeout(()=>{button.disabled=false;},1600);
+                },{once:true});true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "disabled-later", "disabled-later", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(14, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("false", evaluate(view, "window.reservedWhileDisabled"))
+            assertEquals("1", evaluate(view, "window.sendCount"))
+            verifyBytes(view, attachment)
+        }
+    }
+
+    @Test fun cancelledSendTimersCannotReserveOrClickAnExplicitReplacementRequest() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val oldCallbacks = AtomicInteger()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "cancel-before-click", "cancel-before-click", listOf(attachment)) { oldCallbacks.incrementAndGet() } }
+            waitUntil("Old request has injected text but its scheduled click has not run") { evaluate(view, "document.querySelector('textarea').value") == "cancel-before-click" }
+            onMain { pool.cancelAutomation(ArenaService.DOUBAO) }
+            evaluate(view, "cards.innerHTML='';fileStates.length=0;received=[];upload.value='';document.querySelector('textarea').value='';true")
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "explicit-replacement", "explicit-replacement", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(14, TimeUnit.SECONDS))
+            assertEquals(0, oldCallbacks.get())
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("false", evaluate(view, "!!window.__aiArenaSendClicks?.['cancel-before-click']"))
+            assertEquals("1", evaluate(view, "window.sendCount"))
+            assertEquals("explicit-replacement", evaluate(view, "window.sentText"))
+            verifyBytes(view, attachment)
+        }
+    }
+
+    @Test fun kimiActualFailedDocumentCardReturnsPromptlyWithoutSendingText() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                window.completeFixture=()=>{
+                  fileStates.forEach(file=>{file.status='FAILED';file.parseState=2;});
+                  cards.querySelectorAll('.file-card-container').forEach(card=>{
+                    card.className='file-card-container normal error';card.querySelector('.file-ext')?.remove();
+                    const icon=document.createElement('img');icon.className='file-card-icon';icon.alt='txt';card.prepend(icon);
+                    const status=document.createElement('div');status.className='file-card-info-status error';status.textContent='Upload failed';card.appendChild(status);
+                  });
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "must-not-send", "kimi-document-failure", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue("Known webpage upload failure must finish before the 120 second timeout", done.await(12, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("Kimi 附件上传或解析失败"))
+            verifyBytes(view, attachment)
+            assertEquals("0", evaluate(view, "window.sendCount"))
+            assertEquals("", evaluate(view, "window.sentText"))
+            assertEquals("", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun kimiOpenUploadLabelRecoversLostTapWithBoundAndKeepsChangedControlsUntouched() {
+        listOf("recover", "exhausted", "closed", "replaced").forEach { mode ->
+            withPool(emptyMap()) { pool, views, attachment ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const trigger=document.querySelector('.toolkit-trigger-btn'),original=trigger.onclick;
+                    window.labelTaps=0;window.triggerTaps=0;
+                    trigger.onclick=()=>{triggerTaps++;original.call(trigger);
+                      const label=menu.querySelector('label'),input=label.querySelector('input');
+                      label.addEventListener('click',event=>{if(event.target===input)return;labelTaps++;
+                        if('$mode'==='recover'&&labelTaps>1)return;
+                        event.preventDefault();
+                        if('$mode'==='closed'){trigger.setAttribute('aria-expanded','false');menu.style.display='none';}
+                        if('$mode'==='replaced'){const replacement=input.cloneNode();input.replaceWith(replacement);replacement.onchange=handle;}
+                      });
+                    };true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "label-$mode", "label-$mode", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                if (mode in listOf("closed", "replaced")) {
+                    waitUntil("first label attempt") { evaluate(view, "window.labelTaps") == "1" }
+                    Thread.sleep(3_000)
+                    assertEquals("Changed controls cannot inherit old label attempts", "1", evaluate(view, "window.labelTaps"))
+                    assertEquals("The menu trigger must not be reopened by an old label attempt", "1", evaluate(view, "window.triggerTaps"))
+                    assertEquals("0", evaluate(view, "window.sendCount"))
+                    onMain { pool.cancelAutomation(ArenaService.KIMI) }
+                } else {
+                    assertTrue("$mode label attempts must settle without waiting 120 seconds", done.await(16, TimeUnit.SECONDS))
+                    assertEquals(if (mode == "recover") "2" else "3", evaluate(view, "window.labelTaps"))
+                    assertEquals(mode == "recover", outcome.get().success)
+                    if (mode == "recover") { verifyBytes(view, attachment); assertEquals("1", evaluate(view, "window.sendCount")) }
+                    else { assertTrue(outcome.get().detail, outcome.get().detail.contains("连续 3 次")); assertEquals("0", evaluate(view, "window.sendCount")) }
+                }
+            }
+        }
+    }
+
+    @Test fun kimiAlreadyOpenMenuUsesLocalUploadWithoutTogglingTheTrigger() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const trigger=document.querySelector('.toolkit-trigger-btn'),original=trigger.onclick;
+                original.call(trigger);window.triggerTaps=0;
+                trigger.onclick=()=>{triggerTaps++;if(trigger.getAttribute('aria-expanded')==='true'){trigger.setAttribute('aria-expanded','false');menu.innerHTML='';}else original.call(trigger);};true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "already-open", "already-open", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            waitUntil("local upload starts or unwanted trigger tap occurs") { evaluate(view, "window.triggerTaps>0||window.received.length>0") == "true" }
+            assertEquals("Fresh request must not close an already open local menu", "0", evaluate(view, "window.triggerTaps"))
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            verifyBytes(view, attachment)
+        }
+    }
+
+    @Test fun deliveredChooserWithDelayedChangeNeverReceivesAnotherNativeTap() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            val chooserCalls = AtomicInteger()
+            onMain {
+                val delegate = view.webChromeClient!!
+                view.webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onShowFileChooser(webView: WebView, callback: android.webkit.ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                        chooserCalls.incrementAndGet()
+                        return delegate.onShowFileChooser(webView, android.webkit.ValueCallback { uris ->
+                            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ callback.onReceiveValue(uris) }, 3_100L)
+                        }, params)
+                    }
+                }
+            }
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "delayed-change", "delayed-change", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(17, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("Native broker acceptance stops retries before renderer change arrives", 1, chooserCalls.get())
+            verifyBytes(view, attachment)
+        }
+    }
+
+    @Test fun cancelledHiddenAutomationRejectsLateChooserWithoutOpeningManualPicker() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            var returned = false
+            onMain {
+                pool.cancelAutomation()
+                val params = object : android.webkit.WebChromeClient.FileChooserParams() {
+                    override fun getMode() = MODE_OPEN
+                    override fun getAcceptTypes() = arrayOf("text/plain")
+                    override fun isCaptureEnabled() = false
+                    override fun getTitle(): CharSequence? = null
+                    override fun getFilenameHint(): String? = null
+                    override fun createIntent() = android.content.Intent()
+                }
+                view.webChromeClient!!.onShowFileChooser(view, android.webkit.ValueCallback { assertNull(it); returned = true }, params)
+                assertTrue("A late hidden automation chooser must be rejected synchronously", returned)
+            }
+        }
+    }
+
+    @Test fun kimiDetachedUploadInputStillConfirmsExactNativeFilesBeforeSending() {
+        listOf("probe.txt", "probe.png").forEach { name ->
+            withPool(emptyMap(), fileName = name) { pool, views, attachment ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const trigger=document.querySelector('.toolkit-trigger-btn'),open=trigger.onclick;
+                    window.directChanges=0;window.documentChanges=0;window.changedWhileDetached=false;
+                    document.addEventListener('change',()=>documentChanges++,true);
+                    trigger.onclick=()=>{open.call(trigger);const input=menu.querySelector('input');window.selectedInput=input;
+                      input.addEventListener('change',()=>{directChanges++;changedWhileDetached=!input.isConnected;},true);
+                      input.onclick=()=>setTimeout(()=>{trigger.setAttribute('aria-expanded','false');menu.innerHTML='';},0);
+                    };true;
+                """.trimIndent())
+                onMain {
+                    val delegate = view.webChromeClient!!
+                    view.webChromeClient = object : android.webkit.WebChromeClient() {
+                        override fun onShowFileChooser(webView: WebView, callback: android.webkit.ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean =
+                            delegate.onShowFileChooser(webView, android.webkit.ValueCallback { uris ->
+                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ callback.onReceiveValue(uris) }, 500L)
+                            }, params)
+                    }
+                }
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "detached-$name", "detached-$name", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                waitUntil("Native selected bytes reached the detached website input") { evaluate(view, "received.length===1&&directChanges===1&&changedWhileDetached") == "true" }
+                assertEquals("Detached input change must not reach document", "0", evaluate(view, "window.documentChanges"))
+                verifyBytes(view, attachment)
+                assertTrue("Detached native input selection must settle without 120 second timeout", done.await(12, TimeUnit.SECONDS))
+                assertTrue(outcome.get().toString(), outcome.get().success)
+                assertEquals("1", evaluate(view, "window.sendCount"))
+                assertEquals("detached-$name", evaluate(view, "window.sentText"))
+                assertEquals("Completed request must clean up its page state", "true", evaluate(view, "!window.__arenaAttachment"))
+            }
+        }
+    }
+
+    @Test fun doubaoLateExtraTrustedAttachmentStateReportsDraftConflictWithoutTimeout() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                const complete=window.completeFixture;
+                window.completeFixture=()=>{complete();fileStates.push({...fileStates[0],fileName:'older-draft.png',fileKey:'older-key',localKey:'older-local',imageList:[{key:'older-key'}]});};true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "must-not-send-late-draft", "doubao-late-draft", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            waitUntil("Current upload and late restored old draft are both Normal") { evaluate(view, "fileStates.length===2&&fileStates.every(file=>file.status==='Normal')") == "true" }
+            verifyBytes(view, attachment)
+            assertTrue("Known extra draft must be reported before the upload timeout", done.await(8, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("额外") && outcome.get().detail.contains("豆包"))
+            assertEquals("0", evaluate(view, "window.sendCount"))
+            assertEquals("", evaluate(view, "document.querySelector('textarea').value"))
+            assertEquals("The application must not delete website drafts", "2", evaluate(view, "fileStates.length"))
+        }
+    }
+
+    @Test fun nativeGeometryChangesRequeryTheUntouchedLocalControl() = verifyGeometryChange("transient")
+
+    @Test fun persistentNativeGeometryMismatchStopsAfterThreeSnapshotsWithoutTouch() = verifyGeometryChange("persistent")
+
+    @Test fun zeroNativeOrInvalidCssViewportsNeverDispatchAnOriginTouch() {
+        listOf("zero-native", "css-width", "css-height").forEach(::verifyGeometryChange)
+    }
+
+    private fun verifyGeometryChange(mode: String) {
+            withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+                val view = views.getValue(ArenaService.DOUBAO)
+                val nativeDowns = AtomicInteger()
+                val changed = AtomicInteger()
+                val geometry = GeometryFixture {
+                    onMain {
+                        val count = changed.incrementAndGet()
+                        if (mode == "transient" && count > 1) return@onMain
+                        val left = view.left; val top = view.top; val right = view.right; val bottom = view.bottom
+                        when (mode) {
+                            "zero-native" -> { view.layout(left, top, left, bottom); assertEquals(0, view.width) }
+                            "css-width", "css-height" -> Unit
+                            else -> { view.layout(left, top, right, top + 1); assertEquals(1, view.height) }
+                        }
+                        android.util.Log.i("ArenaGeometryFixture", "nativeWidth=${view.width} nativeHeight=${view.height} originalWidth=${right-left} originalHeight=${bottom-top}")
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            view.layout(left, top, right, bottom)
+                            view.evaluateJavascript("restoreFixtureViewport();document.getElementById('upload-menu').style.transform='translateY(90px)';true", null)
+                        }, 200L)
+                    }
+                }
+                installGeometryFixture(pool, view, geometry)
+                onMain {
+                    view.setOnTouchListener { _, event -> if (event.action == android.view.MotionEvent.ACTION_DOWN) nativeDowns.incrementAndGet(); false }
+                }
+                evaluate(view, """
+                    const widthProperty=Object.getOwnPropertyDescriptor(window,'innerWidth'),heightProperty=Object.getOwnPropertyDescriptor(window,'innerHeight');
+                    window.restoreFixtureViewport=()=>{Object.defineProperty(window,'innerWidth',widthProperty);Object.defineProperty(window,'innerHeight',heightProperty);};
+                    const hit=document.elementFromPoint.bind(document);window.localSnapshots=0;window.cloudClicks=0;
+                    document.querySelector('#upload-menu [role=menuitem]').onclick=()=>cloudClicks++;
+                    document.elementFromPoint=(x,y)=>{const target=hit(x,y),item=target?.closest('[data-slot=dropdown-menu-item]');
+                      if(item&&item.textContent==='上传文件或图片'&&window.__arenaAttachment){localSnapshots++;
+                        if('$mode'==='css-width')Object.defineProperty(window,'innerWidth',{value:0,configurable:true});
+                        if('$mode'==='css-height')Object.defineProperty(window,'innerHeight',{value:Infinity,configurable:true});
+                        GeometryFixture.changeSize();}return target;
+                    };true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "geometry-$mode", "geometry-$mode", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                assertTrue("Geometry recovery must finish within a small bound", done.await(14, TimeUnit.SECONDS))
+                assertEquals("Old coordinates must never click the adjacent cloud item", "0", evaluate(view, "cloudClicks"))
+                if (mode == "transient") {
+                    assertTrue("A new layout must be queried without losing the untouched local upload control: ${outcome.get()}", outcome.get().success)
+                    assertEquals("2", evaluate(view, "localSnapshots"))
+                    assertEquals("Only the menu trigger and one valid local upload may receive native DOWN", 2, nativeDowns.get())
+                    verifyBytes(view, attachment)
+                    assertEquals("1", evaluate(view, "sendCount"))
+                } else {
+                    assertFalse(outcome.get().success)
+                    assertTrue(outcome.get().detail, outcome.get().detail.contains("布局"))
+                    assertEquals("Persistent mismatch must stop after three fresh snapshots", "3", evaluate(view, "localSnapshots"))
+                    assertEquals("No out-of-bounds local input receives native DOWN", 1, nativeDowns.get())
+                    assertEquals("0", evaluate(view, "received.length"))
+                    assertEquals("0", evaluate(view, "sendCount"))
+                }
+            }
+    }
+
+    @Test fun geometryCancellationCannotTouchOrRestoreAnOldControlIntoANewRequest() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val cancelled = AtomicBoolean()
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            var oldCallbacks = 0
+            val geometry = GeometryFixture {
+                if (cancelled.compareAndSet(false, true)) onMain {
+                    val left = view.left; val top = view.top; val right = view.right; val bottom = view.bottom
+                    view.layout(left, top, right, top + 1)
+                    pool.cancelAutomation(ArenaService.DOUBAO)
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        view.layout(left, top, right, bottom)
+                        pool.sendPromptWithAttachments(ArenaService.DOUBAO, "geometry-new", "geometry-new", listOf(attachment)) { outcome.set(it); done.countDown() }
+                    }, 250L)
+                }
+            }
+            installGeometryFixture(pool, view, geometry)
+            evaluate(view, """
+                const hit=document.elementFromPoint.bind(document);
+                document.elementFromPoint=(x,y)=>{const target=hit(x,y),item=target?.closest('[data-slot=dropdown-menu-item]');if(item&&item.textContent==='上传文件或图片')GeometryFixture.changeSize();return target;};true;
+            """.trimIndent())
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "geometry-old", "geometry-old", listOf(attachment)) { oldCallbacks++ } }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            onMain { assertEquals("Cancelled request cannot receive a late result", 0, oldCallbacks) }
+            verifyBytes(view, attachment)
+            assertEquals("geometry-new", evaluate(view, "sentText"))
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun delayedChooserAcceptedDuringGeometryReturnKeepsItsInputAndFinishesOnce() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            val chooserCalls = AtomicInteger()
+            val deliveries = AtomicInteger()
+            val rendererReturned = AtomicBoolean()
+            var pendingChooser: (() -> Unit)? = null
+            val delivery = GeometryFixture { onMain { val pending = pendingChooser; pendingChooser = null; pending?.invoke() } }
+            val geometry = GeometryFixture {
+                onMain {
+                    val left = view.left; val top = view.top; val right = view.right; val bottom = view.bottom
+                    view.layout(left, top, right, top + 1)
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ view.layout(left, top, right, bottom) }, 200L)
+                }
+            }
+            onMain { view.addJavascriptInterface(delivery, "DelayedDeliveryFixture") }
+            installGeometryFixture(pool, view, geometry, ArenaService.KIMI)
+            evaluate(view, """
+                const hit=document.elementFromPoint.bind(document);window.labelSnapshots=0;window.forceRestoreRace=false;window.raceControlId=0;window.removedBeforeChange=0;
+                document.elementFromPoint=(x,y)=>{const target=hit(x,y);if(target?.closest('label.toolkit-item')){
+                  labelSnapshots++;if(labelSnapshots===2){forceRestoreRace=true;raceControlId=window.__arenaAttachment.controlSequence+1;GeometryFixture.changeSize();}
+                }return target;};
+                const trigger=document.querySelector('.toolkit-trigger-btn'),open=trigger.onclick;
+                trigger.onclick=()=>{open.call(trigger);const input=menu.querySelector('input'),remove=input.removeEventListener.bind(input);
+                  input.removeEventListener=(type,listener,capture)=>{if(type==='change'&&capture===true&&input.files.length===0)removedBeforeChange++;remove(type,listener,capture);};
+                };true;
+            """.trimIndent())
+            onMain {
+                val delegate = view.webChromeClient!!
+                view.webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onShowFileChooser(webView: WebView, callback: android.webkit.ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+                        chooserCalls.incrementAndGet()
+                        pendingChooser = {
+                            delegate.onShowFileChooser(webView, android.webkit.ValueCallback { uris ->
+                                if (uris != null) deliveries.incrementAndGet()
+                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ callback.onReceiveValue(uris); rendererReturned.set(true) }, 500L)
+                            }, params)
+                        }
+                        webView.evaluateJavascript("""
+                            const request=window.__arenaAttachment;let pending=request.pendingControl;
+                            Object.defineProperty(request,'pendingControl',{configurable:true,get(){
+                              if(forceRestoreRace&&pending?.id===raceControlId){forceRestoreRace=false;DelayedDeliveryFixture.changeSize();return null;}
+                              return pending;
+                            },set(value){pending=value;}});true;
+                        """.trimIndent(), null)
+                        return true
+                    }
+                }
+            }
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "late-geometry-delivery", "late-geometry-delivery", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(16, TimeUnit.SECONDS))
+            // Drain the fixture's deliberately delayed native callback before assertion failure can destroy its WebView.
+            waitUntil("Delayed renderer callback returned before fixture teardown", 3_000L) { rendererReturned.get() }
+            assertTrue("An accepted native file cannot be aborted by a stale geometry return: ${outcome.get()}", outcome.get().success)
+            assertEquals(1, chooserCalls.get())
+            assertEquals(1, deliveries.get())
+            assertEquals("0", evaluate(view, "removedBeforeChange"))
+            assertEquals("2", evaluate(view, "labelSnapshots"))
+            verifyBytes(view, attachment)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("late-geometry-delivery", evaluate(view, "sentText"))
+        }
+    }
+
+    private class GeometryFixture(private val change: () -> Unit) {
+        @android.webkit.JavascriptInterface fun changeSize() = change()
+    }
+
+    private fun installGeometryFixture(pool: ArenaWebViewPool, view: WebView, geometry: GeometryFixture, service: ArenaService = ArenaService.DOUBAO) {
+        onMain {
+            view.addJavascriptInterface(geometry, "GeometryFixture")
+            view.loadDataWithBaseURL(service.url, fixture(service, 150L, true), "text/html", "UTF-8", service.url)
+        }
+        waitUntil("Fresh synthetic document installs its geometry bridge") { evaluate(view, "typeof GeometryFixture!=='undefined'&&window.fixtureReady===true") == "true" }
+        onMain { pool.statuses[service] = ServiceStatus(ConnectionState.SIGNED_IN, "isolated geometry fixture") }
+    }
+
+    @Test fun kimiLateExtraFileOrImageStopsBeforeSendingSelectedAttachment() {
+        listOf("file", "image").forEach { kind ->
+            withPool(emptyMap()) { pool, views, attachment ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const complete=window.completeFixture;
+                    window.completeFixture=()=>{complete();const extra=document.createElement('div');extra.style='height:60px;width:160px';extra.className='${if (kind == "file") "file-card-container success" else "image-thumbnail success"}';extra.innerHTML='${if (kind == "file") "<span class=\"file-card-info-name\">unexpected</span><span class=\"file-ext\">txt</span>" else "<img alt=\"unexpected\">"}';cards.appendChild(extra);};true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "must-not-send-extra", "extra-$kind", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(12, TimeUnit.SECONDS))
+                assertFalse("Late extra $kind must not authorize a send", outcome.get().success)
+                assertTrue(outcome.get().detail, outcome.get().detail.contains("额外"))
+                verifyBytes(view, attachment)
+                assertEquals("0", evaluate(view, "window.sendCount"))
+                assertEquals("", evaluate(view, "document.querySelector('textarea').value"))
+            }
+        }
+    }
+
     @Test fun bothSendScriptsRespectDisabledContainersWithoutEnterFallback() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.KIMI)
@@ -205,6 +776,65 @@ class ArenaParallelWebViewInstrumentedTest {
                 assertEquals("0", evaluate(view, "window.disabledClicks"))
                 assertEquals("0", evaluate(view, "window.enterKeys"))
             }
+        }
+    }
+
+    @Test fun doubaoClosedModernMenuRetriesLostTapWithoutRepeatingOpenMenuOrUploadItem() {
+        listOf("recover", "exhausted", "open").forEach { mode ->
+            withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+                val view = views.getValue(ArenaService.DOUBAO)
+                evaluate(view, """
+                    const trigger=document.getElementById('upload-trigger'),original=trigger.onclick;
+                    trigger.setAttribute('aria-expanded','false');trigger.setAttribute('aria-controls','upload-menu');
+                    window.uploadTriggerTaps=0;window.uploadItemTaps=0;
+                    const local=Array.from(document.querySelectorAll('#upload-menu [role=menuitem]')).find(e=>e.textContent==='上传文件或图片'),choose=local.onclick;
+                    local.onclick=()=>{uploadItemTaps++;if('$mode'!=='open')choose.call(local);};
+                    trigger.onclick=()=>{uploadTriggerTaps++;
+                      if(('$mode'==='recover'&&uploadTriggerTaps>1)||'$mode'==='open'){trigger.setAttribute('aria-expanded','true');original.call(trigger);}
+                    };true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "doubao-retry-$mode", "doubao-menu-$mode", listOf(attachment)) { outcome.set(it); done.countDown() } }
+                if (mode == "open") {
+                    waitUntil("local menu item clicked") { evaluate(view, "window.uploadItemTaps") == "1" }
+                    Thread.sleep(3_000)
+                    assertEquals("An open menu must not be toggled by retry", "1", evaluate(view, "window.uploadTriggerTaps"))
+                    assertEquals("Upload menu item must not be retried", "1", evaluate(view, "window.uploadItemTaps"))
+                    assertEquals(1L, done.count)
+                    onMain { pool.cancelAutomation(ArenaService.DOUBAO) }
+                } else {
+                    assertTrue("$mode must settle after bounded menu attempts", done.await(15, TimeUnit.SECONDS))
+                    assertEquals(if (mode == "recover") "2" else "3", evaluate(view, "window.uploadTriggerTaps"))
+                    assertEquals(mode == "recover", outcome.get().success)
+                    assertEquals(if (mode == "recover") "1" else "0", evaluate(view, "window.sendCount"))
+                    assertEquals(if (mode == "recover") "1" else "0", evaluate(view, "window.uploadItemTaps"))
+                    if (mode == "recover") verifyBytes(view, attachment)
+                }
+            }
+        }
+    }
+
+    @Test fun kimiWaitsForHydratedMenuIdentityBeforeTheFirstNativeTap() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const trigger=document.querySelector('.toolkit-trigger-btn'),original=trigger.onclick;
+                trigger.removeAttribute('id');trigger.removeAttribute('aria-haspopup');trigger.removeAttribute('aria-expanded');
+                window.earlyToolkitTaps=0;window.hydratedToolkitTaps=0;window.toolkitHydrated=false;
+                trigger.onclick=()=>{if(!toolkitHydrated){earlyToolkitTaps++;return;}hydratedToolkitTaps++;trigger.setAttribute('aria-expanded','true');original.call(trigger);};
+                setTimeout(()=>{trigger.id='hydrated-toolkit';trigger.setAttribute('aria-haspopup','menu');trigger.setAttribute('aria-expanded','false');window.toolkitHydrated=true;},1800);true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "hydrated-menu", "hydrated-kimi", listOf(attachment)) { outcome.set(it); done.countDown() } }
+            waitUntil("toolkit hydration") { evaluate(view, "window.toolkitHydrated") == "true" }
+            assertEquals("Uninitialized trigger must not consume a native tap", "0", evaluate(view, "window.earlyToolkitTaps"))
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "window.hydratedToolkitTaps"))
+            assertEquals("1", evaluate(view, "window.sendCount"))
+            verifyBytes(view, attachment)
         }
     }
 
@@ -445,7 +1075,7 @@ class ArenaParallelWebViewInstrumentedTest {
         val area = if (modernDoubao) "<div id='cards' class='container-tJHWhP flex flex-col pl-12 pr-2'></div>"
             else "<div id='cards' data-testid='${if (service == ArenaService.KIMI) "input-attachment-list" else "attachment_area"}'></div>"
         val controls = if (service == ArenaService.KIMI) """
-            <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; style=&quot;display:none&quot;></label>';upload.onchange=handle;">Add</button><div id="menu"></div>
+            <button class="toolkit-trigger-btn" id="fixture-toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; style=&quot;display:none&quot;></label>';upload.onchange=handle;">Add</button><div id="menu" role="menu" aria-labelledby="fixture-toolkit"></div>
         """ else if (modernDoubao) """
             <div class="relative"><input id="upload" type="file" accept="image/*" style="display:none">$area</div>
             <div class="guidance-input-actions"><button id="upload-trigger" data-slot="dropdown-menu-trigger" aria-haspopup="menu" onclick="document.getElementById('upload-menu').style.display='block'"></button></div>
@@ -468,7 +1098,7 @@ class ArenaParallelWebViewInstrumentedTest {
               if('${service.name}'==='DEEPSEEK'&&f.isImage&&!f.fileName.endsWith('.webp')){f.fileName=f.fileName.replace(/\.[^.]+${'$'}/,'')+'.webp';f.fileSize=Math.max(1,f.fileSize-1);}
               f.imageList=[{key:f.fileKey,image_ori:{url:'blob:https://www.doubao.com/local-preview'}}];});
               Array.from(cards.children).forEach(c=>{if('${service.name}'==='KIMI')c.className=(c.classList.contains('image-thumbnail')?'image-thumbnail ':'file-card-container ')+'success';});};
-            function handle(){for(const file of upload.files){
+            function handle(event){for(const file of (event?.target||document.getElementById('upload')).files){
               const image=file.type.startsWith('image/');
               const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,localId:'local-'+file.name,isImage:image,auditResult:'pass',fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
               if('${service.name}'==='DEEPSEEK'&&image&&$currentImageUi){state.fileName=file.name.replace(/\.[^.]+${'$'}/,'')+'.webp';state.fileSize=Math.max(1,file.size-1);}

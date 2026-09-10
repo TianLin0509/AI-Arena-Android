@@ -798,7 +798,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     fileChooserParams: FileChooserParams,
                 ): Boolean {
                     if (fileBroker.handle(webView, filePathCallback, fileChooserParams)) return true
-                    if (destroyed || service in automations || !ArenaFileChooserBroker.trusted(service, webView.url)) {
+                    if (destroyed || service in automations || uiSelectedService != service || !ArenaFileChooserBroker.trusted(service, webView.url)) {
                         filePathCallback.onReceiveValue(null)
                         return true
                     }
@@ -1169,6 +1169,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${sendControlHelperScript()}
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
+              if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return 'awaiting_confirmation';
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
@@ -1312,6 +1313,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 const attemptSend = function() {
                   if (cancelled()) return;
                   if ($conversationAdvanced) return;
+                  if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return;
                   if (!currentInputText().trim()) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};

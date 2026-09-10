@@ -373,6 +373,60 @@ class ArenaAttachmentInstrumentedTest {
         }
     }
 
+    @Test fun kimiDocumentIconExtensionIdentifiesErrorsAndRejectsAmbiguousCards() {
+        listOf("error", "success", "conflict", "multiple-icons", "wrong-name", "wrong-extension", "missing", "old", "duplicate").forEach { case ->
+            withView("<div data-testid='input-attachment-list' id='cards'></div>") { view, _ ->
+                val attachment = ArenaAttachment("fixture", "notes.txt", "text/plain", 64, "a".repeat(64))
+                if (case == "old") evaluate(view, "cards.innerHTML='<div class=\"file-card-container error\" style=\"height:70px;width:160px;visibility:hidden\"><p class=\"file-card-info-name\">notes</p><img class=\"file-card-icon\" alt=\"txt\"></div>';true")
+                evaluate(view, ArenaAttachmentScript.prepare("kimi-icon-$case", listOf(attachment), ArenaService.KIMI))
+                evaluate(view, """
+                    window.__arenaAttachment.chosen=true;
+                    ${if (case == "old") "cards.firstElementChild.style.visibility='visible';" else """
+                    const card=document.createElement('div');card.className='file-card-container normal ${if (case == "error") "error" else "success"}';card.style='height:70px;width:160px';
+                    card.innerHTML='<p class="file-card-info-name">${if (case == "wrong-name") "unrelated" else "notes"}</p>${if (case == "missing") "" else "<img class=\"file-card-icon\" alt=\"${if (case == "wrong-extension") "pdf" else "txt"}\">"}${if (case == "conflict") "<span class=\"file-ext\">PDF</span>" else ""}${if (case == "multiple-icons") "<img class=\"file-card-icon\" alt=\"txt\">" else ""}<div class="file-card-info-status">${if (case == "error") "Upload failed" else "64 Bytes"}</div>';
+                    cards.appendChild(card);${if (case == "duplicate") "cards.appendChild(card.cloneNode(true));" else ""}
+                    """}
+                    true;
+                """.trimIndent())
+                val result = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("kimi-icon-$case", ArenaService.KIMI)))
+                when (case) {
+                    "error" -> assertTrue("A new failed file card has icon alt but no file-ext: $result", result.optString("error").contains("Kimi"))
+                    "success" -> assertTrue("A unique icon extension can identify a successful current file: $result", result.getBoolean("ready"))
+                    else -> assertFalse("$case must not authorize sending: $result", result.optBoolean("ready"))
+                }
+            }
+        }
+    }
+
+    @Test fun kimiBoundInputListenersRejectReplacementAndAreRemovedOnCancelOrSupersession() {
+        listOf("cancel", "supersede").forEach { mode ->
+            withView("""
+                <button class="toolkit-trigger-btn" id="toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="true">Add</button>
+                <div role="menu" id="menu" aria-labelledby="toolkit"><label class="toolkit-item" role="menuitem" style="display:block;width:180px;height:60px">Upload<input id="picker" type="file" style="display:none"></label></div>
+            """.trimIndent()) { view, _ ->
+                val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 4, "a".repeat(64))
+                evaluate(view, """
+                    window.originalInput=document.getElementById('picker');window.captureListeners=new Set();
+                    const add=originalInput.addEventListener.bind(originalInput),remove=originalInput.removeEventListener.bind(originalInput);
+                    originalInput.addEventListener=(type,listener,capture)=>{if(type==='change'&&capture===true)captureListeners.add(listener);add(type,listener,capture);};
+                    originalInput.removeEventListener=(type,listener,capture)=>{if(type==='change'&&capture===true)captureListeners.delete(listener);remove(type,listener,capture);};
+                    window.choose=input=>{const transfer=new DataTransfer();transfer.items.add(new File(['test'],'probe.txt',{type:'text/plain'}));input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));};true;
+                """.trimIndent())
+                assertEquals("true", evaluate(view, ArenaAttachmentScript.prepare("bound-$mode", listOf(attachment), ArenaService.KIMI)))
+                assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("bound-$mode", ArenaService.KIMI))).has("x"))
+                evaluate(view, "window.previousState=window.__arenaAttachment;const replacement=originalInput.cloneNode();originalInput.replaceWith(replacement);choose(replacement);true")
+                assertEquals("A new input cannot confirm the original bound picker", "false", evaluate(view, "window.__arenaAttachment.chosen"))
+                assertEquals("Capture listener belongs to the original selected input", "1", evaluate(view, "captureListeners.size"))
+                if (mode == "cancel") evaluate(view, ArenaAttachmentScript.cancel("bound-$mode"))
+                else assertEquals("true", evaluate(view, ArenaAttachmentScript.prepare("replacement", listOf(attachment), ArenaService.KIMI)))
+                assertEquals("Old detached input listener must be removed", "0", evaluate(view, "captureListeners.size"))
+                evaluate(view, "choose(originalInput);true")
+                assertEquals("A late old input event cannot mutate the old request", "false", evaluate(view, "previousState.chosen"))
+                assertEquals("A late old input event cannot confirm a replacement request", "false", evaluate(view, "window.__arenaAttachment?.chosen||false"))
+            }
+        }
+    }
+
     @Test fun parseFailureStopsBeforeSendAndBareFileSelectionIsNotReady() {
         withView(fixture(fail = true)) { view, broker ->
             val files = imported()
@@ -413,6 +467,27 @@ class ArenaAttachmentInstrumentedTest {
                 broker.cancelAll()
             }
             supplied!!.forEach { uri -> assertTrue(runCatching { context.contentResolver.openInputStream(uri)!!.use { it.read() } }.isFailure) }
+            store.discardImported(files)
+        }
+    }
+
+    @Test fun lateDuplicateChooserCannotAbortFirstDeliveryOrIssueMoreUris() {
+        withView(fixture()) { view, broker ->
+            val files = imported()
+            val store = ArenaAttachmentStore(context)
+            val delivered = mutableListOf<String?>()
+            var first: Array<Uri>? = null
+            onMain {
+                broker.prepare(view, ArenaService.DEEPSEEK, "one-delivery", files.map { it to store.verify(it) }) { delivered += it }
+                assertTrue(broker.handle(view, ValueCallback { first = it }, params()))
+                assertTrue(broker.handle(view, ValueCallback { assertNull("Duplicate chooser receives no URI", it) }, params()))
+                assertEquals("Late duplicate must not turn the first accepted upload into a failure", listOf<String?>(null), delivered)
+            }
+            assertEquals(files.size, first!!.size)
+            first!!.forEachIndexed { i, uri ->
+                assertArrayEquals(store.verify(files[i]).readBytes(), context.contentResolver.openInputStream(uri)!!.use { it.readBytes() })
+            }
+            onMain { broker.cancel(view) }
             store.discardImported(files)
         }
     }
@@ -483,7 +558,7 @@ class ArenaAttachmentInstrumentedTest {
     private fun fixture(fail: Boolean = false, service: ArenaService = ArenaService.DEEPSEEK): String {
         val kind = service.name
         val controls = if (service == ArenaService.KIMI) """
-            <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; multiple style=&quot;display:none&quot;></label>';document.getElementById('upload').onchange=handle;">Add</button><div id="menu"></div>
+            <button class="toolkit-trigger-btn" id="fixture-toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; multiple style=&quot;display:none&quot;></label>';document.getElementById('upload').onchange=handle;">Add</button><div id="menu" role="menu" aria-labelledby="fixture-toolkit"></div>
         """.trimIndent() else """
             <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" multiple accept="image/*,.pdf,.txt" style="display:none">
         """.trimIndent()
