@@ -11,7 +11,7 @@ internal object ArenaAttachmentScript {
               $reactHelpers
               ${if (service == ArenaService.DEEPSEEK) deepSeekIdentityHelpers else ""}
               if (previous && previous.listener) document.removeEventListener('change', previous.listener, true);
-              if (previous && previous.selectionInput && previous.listener) previous.selectionInput.removeEventListener('change', previous.listener, true);
+              if (previous && previous.listener) for(const input of previous.selectionInputs||[previous.selectionInput]) if(input)input.removeEventListener('change',previous.listener,true);
               if (previous && previous.pendingControl?.clickTarget) previous.pendingControl.clickTarget.removeEventListener('click', previous.pendingControl.clickListener, true);
               if (previous && previous.observer) previous.observer.disconnect();
               const shown=e=>{const r=e.getBoundingClientRect();return r.width>2&&r.height>2&&getComputedStyle(e).visibility!=='hidden'};
@@ -24,8 +24,9 @@ internal object ArenaAttachmentScript {
               document.querySelectorAll(${ArenaJs.quote(doubaoAreaSelector)}).forEach(area=>{const props=reactProps(area,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(area);});
               if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，请先到原网页移除后重试，避免重复上传'});
               const previousLocalIds=new Set(Array.from(document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b')).map(card=>reactProps(card,'file')?.file?.localId).filter(id=>typeof id==='string'&&id));
-              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,selectionInput:null,clicked:new WeakSet(),menuAttempts:new Map(),fileControlAttempt:null,deepSeekControlAttempt:null,controlSequence:0,pendingControl:null,baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
+              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,selectionInput:null,selectionInputs:new Set(),clicked:new WeakSet(),menuAttempts:new Map(),kimiMenuAttempt:null,kimiFileAttempt:null,fileControlAttempt:null,deepSeekControlAttempt:null,controlSequence:0,pendingControl:null,baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
               const rememberImages=()=>{
+                resetReactRead();
                 document.querySelectorAll('[data-testid="input-attachment-list"] .image-thumbnail,.chat-editor-attachment-area .image-thumbnail').forEach(card=>{
                   if(!state.baseline.has(card)&&card.classList.contains('loading'))state.imageWasLoading.add(card);
                 });
@@ -35,7 +36,7 @@ internal object ArenaAttachmentScript {
               state.observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class']});
               state.listener = e => {
                 if (window.__arenaAttachment !== state || !e.target || e.target.type !== 'file') return;
-                ${if (service == ArenaService.KIMI) "if(e.target!==state.selectionInput)return;" else ""}
+                ${if (service == ArenaService.KIMI) "if(!state.selectionInputs.has(e.target))return;" else ""}
                 const actual = Array.from(e.target.files || []);
                 state.chosen = actual.length === state.expected.length && state.expected.every(f => actual.some(a => a.name === f.name && a.size === f.size));
                 state.selectionConfirmed = state.chosen;
@@ -55,19 +56,42 @@ internal object ArenaAttachmentScript {
     """.trimIndent()
 
     private val reactHelpers: String get() = """
-        const currentFiber = element => {
-          let fiber=element[Object.keys(element).find(k=>k.startsWith('__reactFiber${'$'}'))];
-          const isCurrent=f=>{
-            if(!f)return false;
-            let root=f,depth=0;const seen=new Set();
-            while(root.return){if(seen.has(root)||depth++>=512)return false;seen.add(root);root=root.return;}
-            return root.tag===3&&root.stateNode&&root.stateNode.current===root;
-          };
-          if(isCurrent(fiber))return fiber;
-          if(fiber&&isCurrent(fiber.alternate))return fiber.alternate;
-          return null;
+        // Shared bailout children may retain return pointers to the other parent branch.
+        // Index actual current child/sibling edges once per synchronous read, including
+        // the ancestor path; choosing only a leaf then following return is insufficient.
+        let reactIndexes=new Map();
+        const resetReactRead=()=>{reactIndexes=new Map();};
+        const currentReactPath=element=>{
+          if(!element||!element.isConnected)return null;
+          const raw=element[Object.keys(element).find(k=>k.startsWith('__reactFiber${'$'}'))];
+          let currentRoot=null;
+          for(const candidate of [raw,raw&&raw.alternate]){
+            let root=candidate,depth=0;const seen=new Set();
+            while(root&&root.return){if(seen.has(root)||depth++>=512){root=null;break;}seen.add(root);root=root.return;}
+            if(root&&root.tag===3&&root.stateNode&&root.stateNode.current&&root.stateNode.current.tag===3){currentRoot=root.stateNode.current;break;}
+          }
+          if(!currentRoot)return null;
+          let index=reactIndexes.get(currentRoot);
+          if(!index){
+            const parents=new Map(),hosts=new Set(),stack=[[currentRoot,null,0]];let valid=true;
+            while(stack.length){
+              const [fiber,parent,depth]=stack.pop();
+              if(!fiber||parents.has(fiber)||parents.size>=25000||depth>512){valid=false;break;}
+              parents.set(fiber,parent);
+              if(fiber.stateNode instanceof Node){if(hosts.has(fiber.stateNode)){valid=false;break;}hosts.add(fiber.stateNode);}
+              if(fiber.sibling)stack.push([fiber.sibling,parent,depth]);
+              if(fiber.child)stack.push([fiber.child,fiber,depth+1]);
+            }
+            index={parents,valid};reactIndexes.set(currentRoot,index);
+          }
+          if(!index.valid)return null;
+          const matches=[raw,raw&&raw.alternate].filter(f=>f&&index.parents.has(f)&&f.stateNode===element);
+          if(matches.length!==1)return null;
+          const path=[];let fiber=matches[0];
+          while(fiber){path.push(fiber);fiber=index.parents.get(fiber);}
+          return path;
         };
-        const reactProps=(element,key)=>{let fiber=currentFiber(element);for(let depth=0;fiber&&depth<15;depth++,fiber=fiber.return){if(fiber.memoizedProps&&fiber.memoizedProps[key])return fiber.memoizedProps;}return null;};
+        const reactProps=(element,key)=>{const path=currentReactPath(element);if(!path)return null;for(const fiber of path.slice(0,15)){if(fiber.memoizedProps&&fiber.memoizedProps[key])return fiber.memoizedProps;}return null;};
     """.trimIndent()
 
     // Prefer binding original metadata before DeepSeek's WebP conversion; readiness also
@@ -127,7 +151,13 @@ internal object ArenaAttachmentScript {
                 }
               """.trimIndent()
               ArenaService.KIMI -> """
-                const trigger=document.querySelector('.toolkit-trigger-btn');const scope=document;
+                if(state.error)return JSON.stringify({error:state.error});
+                if(state.chosen||Array.from(state.selectionInputs).some(input=>input.files?.length))return JSON.stringify({waiting:true});
+                const fileAttempt=state.kimiFileAttempt;
+                if(fileAttempt?.count>=3&&Date.now()-fileAttempt.at>=2000)return JSON.stringify({error:'Kimi 本地附件入口连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
+                const triggers=Array.from(document.querySelectorAll('.toolkit-trigger-btn')).filter(visible);
+                if(triggers.length>1)return JSON.stringify({error:'无法确认 Kimi 唯一附件菜单，未发送问题'});
+                const trigger=triggers[0];const scope=document;
                 if(trigger&&trigger.id&&trigger.getAttribute('aria-haspopup')==='menu'){
                   const controls=(trigger.getAttribute('aria-controls')||'').split(/\s+/);
                   const menus=Array.from(document.querySelectorAll('[role=menu]')).filter(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id)));
@@ -135,11 +165,13 @@ internal object ArenaAttachmentScript {
                     const labels=Array.from(menus[0].querySelectorAll('label.toolkit-item[role=menuitem]')).filter(label=>visible(label)&&label.closest('[role=menu]')===menus[0]&&label.querySelectorAll('input[type=file]').length===1);
                     if(labels.length===1){
                       const label=labels[0],input=label.querySelector('input[type=file]'),previous=state.fileControlAttempt;
-                      if((!state.selectionInput||state.selectionInput===input)&&(!previous||(previous.label===label&&previous.input===input&&previous.triggerId===trigger.id))){
+                      const same=!previous||(previous.label===label&&previous.input===input&&previous.triggerId===trigger.id);
+                      const oldStillUsable=previous&&previous.input.isConnected&&visible(previous.label)&&previous.label.closest('[role=menu]')===menus[0]&&previous.label.contains(previous.input);
+                      if(same||(!oldStillUsable&&fileAttempt&&Date.now()-fileAttempt.at>=2000)){
                         if(!state.chosen&&input.files&&input.files.length===0&&!input.disabled){kimiFileLabel=label;kimiFileInput=input;kimiFileTrigger=trigger;candidates.push(label);}
                       }
                     }
-                  }else if(!state.fileControlAttempt&&trigger.getAttribute('aria-expanded')==='false'&&menus.length===0)candidates.push(trigger);
+                  }else if(trigger.getAttribute('aria-expanded')==='false'&&menus.length===0&&(!fileAttempt||Date.now()-fileAttempt.at>=2000))candidates.push(trigger);
                 }
               """.trimIndent()
               else -> "return JSON.stringify({error:'该成员暂不支持附件'});const scope=document;"
@@ -163,7 +195,6 @@ internal object ArenaAttachmentScript {
           const closedMenu=e=>{
             const trigger=menuTrigger(e);
             if(!trigger||state.chosen||trigger.getAttribute('aria-expanded')!=='false')return false;
-            if(kimiTrigger(e)&&document.querySelector('label.toolkit-item[role=menuitem] input[type=file]'))return false;
             const controls=(trigger.getAttribute('aria-controls')||'').split(/\s+/);
             return !Array.from(document.querySelectorAll('[role=menu]')).some(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id)));
           };
@@ -175,14 +206,14 @@ internal object ArenaAttachmentScript {
           """.trimIndent() else ""}
           const target=eligible.find(e=>{
             if(e===deepSeekTarget){const attempt=state.deepSeekControlAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
-            if(e===kimiFileLabel){const attempt=state.fileControlAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
-            const trigger=menuTrigger(e),attempt=trigger&&state.menuAttempts.get(trigger.id);
+            if(e===kimiFileLabel){const attempt=state.kimiFileAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
+            const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(trigger.id);
             if(!state.clicked.has(e)&&!attempt)return true;
             return attempt&&attempt.count<3&&Date.now()-attempt.at>=2000&&closedMenu(e);
           });
           if(!target){
             if(kimiFileLabel&&eligible.includes(kimiFileLabel)&&state.fileControlAttempt?.count>=3&&Date.now()-state.fileControlAttempt.at>=2000)return JSON.stringify({error:'Kimi 本地附件入口连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
-            if(eligible.some(e=>{const trigger=menuTrigger(e),attempt=trigger&&state.menuAttempts.get(trigger.id);return attempt&&attempt.count>=3&&Date.now()-attempt.at>=2000&&closedMenu(e);}))return JSON.stringify({error:${ArenaJs.quote(service.displayName + " 附件菜单连续 3 次未响应，未发送问题；请打开原网页检查后重试")}});
+            if(eligible.some(e=>{const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(trigger.id);return attempt&&attempt.count>=3&&Date.now()-attempt.at>=2000&&closedMenu(e);}))return JSON.stringify({error:${ArenaJs.quote(service.displayName + " 附件菜单连续 3 次未响应，未发送问题；请打开原网页检查后重试")}});
             return JSON.stringify({waiting:true});
           }
           target.scrollIntoView({block:'nearest',inline:'nearest'});
@@ -209,9 +240,14 @@ internal object ArenaAttachmentScript {
           }
           if(target===kimiFileLabel){
             // Kimi closes and unmounts the menu on input click, before chooser change can bubble to document.
-            if(!state.selectionInput){state.selectionInput=kimiFileInput;kimiFileInput.addEventListener('change',state.listener,true);}
-            const previous=state.fileControlAttempt;state.fileControlAttempt={label:target,input:kimiFileInput,triggerId:kimiFileTrigger.id,count:(previous?.count||0)+1,at:Date.now()};
+            // Previously attempted inputs can receive a legitimate late chooser response after menu unmount.
+            // Only this request's bounded, verified inputs retain authority; native broker still delivers once.
+            if(!state.selectionInputs.has(kimiFileInput)){state.selectionInputs.add(kimiFileInput);kimiFileInput.addEventListener('change',state.listener,true);}
+            state.selectionInput=kimiFileInput;
+            const attempt={count:(state.kimiFileAttempt?.count||0)+1,at:Date.now()};state.kimiFileAttempt=attempt;
+            state.fileControlAttempt={label:target,input:kimiFileInput,triggerId:kimiFileTrigger.id,...attempt};
           }
+          if(kimiTrigger(target))state.kimiMenuAttempt={count:(state.kimiMenuAttempt?.count||0)+1,at:Date.now()};
           if(clickedTrigger){const previous=state.menuAttempts.get(clickedTrigger.id);state.menuAttempts.set(clickedTrigger.id,{count:(previous?.count||0)+1,at:Date.now()});}
           return JSON.stringify({x,y,width:innerWidth,height:innerHeight,controlId:hold.id,retryableTap:!!clickedTrigger||target===kimiFileLabel||target===deepSeekTarget});
         })();
@@ -263,6 +299,7 @@ internal object ArenaAttachmentScript {
           const cards=composer?Array.from(composer.querySelectorAll('._25c7358,.d5fa3d1b')).filter(e=>visible(e)&&!state.baseline.has(e)):[];
           if(cards.length) {
             const allEntries=cards.map(card=>({card,props:reactProps(card,'file')})).filter(entry=>entry.props&&entry.props.file);
+            if(allEntries.length!==cards.length)return JSON.stringify({ready:false,detail:'无法确认 DeepSeek 当前附件处理状态，暂未发送问题'});
             const localIds=allEntries.map(({props})=>props.file.localId).filter(id=>typeof id==='string'&&id);
             if(cards.length>state.expected.length||localIds.some(id=>state.previousLocalIds.has(id))||new Set(localIds).size!==localIds.length)return JSON.stringify({error:'DeepSeek 出现额外、重复或旧附件身份，未发送问题'});
             const canConvert=expected=>expected.mime.startsWith('image/')&&(/\.(jpe?g|png|heic|heif)${'$'}/i.test(expected.name)||['image/jpeg','image/png','image/heic','image/heif'].includes(expected.mime));
@@ -372,6 +409,6 @@ internal object ArenaAttachmentScript {
     }
 
     fun cancel(requestId: String): String = """
-        (() => {const s=window.__arenaAttachment;if(s&&s.id===${ArenaJs.quote(requestId)}){document.removeEventListener('change',s.listener,true);if(s.selectionInput)s.selectionInput.removeEventListener('change',s.listener,true);if(s.pendingControl?.clickTarget)s.pendingControl.clickTarget.removeEventListener('click',s.pendingControl.clickListener,true);if(s.observer)s.observer.disconnect();delete window.__arenaAttachment;}return true;})();
+        (() => {const s=window.__arenaAttachment;if(s&&s.id===${ArenaJs.quote(requestId)}){document.removeEventListener('change',s.listener,true);for(const input of s.selectionInputs||[s.selectionInput])if(input)input.removeEventListener('change',s.listener,true);if(s.pendingControl?.clickTarget)s.pendingControl.clickTarget.removeEventListener('click',s.pendingControl.clickListener,true);if(s.observer)s.observer.disconnect();delete window.__arenaAttachment;}return true;})();
     """.trimIndent()
 }

@@ -50,7 +50,7 @@ internal class ArenaAttachmentTransport(
             if (!delivered && geometryDeadline > 0L && SystemClock.elapsedRealtime() >= geometryDeadline) return finish(geometryError)
             if (SystemClock.elapsedRealtime() >= deadline) return finish(
                 if (delivered) "${service.displayName} 附件上传或解析未确认完成，未发送问题；请到原网页查看后重试"
-                else "${service.displayName} 未提供可用的附件上传入口，未发送问题；请登录并检查网页是否支持附件",
+                else "${service.displayName} 未提供可用的附件上传入口，未发送问题；请打开原网页检查上传入口后重试",
             )
             fun inspect(release: () -> Unit) {
                 if (!current()) { release(); return }

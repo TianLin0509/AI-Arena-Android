@@ -40,6 +40,14 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 
 新增五项生产 WebViewPool 回归在同一测试包上完成 RED / GREEN；主机闸门仍为 8 项工作流、131 项 JVM、两种 lint 与构建，全部 127 项 Android instrumentation 通过。证据保留在任务工作树 `artifacts/20260909-real-attachment-r10-*`。此时 r10 最终 SHA 的独立闸门、正式 R8 包 PNG / JPEG / TXT 实传及签名 API 26 覆盖升级仍待 Merger；不得沿用 r9 的真实通过代替。
 
+### 0.13.2 R14 发布检查点（2026-09-10）
+
+发布源码从 e7050735ec2674d2a2d43eb141d90e9a12bd4ac9 和冻结 R14 patch 恢复，全部 88 个 app 文件与诊断 binding 的 Git blob 一致。R15 自动草稿恢复草稿留在原 Author 工作树并另行归档，未验收、未纳入发布。本发布检查点重新执行完整主机门通过：8 项工作流、131 项 JVM、debug/release lint 与全部 APK 构建，359.52 秒；隔离 emulator-5586 上全部 144 项 Android 测试通过，474.37 秒、0 失败 / 崩溃 / 漏测。新工作树重建 APK 的哈希与旧诊断包不同，完整设备结果绑定本次新包，源码前后仍匹配全部 88 个 blob。证据在发布工作树 `artifacts/20260910-release0132-checkpoint-author-host-full.json` 与 `artifacts/20260910-release0132-checkpoint-author-android-full.json`，最终提交仍须独立 Merger 验证。
+
+独立 Merger 的 R14 纯原生连续三轮实测记录在主仓库 `artifacts/20260910-real-attachment-r14-trial-native-sequence.json`：单张 PNG、单张 JPEG 的 DeepSeek / 豆包 / Kimi App 展开正文均正确；第三轮 TXT 的 DeepSeek / Kimi 正确，豆包因恢复此前已发送的 JPEG 与正文而报旧草稿冲突。轮次之间没有网页清理、人工补发或 CDP 观察。此记录不是三轮全通过，也不是 R15 复原验证；原生失败证据为 `artifacts/20260909-real-attachment-r14-trial-txt-failed-round.xml`。
+
+发布说明必须保留豆包已成功内容可能恢复成旧草稿的限制，不能称为用户未发送文件或单纯测试污染。冻结 R14 不自动删除任何草稿，发现冲突后用户需在原网页核对处理，再手动重试。正式签名 / R8 / API 26 升级检查按下面发布边界执行，历史候选结果不能替代。
+
 ## 发布
 
 当前产品版本 `0.13.2`、versionCode `22`，折叠回答 UI 基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
@@ -60,7 +68,7 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 
 DeepSeek 直达入口恢复须限制唯一可见输入区、唯一 file input 和唯一已关联本地控件；至少间隔 2 秒、每请求最多三次，按钮重建和未 DOWN 的几何归还不得重置预算，输入框或输入区替换不得继承。须验证首次 capture 点击被吞后真实 URI / 字节交付且正文只一次、交付后解析期间不重选、持续失败终止、另一家在本请求结束前已接收 URI 且最终成功，以及取消后真实晚 chooser 到达生产 WebChromeClient 并明确回 null。不得以未发生实际点击冒充迟到保护通过，也不要求不同成员最终回调的固定顺序。
 
-Kimi 本地上传标签恢复只允许唯一已打开且绑定到 toolkit 的菜单、同一 label/input、空 file list、本请求未交付，至少相隔 2 秒且最多三次；必须验证已打开菜单不先关闭、菜单关闭/换 input/取消后无旧尝试、native 已交付但 change 延迟时不再触摸、重复 chooser 不重复 URI 也不中止首个合法上传。其他厂商上传项不扩大重试；手动 picker 只允许当前用户打开的原网页。
+Kimi 本地上传标签恢复只允许唯一已打开且绑定到 toolkit 的菜单、唯一 label/input、空 file list、本请求未交付，至少相隔 2 秒且整轮最多三次。菜单关闭或输入节点替换可在原请求预算内重新取得唯一入口；必须验证节点 / 菜单 ID 重建不重置次数、已打开菜单不先关闭、取消后无旧尝试、native 已交付但 change 延迟时不再触摸、旧合法 input 的迟到事件仍按原请求核对、重复 chooser 不重复 URI 也不中止首个合法上传。其他厂商上传项不扩大重试；手动 picker 只允许当前用户打开的原网页。
 
 Kimi 菜单点击后卸载原 input 的路径必须用生产 pool 和真实 native 文件回传验证：document 没有收到 change 时，唯一绑定的原 input 仍核对名称和字节大小，TXT/PNG 实际字节正确后才发正文；取消、完成、prepare 替换时清理 input 监听，替换 input 的事件和旧请求迟到事件不得确认新请求。豆包当前可信 attachmentStates 晚恢复额外草稿时须及时报告冲突、保持正文未发送且不删除草稿。
 
