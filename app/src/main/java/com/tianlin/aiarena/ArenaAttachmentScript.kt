@@ -8,11 +8,12 @@ internal object ArenaAttachmentScript {
             (() => {
               const previous = window.__arenaAttachment;
               $reactHelpers
+              ${if (service == ArenaService.DEEPSEEK) deepSeekIdentityHelpers else ""}
               if (previous && previous.listener) document.removeEventListener('change', previous.listener, true);
               if (previous && previous.observer) previous.observer.disconnect();
               const shown=e=>{const r=e.getBoundingClientRect();return r.width>2&&r.height>2&&getComputedStyle(e).visibility!=='hidden'};
               const existing=Array.from(document.querySelectorAll(${ArenaJs.quote(when(service) {
-                ArenaService.DEEPSEEK -> "._77cefa5 ._25c7358"
+                ArenaService.DEEPSEEK -> "._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b"
                 ArenaService.KIMI -> "[data-testid=input-attachment-list] .file-card-container,[data-testid=input-attachment-list] .image-thumbnail,.chat-editor-attachment-area .file-card-container,.chat-editor-attachment-area .image-thumbnail"
                 ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_]"
                 else -> "[data-arena-no-attachment-support]"
@@ -20,10 +21,13 @@ internal object ArenaAttachmentScript {
               const doubaoArea=document.querySelector('[data-testid=attachment_area]');
               if(doubaoArea){const props=reactProps(doubaoArea,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(doubaoArea);}
               if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，请先到原网页移除后重试，避免重复上传'});
-              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,clicked:new WeakSet(),baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet()};
-              const rememberImages=()=>document.querySelectorAll('[data-testid="input-attachment-list"] .image-thumbnail,.chat-editor-attachment-area .image-thumbnail').forEach(card=>{
-                if(!state.baseline.has(card)&&card.classList.contains('loading'))state.imageWasLoading.add(card);
-              });
+              const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,clicked:new WeakSet(),baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[]};
+              const rememberImages=()=>{
+                document.querySelectorAll('[data-testid="input-attachment-list"] .image-thumbnail,.chat-editor-attachment-area .image-thumbnail').forEach(card=>{
+                  if(!state.baseline.has(card)&&card.classList.contains('loading'))state.imageWasLoading.add(card);
+                });
+                ${if (service == ArenaService.DEEPSEEK) "rememberDeepSeekFiles(state);" else ""}
+              };
               state.observer=new MutationObserver(rememberImages);
               state.observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class']});
               state.listener = e => {
@@ -54,6 +58,22 @@ internal object ArenaAttachmentScript {
           return null;
         };
         const reactProps=(element,key)=>{let fiber=currentFiber(element);for(let depth=0;fiber&&depth<15;depth++,fiber=fiber.return){if(fiber.memoizedProps&&fiber.memoizedProps[key])return fiber.memoizedProps;}return null;};
+    """.trimIndent()
+
+    // DeepSeek may asynchronously convert mobile PNG/JPEG files to WebP. Bind the original
+    // committed name/size to its stable localId before accepting changed server metadata.
+    private val deepSeekIdentityHelpers = """
+        const rememberDeepSeekFiles=state=>{
+          if(!state.chosen)return;
+          const reserved=new Set(state.deepSeekLocalIds.filter(Boolean));
+          document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b').forEach(card=>{
+            if(state.baseline.has(card))return;
+            const props=reactProps(card,'file'),file=props&&props.file;
+            if(!file||typeof file.localId!=='string'||!file.localId||reserved.has(file.localId))return;
+            const index=state.expected.findIndex((expected,i)=>!state.deepSeekLocalIds[i]&&expected.mime.startsWith('image/')&&file.fileName===expected.name&&Number(file.fileSize)===expected.size);
+            if(index>=0){state.deepSeekLocalIds[index]=file.localId;reserved.add(file.localId);}
+          });
+        };
     """.trimIndent()
 
     fun nextControl(requestId: String, service: ArenaService): String = """
@@ -106,22 +126,34 @@ internal object ArenaAttachmentScript {
 
     private fun vendorReadiness(service: ArenaService): String = when (service) {
         ArenaService.DEEPSEEK -> """
+          $deepSeekIdentityHelpers
+          rememberDeepSeekFiles(state);
           const input=Array.from(document.querySelectorAll('textarea')).find(visible);
           const composer=input&&input.closest('._77cefa5');
-          const cards=composer?Array.from(composer.querySelectorAll('._25c7358')).filter(e=>visible(e)&&!state.baseline.has(e)):[];
+          const cards=composer?Array.from(composer.querySelectorAll('._25c7358,.d5fa3d1b')).filter(e=>visible(e)&&!state.baseline.has(e)):[];
           if(cards.length) {
-            let complete=0;
-            for(const expected of state.expected) {
-              const card=cards.find(e=>(e.querySelector('.e70accd6')?.textContent||'').trim()===expected.name);
-              if(!card) continue;
-              if(card.querySelector('._6e3a316,.a1310f97,._8753412')) return JSON.stringify({error:expected.name+'：DeepSeek 附件解析失败'});
-              const props=reactProps(card,'file'),file=props&&props.file&&props.file.fileName===expected.name?props.file:null;
-              if(file) {
-                if(['FAILED','ERROR','REJECTED'].includes(file.status)) return JSON.stringify({error:expected.name+'：DeepSeek 附件解析失败'});
-                if(file.status==='SUCCESS' && file.id && Number(file.fileSize)===expected.size) complete++;
+            let complete=0;const used=new Set();
+            for(const [index,expected] of state.expected.entries()) {
+              const localId=state.deepSeekLocalIds[index],isImage=expected.mime.startsWith('image/');
+              const convertible=isImage&&(/\.(jpe?g|png|heic|heif)${'$'}/i.test(expected.name)||['image/jpeg','image/png','image/heic','image/heif'].includes(expected.mime));
+              const dot=expected.name.lastIndexOf('.'),convertedName=(dot>0?expected.name.slice(0,dot):expected.name)+'.webp';
+              const entries=cards.filter(card=>!used.has(card)).map(card=>({card,props:reactProps(card,'file')})).filter(entry=>entry.props&&entry.props.file);
+              const entry=entries.find(({props})=>{
+                const file=props.file,exact=file.fileName===expected.name&&Number(file.fileSize)===expected.size;
+                if(localId&&file.localId!==localId)return false;
+                return exact||(convertible&&localId&&file.isImage===true&&file.fileName===convertedName&&Number(file.fileSize)>0);
+              });
+              if(!entry){
+                if(convertible&&!localId&&entries.some(({props})=>props.file.fileName===convertedName&&props.file.status==='SUCCESS'))return JSON.stringify({error:expected.name+'：无法核对 DeepSeek 图片转换前的文件身份，请在原网页确认附件后手动发送'});
+                continue;
               }
+              const {card,props}=entry,file=props.file;used.add(card);
+              if(card.querySelector('._6e3a316,.a1310f97,._8753412')) return JSON.stringify({error:expected.name+'：DeepSeek 附件解析失败'});
+              if(['FAILED','ERROR','REJECTED','CONTENT_FILTER','CONTENT_TOO_LONG','CANCELLED','CONTENT_EMPTY','_CUSTOM_SYSTEM_ERROR_FAIL'].includes(file.status)||file.auditResult==='reject'||props.fileUploadInfo?.failed||props.fileErrorState?.hasError)return JSON.stringify({error:expected.name+'：DeepSeek 附件上传、解析或审核失败'});
+              if(props.fileUploadInfo?.isUploading||props.isForking)continue;
+              if(file.status==='SUCCESS'&&file.id&&file.id!==file.localId&&(!isImage||(file.isImage===true&&[null,'pass'].includes(file.auditResult??null))))complete++;
             }
-            return JSON.stringify({ready:complete===state.expected.length,detail:'DeepSeek 已确认 '+complete+'/'+state.expected.length+' 个附件解析完成'});
+            return JSON.stringify({ready:complete===state.expected.length&&cards.length===state.expected.length,detail:'DeepSeek 已确认 '+complete+'/'+state.expected.length+' 个附件解析完成'});
           }
         """.trimIndent()
         ArenaService.DOUBAO -> """
@@ -136,7 +168,8 @@ internal object ArenaAttachmentScript {
               if(file.status==='Retry'||file.parseState===2||file.reviewState===2)return JSON.stringify({error:expected.name+'：豆包附件上传、解析或审核失败'});
               if(file.status!=='Normal'||!file.fileKey||!file.localKey||![0,1].includes(file.reviewState??0))continue;
               if(expected.mime.startsWith('image/')) {
-                const remote=(file.imageList||[]).some(image=>image.key===file.fileKey&&/^https:\/\//.test(image.image_ori&&image.image_ori.url||image.image_thumb&&image.image_thumb.url||''));
+                // Normal + the matching remote key confirms upload; blobUrl remains the local preview.
+                const remote=(file.imageList||[]).some(image=>image.key===file.fileKey);
                 if(file.type==='image'&&remote)complete++;
               } else if(file.type==='file'&&file.parseState===1)complete++;
             }

@@ -136,6 +136,82 @@ class ArenaAttachmentInstrumentedTest {
         }
     }
 
+    @Test fun doubaoUploadedImageKeepsBlobPreviewWhileRemoteKeyConfirmsUpload() {
+        withView("<div data-testid='attachment_area' id='area'></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("blob-image", listOf(attachment), ArenaService.DOUBAO))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.fileState={fileName:'photo.png',size:4096,type:'image',fileKey:'remote-upload-key',localKey:'local-file-key',status:'Normal',parseState:0,reviewState:0,
+                  imageList:[{key:'remote-upload-key',image_ori:{url:'blob:https://www.doubao.com/local-preview'},image_thumb:{url:'blob:https://www.doubao.com/local-preview'}}]};
+                area['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:[fileState]},return:root};true;
+            """.trimIndent())
+            assertTrue("Current Doubao upload state retains blob previews after successful upload", JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.status='Uploading';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.status='Normal';fileState.fileKey='';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.fileKey='unrelated-upload-key';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.fileKey='remote-upload-key';fileState.reviewState=3;true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).getBoolean("ready"))
+            evaluate(view, "fileState.reviewState=2;true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("blob-image", ArenaService.DOUBAO))).has("error"))
+        }
+    }
+
+    @Test fun deepSeekImageThumbnailUsesCommittedFileMetadataWithoutDocumentCaption() {
+        withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, ArenaAttachmentScript.prepare("ds-image", listOf(attachment), ArenaService.DEEPSEEK))
+            evaluate(view, """
+                window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                window.imageFile={fileName:'photo.png',fileSize:4096,isImage:true,id:'remote-file-id',localId:'local_file_7',signedPath:'/remote/image',status:'SUCCESS',auditResult:'pass'};
+                const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';card.innerHTML='<img alt="photo.png" src="blob:https://chat.deepseek.com/local-preview">';
+                card['__reactFiber${'$'}fixture']={memoizedProps:{fileName:'photo.png'},return:{memoizedProps:{file:imageFile,fileUploadInfo:{isUploading:false,failed:false},fileErrorState:{hasError:false}},return:root}};cards.appendChild(card);true;
+            """.trimIndent())
+            assertTrue("DeepSeek image thumbnails have no document caption element", JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "imageFile.status='PARSING';true")
+            assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).getBoolean("ready"))
+            evaluate(view, "imageFile.status='SUCCESS';imageFile.auditResult='reject';true")
+            assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-image", ArenaService.DEEPSEEK))).has("error"))
+            assertTrue("Existing unsent image must block accidental duplicate upload", JSONObject(evaluate(view, ArenaAttachmentScript.prepare("next-image", listOf(attachment), ArenaService.DEEPSEEK))).has("error"))
+        }
+    }
+
+    @Test fun deepSeekMobileWebpConversionRequiresObservedOriginalLocalIdentity() {
+        val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+        listOf(true, false).forEach { observeOriginal ->
+            withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
+                evaluate(view, ArenaAttachmentScript.prepare("ds-converted", listOf(attachment), ArenaService.DEEPSEEK))
+                evaluate(view, """
+                    window.__arenaAttachment.chosen=true;const root={tag:3,stateNode:{}};root.stateNode.current=root;
+                    window.imageFile={fileName:'${if (observeOriginal) "photo.png" else "other.png"}',fileSize:4096,isImage:true,id:'local_file_9',localId:'local_file_9',status:'PENDING'};
+                    window.imageProps={file:imageFile,fileUploadInfo:{isUploading:true,failed:false},fileErrorState:{hasError:false},isForking:false};
+                    const card=document.createElement('div');card.className='d5fa3d1b';card.style='height:80px;width:80px';card.innerHTML='<img alt="photo.png">';
+                    card['__reactFiber${'$'}fixture']={memoizedProps:{fileName:imageFile.fileName},return:{memoizedProps:imageProps,return:root}};cards.appendChild(card);true;
+                """.trimIndent())
+                // The committed original draft is visible to MutationObserver before the asynchronous conversion.
+                evaluate(view, "Object.assign(imageFile,{fileName:'photo.webp',fileSize:1234,id:'remote-image-9',status:'SUCCESS',auditResult:'pass',signedPath:'/remote/9'});imageProps.fileUploadInfo.isUploading=false;true")
+                val converted = JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK)))
+                if (observeOriginal) assertTrue("Observed original file retains its identity after conversion", converted.getBoolean("ready"))
+                else assertTrue("Missing original identity must produce an explicit diagnostic", converted.has("error"))
+                if (observeOriginal) {
+                    evaluate(view, "imageFile.localId='unrelated-local-id';true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageFile.localId='local_file_9';imageFile.fileName='other.webp';true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageFile.fileName='photo.webp';imageProps.fileUploadInfo.isUploading=true;true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageProps.fileUploadInfo.isUploading=false;imageFile.auditResult='unknown';true")
+                    assertFalse(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).getBoolean("ready"))
+                    evaluate(view, "imageFile.auditResult='pass';imageProps.fileUploadInfo.failed=true;true")
+                    assertTrue(JSONObject(evaluate(view, ArenaAttachmentScript.readiness("ds-converted", ArenaService.DEEPSEEK))).has("error"))
+                }
+            }
+        }
+    }
+
     @Test fun threePendingWebViewsReceiveSameThreeFilesWithExactHashes() {
         val attachments = imported()
         val store = ArenaAttachmentStore(context)
@@ -315,13 +391,14 @@ class ArenaAttachmentInstrumentedTest {
             cards['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:fileStates},return:root};
             function handle(){for(const file of document.getElementById('upload').files){
               const image=file.type.startsWith('image/'),card=document.createElement('div');card.style='height:80px;width:180px';
-              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
-              if('$kind'==='DEEPSEEK'){card.className='_25c7358';card.innerHTML='<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
+              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,localId:'local-'+file.name,isImage:image,auditResult:'pass',fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
+              if('$kind'==='DEEPSEEK'){card.className=image?'d5fa3d1b':'_25c7358';card.innerHTML=image?'<img alt="'+file.name+'" src="blob:https://chat.deepseek.com/local-preview">':'<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
               else if('$kind'==='KIMI'){card.className=image?'image-thumbnail loading':'file-card-container parsing';card.innerHTML=image?'<img src="https://fixture.invalid/p.png">':'<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">'+file.name.split('.').pop()+'</span>';}
               else {card.setAttribute('data-testid','attachment_file_item');card.textContent=file.name;}
               cards.appendChild(card);const reader=new FileReader();reader.onload=()=>{received.push({name:file.name,data:reader.result});setTimeout(()=>{
                 state.status=${if(fail) "'FAILED'" else if(service == ArenaService.DOUBAO) "'Normal'" else "'SUCCESS'"};state.parseState=${if(fail) 2 else 1};
-                state.imageList=[{key:state.fileKey,image_ori:{url:'https://fixture.invalid/p.png'}}];
+                if('$kind'==='DEEPSEEK'&&image&&${!fail}){state.fileName=file.name.replace(/\.[^.]+${'$'}/,'')+'.webp';state.fileSize=Math.max(1,file.size-1);}
+                state.imageList=[{key:state.fileKey,image_ori:{url:'blob:https://www.doubao.com/local-preview'}}];
                 if('$kind'==='KIMI')card.className=(image?'image-thumbnail ':'file-card-container ')+${if(fail) "'error'" else "'success'"};
               },150);};reader.readAsDataURL(file);
             }}

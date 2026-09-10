@@ -124,7 +124,7 @@ class ArenaParallelWebViewInstrumentedTest {
     }
 
     @Test fun slowUploadDoesNotBlockOtherProvidersAndTabChangesKeepFilesAndPromptsSeparate() {
-        withPool(mapOf(ArenaService.DEEPSEEK to 8_000L)) { pool, views, attachment ->
+        withPool(mapOf(ArenaService.DEEPSEEK to 8_000L), fileName = "probe.png") { pool, views, attachment ->
             val done = CountDownLatch(3)
             val outcomes = mutableMapOf<ArenaService, SendOutcome>()
             val times = mutableMapOf<ArenaService, Long>()
@@ -308,9 +308,9 @@ class ArenaParallelWebViewInstrumentedTest {
     private fun field(instance: Any, name: String): Any? = instance.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(instance)
 
     @Suppress("UNCHECKED_CAST")
-    private fun withPool(delays: Map<ArenaService, Long>, block: (ArenaWebViewPool, Map<ArenaService, WebView>, ArenaAttachment) -> Unit) {
+    private fun withPool(delays: Map<ArenaService, Long>, fileName: String = "probe.txt", block: (ArenaWebViewPool, Map<ArenaService, WebView>, ArenaAttachment) -> Unit) {
         val store = ArenaAttachmentStore(context)
-        val attachment = store.importDocuments(listOf(AttachmentFixtureProvider.uri("probe.txt"))).single()
+        val attachment = store.importDocuments(listOf(AttachmentFixtureProvider.uri(fileName))).single()
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             lateinit var pool: ArenaWebViewPool
             lateinit var views: Map<ArenaService, WebView>
@@ -371,7 +371,7 @@ class ArenaParallelWebViewInstrumentedTest {
         val controls = if (service == ArenaService.KIMI) """
             <button class="toolkit-trigger-btn" onclick="menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; style=&quot;display:none&quot;></label>';upload.onchange=handle;">Add</button><div id="menu"></div>
         """ else """
-            <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" accept=".txt" style="display:none">
+            <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" accept=".txt,image/*" style="display:none">
         """
         return """
             <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -383,13 +383,16 @@ class ArenaParallelWebViewInstrumentedTest {
             window.fixtureReady=true;window.received=[];window.fileStates=[];window.sendCount=0;window.sentText='';
             const root={tag:3,stateNode:{}};root.stateNode.current=root;
             cards['__reactFiber${'$'}fixture']={memoizedProps:{attachmentStates:fileStates},return:root};
-            window.completeFixture=()=>{fileStates.forEach(f=>{f.status='${if(service == ArenaService.DOUBAO) "Normal" else "SUCCESS"}';f.parseState=1;});
-              Array.from(cards.children).forEach(c=>{if('${service.name}'==='KIMI')c.className='file-card-container success';});};
+            window.completeFixture=()=>{fileStates.forEach(f=>{f.status='${if(service == ArenaService.DOUBAO) "Normal" else "SUCCESS"}';f.parseState=1;
+              if('${service.name}'==='DEEPSEEK'&&f.isImage){f.fileName=f.fileName.replace(/\.[^.]+${'$'}/,'')+'.webp';f.fileSize=Math.max(1,f.fileSize-1);}
+              f.imageList=[{key:f.fileKey,image_ori:{url:'blob:https://www.doubao.com/local-preview'}}];});
+              Array.from(cards.children).forEach(c=>{if('${service.name}'==='KIMI')c.className=(c.classList.contains('image-thumbnail')?'image-thumbnail ':'file-card-container ')+'success';});};
             function handle(){for(const file of upload.files){
-              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,fileKey:'key-'+file.name,localKey:'local-'+file.name,type:'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
+              const image=file.type.startsWith('image/');
+              const state={fileName:file.name,fileSize:file.size,size:file.size,id:'id-'+file.name,localId:'local-'+file.name,isImage:image,auditResult:'pass',fileKey:'key-'+file.name,localKey:'local-'+file.name,type:image?'image':'file',status:'${if(service == ArenaService.DOUBAO) "Uploading" else "PENDING"}',parseState:3,reviewState:0};fileStates.push(state);
               const card=document.createElement('div');card.style='height:60px;width:180px';
-              if('${service.name}'==='DEEPSEEK'){card.className='_25c7358';card.innerHTML='<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
-              else if('${service.name}'==='KIMI'){card.className='file-card-container parsing';card.innerHTML='<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">txt</span>';}
+              if('${service.name}'==='DEEPSEEK'){card.className=image?'d5fa3d1b':'_25c7358';card.innerHTML=image?'<img alt="'+file.name+'" src="blob:https://chat.deepseek.com/local-preview">':'<span class="e70accd6">'+file.name+'</span>';card['__reactFiber${'$'}fixture']={memoizedProps:{file:state},return:root};}
+              else if('${service.name}'==='KIMI'){card.className=image?'image-thumbnail loading':'file-card-container parsing';card.innerHTML=image?'<img src="https://fixture.invalid/p.png">':'<span class="file-card-info-name">'+file.name.replace(/\.[^.]+${'$'}/,'')+'</span><span class="file-ext">txt</span>';}
               else {card.setAttribute('data-testid','attachment_file_item');card.textContent=file.name;}
               cards.appendChild(card);const reader=new FileReader();reader.onload=()=>{received.push({name:file.name,data:reader.result,at:Date.now()});setTimeout(completeFixture,$delay);};reader.readAsDataURL(file);
             }}
