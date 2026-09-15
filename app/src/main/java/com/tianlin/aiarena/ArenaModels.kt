@@ -9,6 +9,10 @@ enum class ArenaService(
     val brandGlyph: String? = null,
     val brandColor: Long = 0xFF1D6078,
     val experimental: Boolean = false,
+    /** 境外站点：手机网络必须能访问对应官网，成员列表里单独标出来。 */
+    val overseas: Boolean = false,
+    /** 官网允许不登录直接提问：页面上同时有输入框和「登录」按钮时仍算可用。 */
+    val guestUsable: Boolean = false,
 ) {
     DEEPSEEK(
         displayName = "DeepSeek",
@@ -57,6 +61,38 @@ enum class ArenaService(
         brandGlyph = "智",
         brandColor = 0xFF295FB8,
         experimental = true,
+    ),
+    CLAUDE(
+        displayName = "Claude",
+        shortName = "Claude",
+        url = "https://claude.ai/new",
+        loginHint = "邮箱登录；需要能访问境外网站",
+        brandGlyph = "C",
+        brandColor = 0xFFC96442,
+        experimental = true,
+        overseas = true,
+    ),
+    CHATGPT(
+        displayName = "ChatGPT",
+        shortName = "ChatGPT",
+        url = "https://chatgpt.com/",
+        loginHint = "邮箱登录；需要能访问境外网站",
+        brandGlyph = "G",
+        brandColor = 0xFF10A37F,
+        experimental = true,
+        overseas = true,
+    ),
+    GEMINI(
+        displayName = "Gemini",
+        shortName = "Gemini",
+        url = "https://gemini.google.com/app",
+        loginHint = "Google 账号登录；需要能访问境外网站",
+        brandGlyph = "✦",
+        brandColor = 0xFF4E7FEE,
+        experimental = true,
+        overseas = true,
+        // 2026-09-15 实测：未登录可直接提问并拿到回答（ChatGPT 未登录发送后要求登录，不算）
+        guestUsable = true,
     );
 
     companion object {
@@ -89,6 +125,8 @@ data class ServiceStatus(
     val url: String = "",
     /** 网页里读到的"当前模型 / 思考模式"；读不到就是空的，界面显示"模式 未知"，绝不猜。 */
     val modeReading: AiModeReading = AiModeReading(),
+    /** 未登录但官网允许直接提问（见 [ArenaService.guestUsable]）。 */
+    val guest: Boolean = false,
 )
 
 data class LoginTrustDecision(

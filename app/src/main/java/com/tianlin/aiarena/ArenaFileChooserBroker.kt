@@ -77,6 +77,9 @@ internal class ArenaFileChooserBroker(private val context: Context) {
                 ArenaService.QWEN -> host == "www.qianwen.com" || host == "qianwen.com"
                 ArenaService.YUANBAO -> host == "yuanbao.tencent.com"
                 ArenaService.ZHIPU -> host == "chatglm.cn" || host == "www.chatglm.cn"
+                ArenaService.CLAUDE -> host == "claude.ai"
+                ArenaService.CHATGPT -> host == "chatgpt.com" || host == "chat.openai.com"
+                ArenaService.GEMINI -> host == "gemini.google.com"
             }
         }
     }

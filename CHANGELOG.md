@@ -2,6 +2,22 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- 新增 Claude、ChatGPT、Gemini 三家境外备选成员。不进默认成员，成员列表标「需境外网络」；发送、回答提取、模式小字、新对话和历史对话地址沿用现有网页适配框架。
+- Gemini 官网允许未登录提问时算作可用成员，成员列表和登录引导显示「未登录也可提问」。
+
+### Fixed
+
+- 境外站点停在 `/login`、`/auth` 或 Cloudflare 人机验证页时按需要登录处理，不再沿用页面跳转前闪现输入框得出的已登录结论。
+
+### Known limitations
+
+- Claude 在隔离模拟器（WebView 113，经本机代理）停在 Cloudflare 人机验证页，登录和真实发送未验证；ChatGPT 未登录发送后官网要求登录，登录后的回答提取未用真实账号验证。
+- 境外成员暂不支持圆桌附件，选择后明确提示。
+
 ## [0.13.2] - 2026-09-10
 
 ### Fixed

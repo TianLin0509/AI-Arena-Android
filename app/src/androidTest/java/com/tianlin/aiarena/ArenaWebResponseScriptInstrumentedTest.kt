@@ -178,6 +178,62 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertFalse(payload.getBoolean("requestIdVisible"))
     }
 
+    /** 结构取自 2026-09-15 未登录 Gemini 真实页面（user-query / model-response / aria-busy / message-actions）。 */
+    @Test
+    fun geminiAdapterWaitsForBusyFlagThenExtractsMarkdown() {
+        fun page(busy: Boolean) = """
+            <div class="conversation-container">
+              <user-query><div class="query-text"><p class="query-text-line">用户问题</p></div></user-query>
+              <model-response><message-content><div class="markdown markdown-main-panel" aria-busy="$busy"><p>Gemini 最终文本</p></div></message-content>
+                <message-actions style="display:block;width:160px;height:48px"><button>复制</button></message-actions></model-response>
+            </div>
+        """.trimIndent()
+
+        val done = evaluate(ArenaService.GEMINI, "gemini_done", page(busy = false))
+        assertTrue(done.getBoolean("found"))
+        assertFalse(done.getBoolean("streaming"))
+        assertEquals("Gemini 最终文本", done.getString("text"))
+        assertTrue(done.getBoolean("localTagBound"))
+
+        val busy = evaluate(ArenaService.GEMINI, "gemini_busy", page(busy = true))
+        assertTrue("aria-busy=true 时即使操作栏已在也不能判完成", busy.getBoolean("streaming"))
+    }
+
+    /** Claude 结构按 data-is-streaming 约定的夹具；真实登录页面结构待账号登录后核对。 */
+    @Test
+    fun claudeAdapterUsesStreamingAttribute() {
+        fun page(streaming: Boolean) = """
+            <div data-testid="user-message">用户问题</div>
+            <div data-is-streaming="$streaming"><div class="font-claude-response"><p>Claude 最终文本</p></div></div>
+        """.trimIndent()
+
+        val done = evaluate(ArenaService.CLAUDE, "claude_done", page(streaming = false))
+        assertTrue(done.getBoolean("found"))
+        assertFalse(done.getBoolean("streaming"))
+        assertEquals("Claude 最终文本", done.getString("text"))
+        assertTrue(done.getBoolean("localTagBound"))
+        assertTrue(evaluate(ArenaService.CLAUDE, "claude_streaming", page(streaming = true)).getBoolean("streaming"))
+    }
+
+    /** ChatGPT 按 data-message-author-role 约定的夹具；真实登录页面结构待账号登录后核对。 */
+    @Test
+    fun chatGptAdapterWaitsForCopyActionAndIgnoresPreviousAnswer() {
+        fun page(withCopy: Boolean) = """
+            <article><div data-message-author-role="user">旧问题</div></article>
+            <article><div data-message-author-role="assistant"><div class="markdown"><p>旧回答</p></div></div>
+              <button data-testid="copy-turn-action-button" style="width:24px;height:24px">复制</button></article>
+            <article><div data-message-author-role="user">用户问题</div></article>
+            <article><div data-message-author-role="assistant"><div class="markdown"><p>ChatGPT 最终文本</p></div></div>
+              ${if (withCopy) "<button data-testid=\"copy-turn-action-button\" style=\"width:24px;height:24px\">复制</button>" else ""}</article>
+        """.trimIndent()
+
+        val done = evaluate(ArenaService.CHATGPT, "chatgpt_done", page(withCopy = true))
+        assertTrue(done.getBoolean("found"))
+        assertFalse(done.getBoolean("streaming"))
+        assertEquals("ChatGPT 最终文本", done.getString("text"))
+        assertTrue(evaluate(ArenaService.CHATGPT, "chatgpt_streaming", page(withCopy = false)).getBoolean("streaming"))
+    }
+
     @Test
     fun qwenAdapterIncludesNetworkCaptureFallback() {
         val script = ArenaWebResponseScript.build(ArenaService.QWEN, "qwen_network_cursor")

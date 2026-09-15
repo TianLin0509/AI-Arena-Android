@@ -595,13 +595,17 @@ private fun MemberToggleRow(
     ArenaRow(
         title = service.displayName,
         titleColor = if (selected) colors.accent else colors.ink,
-        detail = if (status.state.isUsable()) "已登录，可直接使用" else service.loginHint,
+        detail = when {
+            status.state.isUsable() && status.guest -> "未登录也可提问，登录后功能更全"
+            status.state.isUsable() -> "已登录，可直接使用"
+            else -> service.loginHint
+        },
         leading = { BrandAvatar(service = service, size = 34.dp) },
         trailing = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (service.experimental) {
                     ArenaPill(
-                        text = "适配中",
+                        text = if (service.overseas) "需境外网络" else "适配中",
                         foreground = colors.warning,
                         background = colors.warningSoft,
                         dot = false,
