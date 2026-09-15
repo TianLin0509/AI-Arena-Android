@@ -185,6 +185,16 @@ internal object ArenaWebResponseScript {
                 const tagged = users.find(function(row) {
                   return row.getAttribute('data-ai-arena-request') === requestId;
                 });
+                // 2026-09-15: with a members-only model selected, Kimi shows an upgrade modal over the send
+                // control and the question never reaches the conversation. Report it instead of waiting minutes.
+                const upgradeModal = Array.from(document.querySelectorAll('.modal-mask')).find(function(mask) {
+                  const rect = mask.getBoundingClientRect();
+                  const words = String(mask.innerText || '').replace(/\s+/g, ' ');
+                  return rect.width > 2 && rect.height > 2 && /Moderato|Allegretto|Vivace|Upgrade your membership|higher-tier members|升级会员|开通会员|会员专享|会员可用/i.test(words);
+                });
+                if (upgradeModal && !tagged) {
+                  throw new Error('Kimi 网页提示当前模型或功能需要会员，问题没有发出；请打开原网页换用可用模型后重试');
+                }
                 const user = tagged || users.slice(Number(state.userBaseline || 0)).pop() || null;
                 if (user) {
                   let assistant = user.nextElementSibling;

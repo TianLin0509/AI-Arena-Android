@@ -394,7 +394,7 @@ internal fun RoundStage(
                     summaryExpanded = summaryExpanded,
                     onSummary = { summaryExpanded = !summaryExpanded },
                     hasAttachments = attachmentDraft.attachments.isNotEmpty(),
-                    attachmentContent = { AttachmentComposer(attachmentDraft.attachments, attachmentDraft.picking, attachmentsEnabled && !busy, onChooseAttachments, attachmentDraft::remove, attachmentDraft.error, summaryHint = true) },
+                    attachmentContent = { AttachmentComposer(attachmentDraft.attachments, attachmentDraft.picking, attachmentsEnabled && !busy, onChooseAttachments, attachmentDraft::remove, attachmentDraft.error, summaryHint = true, memberNotice = ArenaAttachmentSupport.notice(members, attachmentDraft.attachments)) },
                     onIterate = {
                         if (sessionController.startIteration(answerMode, roundGuidance, attachmentDraft.attachments)) { onRoundGuidanceChange(""); attachmentDraft.clear() }
                     },

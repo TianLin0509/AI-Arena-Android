@@ -150,15 +150,48 @@ internal class ArenaAttachmentTransport(
             }
             if (delivered) inspect {} else withFocus(::inspect)
         }
-        webView.evaluateJavascript(ArenaAttachmentScript.prepare(requestId, files.map { it.first }, service)) { raw ->
-            if (current()) {
-                if (raw == "true") poll()
-                else {
-                    val error = try { JSONObject(decode(raw)).optString("error") } catch (_: Exception) { "附件上传准备失败" }
-                    finish(error.ifBlank { "附件上传准备失败" })
+        fun startUpload() {
+            webView.evaluateJavascript(ArenaAttachmentScript.prepare(requestId, files.map { it.first }, service)) { raw ->
+                if (current()) {
+                    if (raw == "true") poll()
+                    else {
+                        val error = try { JSONObject(decode(raw)).optString("error") } catch (_: Exception) { "附件上传准备失败" }
+                        finish(error.ifBlank { "附件上传准备失败" })
+                    }
                 }
             }
         }
+        // Leftover draft cards (an earlier failed round, or a site restoring its draft) used to stop every
+        // later round. Remove them through their own delete controls, bounded, and only start once the
+        // composer has stayed empty for two consecutive reads; prepare() still stops if anything remains.
+        var cleanupRounds = 0
+        var emptyReads = 0
+        fun clearLeftovers() {
+            if (!current()) return
+            if (!sameDocument()) return finish("网页已切换，附件上传已取消，请重新发送")
+            webView.evaluateJavascript(ArenaAttachmentScript.leftovers(service, remove = cleanupRounds < MAX_CLEANUP_ROUNDS)) { raw ->
+                if (!current()) return@evaluateJavascript
+                val result = try { JSONObject(decode(raw)) } catch (_: Exception) { return@evaluateJavascript finish("网页附件状态无法读取，未发送问题") }
+                val count = result.optInt("count", -1)
+                when {
+                    count == 0 && cleanupRounds == 0 -> startUpload()
+                    count == 0 && ++emptyReads >= 2 -> startUpload()
+                    count == 0 -> handler.postDelayed({ clearLeftovers() }, CLEANUP_SETTLE_MS)
+                    result.optInt("clicked") > 0 -> {
+                        cleanupRounds++
+                        emptyReads = 0
+                        handler.postDelayed({ clearLeftovers() }, CLEANUP_SETTLE_MS)
+                    }
+                    else -> startUpload()
+                }
+            }
+        }
+        clearLeftovers()
+    }
+
+    private companion object {
+        const val MAX_CLEANUP_ROUNDS = 2
+        const val CLEANUP_SETTLE_MS = 900L
     }
 
     private fun decode(raw: String): String = when(val value = JSONTokener(raw).nextValue()) {

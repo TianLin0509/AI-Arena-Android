@@ -116,7 +116,7 @@ internal object ArenaWebCursorScript {
         ArenaService.DOUBAO -> "Array.from(document.querySelectorAll('[class*=v_list_row][data-observe-row]')).filter(function(row) { return !!row.querySelector('[class*=bg-g-send]'); }).pop() || null"
         ArenaService.KIMI -> "Array.from(document.querySelectorAll('.chat-content-item-user')).pop() || null"
         ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question, [class*=user] [class*=content], [class*=human] [class*=text]')).pop() || null"
-        ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human, [class*=user-message], [class*=user] [class*=content]')).pop() || null"
+        ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human')).pop() || null"
         ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).pop() || null"
     }
 
@@ -124,6 +124,8 @@ internal object ArenaWebCursorScript {
     private const val userCountDoubao = "Array.from(document.querySelectorAll('[class*=v_list_row][data-observe-row]')).filter(function(row) { return !!row.querySelector('[class*=bg-g-send]'); }).length"
     private const val userCountKimi = "document.querySelectorAll('.chat-content-item-user').length"
     private const val userCountQwen = "document.querySelectorAll('.message-card-wrap.question, [class*=user] [class*=content], [class*=human] [class*=text]').length"
-    private const val userCountYuanbao = "document.querySelectorAll('.agent-chat__list__item--human, [class*=user-message], [class*=user] [class*=content]').length"
+    // 2026-09-15: "[class*=user] [class*=content]" also matched a navigation guide popup under .yb-nav__user,
+    // so its appearance counted as a sent message and a not-sent question waited five minutes.
+    private const val userCountYuanbao = "document.querySelectorAll('.agent-chat__list__item--human').length"
     private const val userCountZhipu = "document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]').length"
 }
