@@ -605,6 +605,7 @@ private fun ConnectionRow(
     ArenaRow(
         title = service.displayName,
         detail = when {
+            connected && status.guest -> "未登录也可提问，登录后功能更全"
             connected -> "已登录，以后自动记住"
             status.state == ConnectionState.ERROR -> "网页没有打开，点一下重试"
             status.state == ConnectionState.LOADING -> "正在打开网页…"
