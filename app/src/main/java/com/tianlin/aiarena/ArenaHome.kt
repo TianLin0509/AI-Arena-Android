@@ -173,7 +173,8 @@ internal fun AskHome(
             )
 
             AttachmentComposer(attachmentDraft.attachments, attachmentDraft.picking, attachmentsEnabled,
-                onChooseAttachments, attachmentDraft::remove, attachmentDraft.error)
+                onChooseAttachments, attachmentDraft::remove, attachmentDraft.error,
+                memberNotice = ArenaAttachmentSupport.notice(selectedServices, attachmentDraft.attachments))
 
             AnimatedVisibility(
                 visible = question.isBlank() && attachmentDraft.attachments.isEmpty(),

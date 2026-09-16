@@ -80,6 +80,8 @@ internal fun AttachmentComposer(
     onRemove: (String) -> Unit,
     error: String? = null,
     summaryHint: Boolean = false,
+    /** 所选成员里有人收不到这些附件时的提示；在点「开始」之前就说清楚。 */
+    memberNotice: String? = null,
 ) {
     val colors = ArenaStyle.colors
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -102,6 +104,9 @@ internal fun AttachmentComposer(
             else "所选附件将发给参与的各家 AI。不写问题时将请 AI 阅读并分析附件。",
             color = colors.muted, style = MaterialTheme.typography.labelSmall,
         )
+        if (attachments.isNotEmpty() && memberNotice != null) {
+            Text(memberNotice, Modifier.testTag("attachment-member-notice"), color = colors.error, style = MaterialTheme.typography.bodySmall)
+        }
         if (error != null) Text(error, color = colors.error, style = MaterialTheme.typography.bodySmall)
     }
 }

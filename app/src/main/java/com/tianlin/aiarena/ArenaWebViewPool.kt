@@ -317,9 +317,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (attachments.isEmpty()) return sendPrompt(service, prompt, requestId, callback)
         val error = ArenaAttachmentPolicy.validate(attachments)
         if (error != null) return callback(SendOutcome(false, requestId, error))
-        if (service !in setOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO, ArenaService.KIMI)) {
-            return callback(SendOutcome(false, requestId, "${service.displayName} 暂不支持圆桌附件，请换用 DeepSeek、豆包或 Kimi"))
-        }
+        ArenaAttachmentSupport.sendError(service, attachments)?.let { return callback(SendOutcome(false, requestId, it)) }
         val epoch = cancellationEpoch
         val serviceEpoch = serviceEpochs[service] ?: 0L
         if (destroyed) return callback(SendOutcome(false, requestId, "网页已关闭"))
@@ -653,6 +651,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         val sent = verifyRaw == "true"
                         if (sent) {
                             finishSuccessfulSend(webView, service, requestId, callback)
+                        } else if (service == ArenaService.KIMI) {
+                            // A members-only Kimi model answers the send click with an upgrade modal (2026-09-15).
+                            webView.evaluateJavascript(KIMI_UPGRADE_MODAL_SCRIPT) { modal ->
+                                if (!isCurrent(service, token)) return@evaluateJavascript
+                                val detail = if (modal == "true") KIMI_UPGRADE_DETAIL else "发送后未检测到新消息"
+                                finishSend(service, SendOutcome(false, requestId, detail), callback)
+                            }
                         } else {
                             finishSend(service, SendOutcome(false, requestId, "发送后未检测到新消息"), callback)
                         }
@@ -1570,6 +1575,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
           if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
           for(let node=send;node&&node!==document.body;node=node.parentElement){
             if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
+            // CSS-module disabled states such as Yuanbao's SendButton_disabled__hash.
+            if(Array.from(node.classList).some(name=>/(^|_)disabled(_|${'$'})/i.test(name)))return false;
           }
           return true;
         };
@@ -1737,6 +1744,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[class*='submit']",
             )
             ArenaService.YUANBAO -> listOf(
+                // 2026-09-15: the send control is a div; none of the button selectors matched any more.
+                "#yuanbao-send-btn",
                 "button[aria-label*='发送']",
                 "button[aria-label*='Send']",
                 "button[aria-label='提交']",
@@ -1884,6 +1893,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L
         private const val SEND_VERIFY_CALLBACK_TIMEOUT_MS = 10_000L
+        private const val KIMI_UPGRADE_DETAIL = "Kimi 网页提示当前模型或功能需要会员，问题没有发出；请打开原网页换用可用模型后重试"
+        private const val KIMI_UPGRADE_MODAL_SCRIPT = "(function(){return Array.from(document.querySelectorAll('.modal-mask')).some(function(mask){var r=mask.getBoundingClientRect();return r.width>2&&r.height>2&&/Upgrade your membership|higher-tier members|members only|升级会员|开通会员|会员专享|仅.{0,8}会员/i.test(String(mask.innerText||''));});})()"
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L

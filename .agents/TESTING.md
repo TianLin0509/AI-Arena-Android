@@ -48,6 +48,22 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 
 发布说明必须保留豆包已成功内容可能恢复成旧草稿的限制，不能称为用户未发送文件或单纯测试污染。冻结 R14 不自动删除任何草稿，发现冲突后用户需在原网页核对处理，再手动重试。正式签名 / R8 / API 26 升级检查按下面发布边界执行，历史候选结果不能替代。
 
+### 千问 / 元宝附件与残留草稿清理（2026-09-15 任务 `task/20260915-attachments-all-claude`）
+
+网页结构依据：2026-09-15 在保留登录的隔离克隆 `arena_real_account_20260909`（emulator-5594）上用 CDP 只读探测，并以合成测试文件实传后删除草稿，未发送任何消息。探测脚本与原始 JSON 在该任务工作树 `artifacts/20260915-attachments-all-claude-probe-*`。
+
+- 千问：输入区 `[data-chat-input-shell]` 的「添加附件」radix 菜单，按类型选「上传图片 / 上传文档」；网页在 body 下动态创建 file input 并调用 showPicker。卡片组件属性 `record`（图片）或同名字段直接展开（文档），`recordStatus` 3 上传中、0 解析中、1 成功、-1 上传失败、2 解析失败。
+- 元宝：`[data-new-input-card]` 的 add-tools 菜单，菜单项 React key `upload_pic` / `local_file`，文案随界面语言变化；body 下动态 input。卡片 `file.status` 由 loading 变为 finish、progress 100 并带 fileId；上传中发送按钮已经可点，不能以按钮状态判断就绪。
+- 智谱：手机网页 `/miniapp/home` 只有「选图即发问」组件，桌面版在手机 WebView 进入安全验证，不绕过，保持不支持并在提问前提示。
+- 豆包：当前附件区比 R14 多一层包裹，`.guidance-input-surface > .relative > .container-tJHWhP` 不再命中，改为后代选择器并保留旧路径。
+- 草稿删除按钮（均实测点击后卡片消失）：DeepSeek 卡片直属 `[tabindex=0]` 且含 `.ds-icon`；豆包卡片直属 `svg[aria-label=delete]`；Kimi 图片 `.image-delete-container`、文件 `.file-card-delete`；千问 `[data-icon-type=qwpcicon-close2]`；元宝 `[aria-label=删除文件]`。
+
+- 元宝发送：发送控件为 `div#yuanbao-send-btn`，禁用态 class 为 CSS module 的 `SendButton_disabled__*`；真实用户消息为 `.agent-chat__list__item--human`。旧的 `[class*=user] [class*=content]` 会命中 `.yb-nav__user` 下的引导弹窗，造成未发送却判为已发送。
+- Kimi：选中会员模型（2026-09-15 克隆账号为 K2.8）时发送会弹出 `.modal-mask` 升级提示，问题不进入对话；读取回答须报错而不是等待超时。本任务未修改账号的模型选择。
+- 千问：真实连测中出现一次原生点击菜单项未激活，随后的独立一轮同一路径成功，并记录到可信 pointer/touch/click 与带用户激活的 showPicker；菜单项因此纳入有界重试，不代表根因已确认。
+
+本任务变更还须验证：新增 `ArenaAttachmentProviderInstrumentedTest` 全部通过；其中清理必须覆盖不认识的删除结构不点击、网页恢复一次后仍成功、持续恢复时两轮后停止且不交付文件。真实账号验收须记录每轮成员、文件、随机编号核对和清理前后的草稿数量；合成夹具通过不代表官网实传通过。
+
 ## 发布
 
 当前产品版本 `0.13.2`、versionCode `22`，折叠回答 UI 基线 `aaecc778fcbe6a9a98aa8dfc1adcc8d908de3aee`。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。

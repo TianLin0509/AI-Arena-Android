@@ -2,7 +2,53 @@ package com.tianlin.aiarena
 
 /** Read-only readiness probes deliberately fail closed when a vendor changes its upload UI. */
 internal object ArenaAttachmentScript {
-    private const val doubaoAreaSelector = "[data-testid=attachment_area],.guidance-input-surface > .relative > .container-tJHWhP"
+    // 2026-09-15: the live composer wraps the area in one more div; keep the older direct path too.
+    private const val doubaoAreaSelector = "[data-testid=attachment_area],.guidance-input-surface > .relative > .container-tJHWhP,.guidance-input-surface .container-tJHWhP"
+    private const val qwenCloseSelector = "[data-chat-input-shell] [data-chat-input-top-content] [data-icon-type=qwpcicon-close2]"
+    private const val yuanbaoCloseSelector = "[data-new-input-card] [data-input-resource-area] [aria-label=\"删除文件\"]"
+
+    /** Draft cards in each composer. Qwen and Yuanbao are counted by their per-card delete controls. */
+    private fun draftCardSelector(service: ArenaService): String = when (service) {
+        ArenaService.DEEPSEEK -> "._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b"
+        ArenaService.KIMI -> "[data-testid=input-attachment-list] .file-card-container,[data-testid=input-attachment-list] .image-thumbnail,.chat-editor-attachment-area .file-card-container,.chat-editor-attachment-area .image-thumbnail"
+        ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_],.guidance-input-surface .container-tJHWhP [data-kind][role=button]"
+        ArenaService.QWEN -> qwenCloseSelector
+        ArenaService.YUANBAO -> yuanbaoCloseSelector
+        // 智谱与境外成员没有草稿附件区，故意匹配不到任何节点。
+        else -> "[data-arena-no-attachment-support]"
+    }
+
+    /**
+     * Only delete controls observed on the real site (2026-09-15, isolated account clone) are listed.
+     * Unknown structures return null, so the existing "remove it in the original page" stop remains.
+     */
+    private fun draftDeleteControl(service: ArenaService): String = when (service) {
+        ArenaService.QWEN, ArenaService.YUANBAO -> "card=>card"
+        ArenaService.DEEPSEEK -> "card=>{const controls=Array.from(card.querySelectorAll(':scope > [tabindex=\"0\"]')).filter(e=>e.querySelector('.ds-icon'));return controls.length===1?controls[0]:null;}"
+        ArenaService.DOUBAO -> "card=>{const controls=Array.from(card.querySelectorAll(':scope > svg[aria-label=delete]'));return controls.length===1?controls[0]:null;}"
+        ArenaService.KIMI -> "card=>{const controls=Array.from(card.querySelectorAll(card.matches('.image-thumbnail')?':scope > .image-delete-container':':scope > .file-card-delete'));return controls.length===1?controls[0]:null;}"
+        else -> "card=>null"
+    }
+
+    /**
+     * A failed earlier round, or a site restoring its own draft, leaves cards in the composer and would
+     * stop every later round. Remove them only through each card's own delete control, and only when every
+     * card has exactly one known control; otherwise report them and let the caller stop as before.
+     */
+    fun leftovers(service: ArenaService, remove: Boolean): String = """
+        (() => {
+          const shown=e=>{const r=e.getBoundingClientRect();return r.width>2&&r.height>2&&getComputedStyle(e).visibility!=='hidden'};
+          const cards=Array.from(document.querySelectorAll(${ArenaJs.quote(draftCardSelector(service))})).filter(shown);
+          const controlOf=${draftDeleteControl(service)};
+          const controls=cards.map(controlOf).filter(control=>control&&control.isConnected);
+          let clicked=0;
+          if($remove&&cards.length&&controls.length===cards.length){
+            for(const control of controls){control.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));clicked++;}
+          }
+          return JSON.stringify({count:cards.length,removable:controls.length,clicked});
+        })();
+    """.trimIndent()
+
     fun prepare(requestId: String, files: List<ArenaAttachment>, service: ArenaService): String {
         val expected = files.joinToString(",", "[", "]") { "{name:${ArenaJs.quote(it.name)},size:${it.sizeBytes},mime:${ArenaJs.quote(it.mimeType)}}" }
         return """
@@ -15,14 +61,9 @@ internal object ArenaAttachmentScript {
               if (previous && previous.pendingControl?.clickTarget) previous.pendingControl.clickTarget.removeEventListener('click', previous.pendingControl.clickListener, true);
               if (previous && previous.observer) previous.observer.disconnect();
               const shown=e=>{const r=e.getBoundingClientRect();return r.width>2&&r.height>2&&getComputedStyle(e).visibility!=='hidden'};
-              const existing=Array.from(document.querySelectorAll(${ArenaJs.quote(when(service) {
-                ArenaService.DEEPSEEK -> "._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b"
-                ArenaService.KIMI -> "[data-testid=input-attachment-list] .file-card-container,[data-testid=input-attachment-list] .image-thumbnail,.chat-editor-attachment-area .file-card-container,.chat-editor-attachment-area .image-thumbnail"
-                ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_],.guidance-input-surface > .relative > .container-tJHWhP"
-                else -> "[data-arena-no-attachment-support]"
-              })})).filter(shown);
+              const existing=Array.from(document.querySelectorAll(${ArenaJs.quote(draftCardSelector(service))})).filter(shown);
               document.querySelectorAll(${ArenaJs.quote(doubaoAreaSelector)}).forEach(area=>{const props=reactProps(area,'attachmentStates');if(props&&props.attachmentStates.length)existing.push(area);});
-              if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，请先到原网页移除后重试，避免重复上传'});
+              if(existing.length) return JSON.stringify({error:'原网页还有未发送的附件，自动清理没有完成，请先到原网页移除后重试，避免重复上传'});
               const previousLocalIds=new Set(Array.from(document.querySelectorAll('._77cefa5 ._25c7358,._77cefa5 .d5fa3d1b')).map(card=>reactProps(card,'file')?.file?.localId).filter(id=>typeof id==='string'&&id));
               const state = {id:${ArenaJs.quote(requestId)},expected:$expected,chosen:false,selectionConfirmed:false,selectionInput:null,selectionInputs:new Set(),clicked:new WeakSet(),menuAttempts:new Map(),kimiMenuAttempt:null,kimiFileAttempt:null,fileControlAttempt:null,deepSeekControlAttempt:null,controlSequence:0,pendingControl:null,baseline:new Set(document.querySelectorAll('*')),imageWasLoading:new WeakSet(),deepSeekLocalIds:[],deepSeekCandidates:{},previousLocalIds};
               const rememberImages=()=>{
@@ -42,6 +83,7 @@ internal object ArenaAttachmentScript {
                 state.selectionConfirmed = state.chosen;
                 if (!state.chosen) state.error = '网页收到的附件与所选附件不一致';
               };
+              // Qwen and Yuanbao create their file inputs under body on demand; change still bubbles here.
               document.addEventListener('change', state.listener, true);
               window.__arenaAttachment = state;
               return true;
@@ -115,7 +157,15 @@ internal object ArenaAttachmentScript {
           $helpers
           if (!state || state.id !== ${ArenaJs.quote(requestId)}) return JSON.stringify({error:'附件请求已取消'});
           const candidates = [];
-          let doubaoMenuTrigger=null,doubaoMenuTarget=null,kimiFileLabel=null,kimiFileInput=null,kimiFileTrigger=null,deepSeekInput=null,deepSeekTarget=null;
+          let menuItemEl=null,menuTriggerEl=null,menuTargetEl=null,kimiFileLabel=null,kimiFileInput=null,kimiFileTrigger=null,deepSeekInput=null,deepSeekTarget=null;
+          const openMenus=trigger=>{
+            ${if (service == ArenaService.YUANBAO) {
+                "const holder=trigger.closest('[data-new-input-control=add-tools]')||trigger.parentElement;return Array.from(holder.querySelectorAll('[role=menu]')).filter(visible);"
+            } else {
+                "const controls=(trigger.getAttribute('aria-controls')||'').split(/\\s+/);return Array.from(document.querySelectorAll('[role=menu]')).filter(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\\s+/).includes(trigger.id)));"
+            }}
+          };
+          const menuKey=trigger=>trigger.id||trigger.getAttribute('data-new-input-control')||'menu';
           ${when(service) {
               ArenaService.DEEPSEEK -> """
                 if(state.deepSeekControlAttempt?.count>=3&&Date.now()-state.deepSeekControlAttempt.at>=2000)return JSON.stringify({error:'DeepSeek 本地附件入口连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
@@ -138,12 +188,12 @@ internal object ArenaAttachmentScript {
                     const trigger=triggers[0];
                     const inner=Array.from(trigger.querySelectorAll('button[data-dbx-name=button][aria-haspopup=menu]'));
                     if(inner.length===1){
-                      doubaoMenuTrigger=trigger;doubaoMenuTarget=inner[0];
+                      menuTriggerEl=trigger;menuTargetEl=inner[0];
                       const menus=Array.from(document.querySelectorAll('[role=menu][data-slot=dropdown-menu-content]')).filter(e=>visible(e)&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id));
                       if(menus.length===1){
                         const local=Array.from(menus[0].querySelectorAll('[role=menuitem][data-slot=dropdown-menu-item]')).filter(e=>e.closest('[role=menu]')===menus[0]&&(e.textContent||'').replace(/\s+/g,'')==='上传文件或图片');
                         if(local.length===1)candidates.push(local[0]);
-                      }else if(menus.length===0)candidates.push(doubaoMenuTarget);
+                      }else if(menus.length===0)candidates.push(menuTargetEl);
                     }
                   }
                 }else if(surfaces.length===0){
@@ -174,10 +224,52 @@ internal object ArenaAttachmentScript {
                   }else if(trigger.getAttribute('aria-expanded')==='false'&&menus.length===0&&(!fileAttempt||Date.now()-fileAttempt.at>=2000))candidates.push(trigger);
                 }
               """.trimIndent()
+              ArenaService.QWEN -> """
+                if(state.error)return JSON.stringify({error:state.error});
+                if(state.chosen)return JSON.stringify({waiting:true});
+                const shells=Array.from(document.querySelectorAll('[data-chat-input-shell]')).filter(e=>visible(e)&&e.querySelector('[contenteditable=true],textarea'));
+                if(shells.length>1)return JSON.stringify({error:'无法确认千问唯一输入区，未发送问题'});
+                const scope=shells[0];if(!scope)return JSON.stringify({waiting:true});
+                const triggers=Array.from(scope.querySelectorAll('button[aria-haspopup=menu][aria-label="添加附件"]')).filter(visible);
+                if(triggers.length>1)return JSON.stringify({error:'无法确认千问唯一附件菜单，未发送问题'});
+                const trigger=triggers[0];if(!trigger||!trigger.id)return JSON.stringify({waiting:true});
+                menuTriggerEl=trigger;menuTargetEl=trigger;
+                // Qwen keeps images and documents behind separate items with different accept lists.
+                const label=state.expected.every(f=>f.mime.startsWith('image/'))?'上传图片':'上传文档';
+                const menus=openMenus(trigger);
+                if(menus.length===1){
+                  const items=Array.from(menus[0].querySelectorAll('[role=menuitem]')).filter(e=>visible(e)&&e.closest('[role=menu]')===menus[0]&&(e.textContent||'').replace(/\s+/g,'')===label);
+                  if(items.length>1)return JSON.stringify({error:'千问上传菜单出现多个“'+label+'”，未发送问题'});
+                  if(items.length===1){menuItemEl=items[0];candidates.push(items[0]);}
+                }else if(menus.length===0)candidates.push(trigger);
+              """.trimIndent()
+              ArenaService.YUANBAO -> """
+                if(state.error)return JSON.stringify({error:state.error});
+                if(state.chosen)return JSON.stringify({waiting:true});
+                const cards=Array.from(document.querySelectorAll('[data-new-input-card]')).filter(e=>visible(e)&&e.querySelector('[contenteditable=true]'));
+                if(cards.length>1)return JSON.stringify({error:'无法确认元宝唯一输入区，未发送问题'});
+                const scope=cards[0];if(!scope)return JSON.stringify({waiting:true});
+                const triggers=Array.from(scope.querySelectorAll('button[data-new-input-control=add-tools-trigger]')).filter(visible);
+                if(triggers.length>1)return JSON.stringify({error:'无法确认元宝唯一附件菜单，未发送问题'});
+                const trigger=triggers[0];if(!trigger)return JSON.stringify({waiting:true});
+                menuTriggerEl=trigger;menuTargetEl=trigger;
+                // Menu labels follow the page language; React keys do not.
+                const wantImage=state.expected.every(f=>f.mime.startsWith('image/'));
+                const itemKey=wantImage?'upload_pic':'local_file',itemTexts=wantImage?['uploadimage','上传图片']:['localfiles','本地文件','上传文件'];
+                const menus=openMenus(trigger);
+                if(menus.length===1){
+                  const all=Array.from(menus[0].querySelectorAll('[role=menuitem]')).filter(visible);
+                  let items=all.filter(e=>(currentReactPath(e)||[]).slice(0,6).some(f=>f.key===itemKey));
+                  if(!items.length)items=all.filter(e=>itemTexts.includes((e.textContent||'').replace(/\s+/g,'').toLowerCase()));
+                  if(items.length>1)return JSON.stringify({error:'元宝上传菜单项不唯一，未发送问题'});
+                  if(items.length===1){menuItemEl=items[0];candidates.push(items[0]);}
+                }else if(menus.length===0)candidates.push(trigger);
+              """.trimIndent()
               else -> "return JSON.stringify({error:'该成员暂不支持附件'});const scope=document;"
           }}
           scope.querySelectorAll('input[type=file]').forEach(input => {
             ${if(service == ArenaService.KIMI) "return; // Kimi local input is only eligible through the unique bound open menu above." else ""}
+            ${if(service == ArenaService.QWEN || service == ArenaService.YUANBAO) "return; // Their inputs are created by the chosen menu item." else ""}
             ${if(service == ArenaService.DOUBAO) "if(!input.matches('[data-testid=upload-file-input]')&&!input.closest('[data-testid=upload_file_button]'))return;" else ""}
             if (visible(input)) candidates.push(input);
             if(input.id) document.querySelectorAll('label').forEach(label => { if(label.htmlFor===input.id${if(service == ArenaService.DEEPSEEK) "&&scope.contains(label)" else ""}) candidates.push(label); });
@@ -191,12 +283,11 @@ internal object ArenaAttachmentScript {
             }
           });
           const kimiTrigger=e=>${if (service == ArenaService.KIMI) "e.matches('.toolkit-trigger-btn')&&e.id&&e.getAttribute('aria-haspopup')==='menu'" else "false"};
-          const menuTrigger=e=>kimiTrigger(e)?e:(e===doubaoMenuTarget?doubaoMenuTrigger:null);
+          const menuTrigger=e=>kimiTrigger(e)?e:(e===menuTargetEl?menuTriggerEl:null);
           const closedMenu=e=>{
             const trigger=menuTrigger(e);
             if(!trigger||state.chosen||trigger.getAttribute('aria-expanded')!=='false')return false;
-            const controls=(trigger.getAttribute('aria-controls')||'').split(/\s+/);
-            return !Array.from(document.querySelectorAll('[role=menu]')).some(menu=>visible(menu)&&(controls.includes(menu.id)||(menu.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id)));
+            return openMenus(trigger).length===0;
           };
           const eligible=candidates.filter(e=>visible(e)&&getComputedStyle(e).pointerEvents!=='none'&&!e.disabled&&e.getAttribute('aria-disabled')!=='true'&&!['','true'].includes(e.getAttribute('data-disabled'))&&!e.classList.contains('disabled'));
           ${if (service == ArenaService.DEEPSEEK) """
@@ -205,15 +296,19 @@ internal object ArenaAttachmentScript {
             deepSeekTarget=directTargets[0]||null;
           """.trimIndent() else ""}
           const target=eligible.find(e=>{
+            // 2026-09-15 real run: one native tap on Qwen's open menu item was not activated. Items keep a
+            // request-wide budget like triggers: at most three taps, two seconds apart, while it stays unchosen.
+            if(e===menuItemEl){const attempt=state.menuItemAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
             if(e===deepSeekTarget){const attempt=state.deepSeekControlAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
             if(e===kimiFileLabel){const attempt=state.kimiFileAttempt;return !attempt||(attempt.count<3&&Date.now()-attempt.at>=2000);}
-            const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(trigger.id);
+            const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(menuKey(trigger));
             if(!state.clicked.has(e)&&!attempt)return true;
             return attempt&&attempt.count<3&&Date.now()-attempt.at>=2000&&closedMenu(e);
           });
           if(!target){
+            if(menuItemEl&&eligible.includes(menuItemEl)&&state.menuItemAttempt?.count>=3&&Date.now()-state.menuItemAttempt.at>=2000)return JSON.stringify({error:${ArenaJs.quote(service.displayName + " 上传菜单项连续 3 次未响应，未发送问题；请打开原网页检查后重试")}});
             if(kimiFileLabel&&eligible.includes(kimiFileLabel)&&state.fileControlAttempt?.count>=3&&Date.now()-state.fileControlAttempt.at>=2000)return JSON.stringify({error:'Kimi 本地附件入口连续 3 次未响应，未发送问题；请打开原网页检查后重试'});
-            if(eligible.some(e=>{const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(trigger.id);return attempt&&attempt.count>=3&&Date.now()-attempt.at>=2000&&closedMenu(e);}))return JSON.stringify({error:${ArenaJs.quote(service.displayName + " 附件菜单连续 3 次未响应，未发送问题；请打开原网页检查后重试")}});
+            if(eligible.some(e=>{const trigger=menuTrigger(e),attempt=kimiTrigger(e)?state.kimiMenuAttempt:trigger&&state.menuAttempts.get(menuKey(trigger));return attempt&&attempt.count>=3&&Date.now()-attempt.at>=2000&&closedMenu(e);}))return JSON.stringify({error:${ArenaJs.quote(service.displayName + " 附件菜单连续 3 次未响应，未发送问题；请打开原网页检查后重试")}});
             return JSON.stringify({waiting:true});
           }
           target.scrollIntoView({block:'nearest',inline:'nearest'});
@@ -223,7 +318,7 @@ internal object ArenaAttachmentScript {
           if(!hit || !(target===hit || target.contains(hit) || hit.contains(target))) return JSON.stringify({waiting:true});
           const clickedTrigger=menuTrigger(target);
           if(state.pendingControl?.clickTarget)state.pendingControl.clickTarget.removeEventListener('click',state.pendingControl.clickListener,true);
-          const hold={id:++state.controlSequence,target,wasClicked:state.clicked.has(target),menuId:clickedTrigger?.id,menuAttempt:clickedTrigger?state.menuAttempts.get(clickedTrigger.id):null,isFileTarget:target===kimiFileLabel,fileAttempt:state.fileControlAttempt,clickComplete:false,clickTarget:kimiFileInput||target};
+          const hold={id:++state.controlSequence,target,wasClicked:state.clicked.has(target),menuId:clickedTrigger?menuKey(clickedTrigger):null,menuAttempt:clickedTrigger?state.menuAttempts.get(menuKey(clickedTrigger)):null,isFileTarget:target===kimiFileLabel,fileAttempt:state.fileControlAttempt,isMenuItem:target===menuItemEl,itemAttempt:state.menuItemAttempt,clickComplete:false,clickTarget:kimiFileInput||target};
           hold.clickListener=event=>{
             if(window.__arenaAttachment!==state||state.pendingControl!==hold)return;
             if(kimiFileInput&&event.target!==kimiFileInput)return;
@@ -247,9 +342,10 @@ internal object ArenaAttachmentScript {
             const attempt={count:(state.kimiFileAttempt?.count||0)+1,at:Date.now()};state.kimiFileAttempt=attempt;
             state.fileControlAttempt={label:target,input:kimiFileInput,triggerId:kimiFileTrigger.id,...attempt};
           }
+          if(target===menuItemEl)state.menuItemAttempt={count:(state.menuItemAttempt?.count||0)+1,at:Date.now()};
           if(kimiTrigger(target))state.kimiMenuAttempt={count:(state.kimiMenuAttempt?.count||0)+1,at:Date.now()};
-          if(clickedTrigger){const previous=state.menuAttempts.get(clickedTrigger.id);state.menuAttempts.set(clickedTrigger.id,{count:(previous?.count||0)+1,at:Date.now()});}
-          return JSON.stringify({x,y,width:innerWidth,height:innerHeight,controlId:hold.id,retryableTap:!!clickedTrigger||target===kimiFileLabel||target===deepSeekTarget});
+          if(clickedTrigger){const key=menuKey(clickedTrigger),previous=state.menuAttempts.get(key);state.menuAttempts.set(key,{count:(previous?.count||0)+1,at:Date.now()});}
+          return JSON.stringify({x,y,width:innerWidth,height:innerHeight,controlId:hold.id,retryableTap:!!clickedTrigger||target===kimiFileLabel||target===deepSeekTarget||target===menuItemEl});
         })();
     """.trimIndent()
 
@@ -271,6 +367,7 @@ internal object ArenaAttachmentScript {
           if(!state||state.id!==${ArenaJs.quote(requestId)}||!hold||hold.id!==$controlId||state.chosen)return false;
           if(!hold.wasClicked)state.clicked.delete(hold.target);
           if(hold.menuId){if(hold.menuAttempt)state.menuAttempts.set(hold.menuId,hold.menuAttempt);else state.menuAttempts.delete(hold.menuId);}
+          if(hold.isMenuItem)state.menuItemAttempt=hold.itemAttempt;
           if(hold.isFileTarget){
             // A previous native chooser may arrive late. Keep this exact input bound until request cleanup.
             state.fileControlAttempt=hold.fileAttempt;
@@ -403,6 +500,62 @@ internal object ArenaAttachmentScript {
               } else complete++;
             }
             return JSON.stringify({ready:complete===state.expected.length,detail:'Kimi 已确认 '+complete+'/'+state.expected.length+' 个附件解析完成'});
+          }
+        """.trimIndent()
+        ArenaService.QWEN -> """
+          const shells=Array.from(document.querySelectorAll('[data-chat-input-shell]')).filter(visible);
+          const shell=shells.length===1?shells[0]:null;
+          const top=shell&&shell.querySelector('[data-chat-input-top-content]');
+          const cards=top?Array.from(top.querySelectorAll('[data-icon-type=qwpcicon-close2]')).map(icon=>icon.parentElement).filter(Boolean):[];
+          if(cards.length) {
+            if(cards.length>state.expected.length)return JSON.stringify({error:'千问出现额外附件，未发送问题；请打开原网页检查未发送的附件'});
+            // Image cards receive {record}; document cards receive the record fields directly (2026-09-15).
+            const entries=cards.map(card=>{const props=reactProps(card,'record')||reactProps(card,'recordId');const record=props&&(props.record&&typeof props.record==='object'?props.record:props);return {card,props,record};});
+            if(entries.some(entry=>!entry.record||!entry.record.recordId))return JSON.stringify({ready:false,detail:'无法确认千问附件处理状态'});
+            let complete=0;const used=new Set();
+            for(const expected of state.expected) {
+              const named=entries.filter(entry=>!used.has(entry)&&entry.record.fileName===expected.name);
+              if(named.length>1)return JSON.stringify({error:expected.name+'：千问附件身份重复，未发送问题'});
+              const entry=named[0];
+              if(!entry)continue;
+              used.add(entry);
+              const record=entry.record,isImage=expected.mime.startsWith('image/');
+              if(Number(record.fileSize)!==expected.size&&!state.selectionConfirmed)continue;
+              if(record.recordStatus===-1||record.recordStatus===2||entry.props.exceeded===true||entry.props.unsupportedMixed===true)return JSON.stringify({error:expected.name+'：千问附件上传或解析失败，未发送问题'});
+              if((record.recordType==='image')!==isImage)return JSON.stringify({error:expected.name+'：千问附件类型与所选文件不一致，未发送问题'});
+              // recordStatus: 3 uploading, 0 parsing, 1 parse success, -1 upload failed, 2 parse failed.
+              if(record.recordStatus!==1||Number(record.uploadProgress)!==100||!record.fileUrl||entry.card.querySelector('[data-icon-type=qwpcicon-loading]'))continue;
+              complete++;
+            }
+            if(used.size<entries.length&&entries.every(entry=>entry.record.recordStatus===1))return JSON.stringify({error:'千问附件名称与所选文件不一致，未发送问题'});
+            return JSON.stringify({ready:complete===state.expected.length&&cards.length===state.expected.length,detail:'千问已确认 '+complete+'/'+state.expected.length+' 个附件处理完成'});
+          }
+        """.trimIndent()
+        ArenaService.YUANBAO -> """
+          const inputCards=Array.from(document.querySelectorAll('[data-new-input-card]')).filter(visible);
+          const area=inputCards.length===1?inputCards[0].querySelector('[data-input-resource-area]'):null;
+          const items=area?Array.from(area.querySelectorAll('[aria-label="删除文件"]')).map(control=>control.parentElement).filter(Boolean):[];
+          if(items.length) {
+            if(items.length>state.expected.length)return JSON.stringify({error:'元宝出现额外附件，未发送问题；请打开原网页检查未发送的附件'});
+            const entries=items.map(item=>({item,file:reactProps(item,'file')?.file}));
+            if(entries.some(entry=>!entry.file||typeof entry.file!=='object'))return JSON.stringify({ready:false,detail:'无法确认元宝附件处理状态'});
+            let complete=0;const used=new Set();
+            for(const expected of state.expected) {
+              const named=entries.filter(entry=>!used.has(entry)&&entry.file.name===expected.name);
+              if(named.length>1)return JSON.stringify({error:expected.name+'：元宝附件身份重复，未发送问题'});
+              const entry=named[0];
+              if(!entry)continue;
+              used.add(entry);
+              const file=entry.file,status=String(file.status||'').toLowerCase(),isImage=expected.mime.startsWith('image/');
+              if(Number(file.size)!==expected.size&&!state.selectionConfirmed)continue;
+              if(['error','fail','failed','uploadfail','uploaderror','reject','rejected','timeout','abort'].includes(status))return JSON.stringify({error:expected.name+'：元宝附件上传失败，未发送问题'});
+              if((file.type==='image')!==isImage)return JSON.stringify({error:expected.name+'：元宝附件类型与所选文件不一致，未发送问题'});
+              // Observed: loading/progress 0 -> finish/progress 100 with a remote fileId. The send button is enabled earlier.
+              if(status!=='finish'||Number(file.progress)!==100||!file.fileId)continue;
+              complete++;
+            }
+            if(used.size<entries.length&&entries.every(entry=>String(entry.file.status).toLowerCase()==='finish'))return JSON.stringify({error:'元宝附件名称与所选文件不一致，未发送问题'});
+            return JSON.stringify({ready:complete===state.expected.length&&items.length===state.expected.length,detail:'元宝已确认 '+complete+'/'+state.expected.length+' 个附件处理完成'});
           }
         """.trimIndent()
         else -> ""
