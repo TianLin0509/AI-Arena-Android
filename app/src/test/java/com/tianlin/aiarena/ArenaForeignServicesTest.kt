@@ -22,6 +22,29 @@ class ArenaForeignServicesTest {
     }
 
     @Test
+    fun overseasMembersAreASeparateCollapsedGroup() {
+        assertEquals(foreign, ArenaMemberGroups.overseas)
+        assertEquals(
+            listOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO, ArenaService.KIMI, ArenaService.QWEN, ArenaService.YUANBAO, ArenaService.ZHIPU),
+            ArenaMemberGroups.domestic,
+        )
+        assertEquals(ArenaService.entries.size, ArenaMemberGroups.domestic.size + ArenaMemberGroups.overseas.size)
+    }
+
+    @Test
+    fun overseasGroupStaysCollapsedUntilOneOfItsMembersIsSelected() {
+        assertFalse(ArenaMemberGroups.overseasExpandedByDefault(ArenaService.defaultMembers))
+        assertFalse(ArenaMemberGroups.overseasExpandedByDefault(emptyList()))
+        assertTrue(ArenaMemberGroups.overseasExpandedByDefault(listOf(ArenaService.DEEPSEEK, ArenaService.GEMINI)))
+    }
+
+    @Test
+    fun overseasSummaryReportsSelectedCountAndNetworkRequirement() {
+        assertEquals("需境外网络", ArenaMemberGroups.overseasSummary(ArenaService.defaultMembers))
+        assertEquals("已选 2 家 · 需境外网络", ArenaMemberGroups.overseasSummary(listOf(ArenaService.CLAUDE, ArenaService.GEMINI, ArenaService.KIMI)))
+    }
+
+    @Test
     fun onlyGeminiAllowsQuestionsWithoutLogin() {
         assertEquals(listOf(ArenaService.GEMINI), ArenaService.entries.filter { it.guestUsable })
     }

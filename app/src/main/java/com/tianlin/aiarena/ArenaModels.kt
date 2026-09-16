@@ -108,6 +108,25 @@ enum class ArenaService(
     }
 }
 
+/**
+ * 成员选择页的分组。国外三家是拓展成员：**默认折叠、不出现在列表里**，
+ * 免得家人在只能用国内 AI 的网络下被一串打不开的名字干扰。
+ */
+object ArenaMemberGroups {
+    val domestic: List<ArenaService> = ArenaService.entries.filter { !it.overseas }
+    val overseas: List<ArenaService> = ArenaService.entries.filter { it.overseas }
+
+    /** 已经选了国外成员时必须展开，否则用户看不到它、也没法取消选择。 */
+    fun overseasExpandedByDefault(selected: Collection<ArenaService>): Boolean =
+        selected.any { it.overseas }
+
+    /** 分组标题右侧的小字：告诉用户这一组要什么条件、现在选了几家。 */
+    fun overseasSummary(selected: Collection<ArenaService>): String {
+        val count = selected.count { it.overseas }
+        return if (count > 0) "已选 $count 家 · 需境外网络" else "需境外网络"
+    }
+}
+
 enum class ConnectionState {
     NOT_LOADED,
     LOADING,

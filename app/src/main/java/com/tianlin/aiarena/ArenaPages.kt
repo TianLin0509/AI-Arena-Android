@@ -25,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -544,7 +545,7 @@ internal fun RoundtableMembersPage(
         ) {
             item(key = "members") {
                 ArenaGroup {
-                    ArenaService.entries.forEachIndexed { index, service ->
+                    ArenaMemberGroups.domestic.forEachIndexed { index, service ->
                         if (index > 0) ArenaRowDivider(startIndent = 62.dp)
                         MemberToggleRow(
                             service = service,
@@ -552,6 +553,37 @@ internal fun RoundtableMembersPage(
                             status = statuses[service] ?: ServiceStatus(),
                             onToggle = { onToggle(service) },
                         )
+                    }
+                }
+            }
+            // 国外三家是拓展成员：默认收起，只留一行标题。用不到境外网络的家人不会看到一串打不开的名字。
+            item(key = "overseas") {
+                var overseasExpanded by rememberSaveable {
+                    mutableStateOf(ArenaMemberGroups.overseasExpandedByDefault(selectedServices))
+                }
+                ArenaGroup {
+                    ArenaRow(
+                        title = "国外 AI（拓展）",
+                        detail = if (overseasExpanded) {
+                            "Claude、ChatGPT、Gemini；手机要能访问境外网站"
+                        } else {
+                            "默认不显示，需要时点开"
+                        },
+                        trailingText = ArenaMemberGroups.overseasSummary(selectedServices),
+                        chevron = true,
+                        onClick = { overseasExpanded = !overseasExpanded },
+                        contentDescriptionText = "国外 AI 分组，${if (overseasExpanded) "已展开，点击收起" else "已收起，点击展开"}",
+                    )
+                    if (overseasExpanded) {
+                        ArenaMemberGroups.overseas.forEach { service ->
+                            ArenaRowDivider(startIndent = 62.dp)
+                            MemberToggleRow(
+                                service = service,
+                                selected = service in selectedServices,
+                                status = statuses[service] ?: ServiceStatus(),
+                                onToggle = { onToggle(service) },
+                            )
+                        }
                     }
                 }
             }
