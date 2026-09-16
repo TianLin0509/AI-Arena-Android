@@ -1238,8 +1238,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             } else {
                 explicitLoginProbeCounts.remove(service)
             }
+            val guest = result == "guest"
             val decision = LoginTrustPolicy.afterProbe(
-                probeSignedIn = result == "signed_in",
+                probeSignedIn = result == "signed_in" || guest,
                 pageVisibleToUser = uiSelectedService == service,
                 previouslyConfirmed = service in confirmedSignedIn,
                 explicitLoginVisible = explicitLoginVisible,
@@ -1250,13 +1251,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             statuses[service] = ServiceStatus(
                 state = state,
                 detail = when (state) {
-                    ConnectionState.SIGNED_IN -> "网页可用"
+                    ConnectionState.SIGNED_IN -> if (guest) "未登录也可提问" else "网页可用"
                     ConnectionState.NEEDS_LOGIN -> "需要在网页中登录"
                     else -> "后台检查中，打开网页可确认"
                 },
                 url = webView.url.orEmpty(),
                 // 模式小字由下面的探针单独更新；这里先沿用上一次的，免得每次登录探测都闪成"未知"
                 modeReading = statuses[service]?.modeReading ?: AiModeReading(),
+                guest = guest && state == ConnectionState.SIGNED_IN,
             )
             if (state == ConnectionState.SIGNED_IN) evaluateMode(service, webView, onComplete) else onComplete()
         }
@@ -1322,6 +1324,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "[role='textbox']",
                 "textarea",
             )
+            ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI -> promptInputSelectors(service)
         }
         val selectorJson = selectors.joinToString(",") { ArenaJs.quote(it) }
         return """
@@ -1336,7 +1339,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   return rect.width > 40 && rect.height > 12 && style.display !== 'none' && style.visibility !== 'hidden';
                 } catch (_) { return false; }
               });
-              const loginPattern = /^(登录(?:\s*[\/\|·]\s*注册)?|微信登录|抖音登录|手机号登录|扫码登录|sign in|log in|log in to sync chat history|phone number login)$/i;
+              const loginPattern = /^(登录(?:\s*[\/\|·]\s*注册)?|微信登录|抖音登录|手机号登录|扫码登录|sign in|log in|log in to sync chat history|phone number login|continue with email|continue with google)$/i;
               const hasVisibleLogin = Array.from(document.querySelectorAll('button,a,[role=button],[class~=button],[class*=login]')).some(function(el) {
                 try {
                   const rect = el.getBoundingClientRect();
@@ -1345,6 +1348,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   return visible && loginPattern.test((el.innerText || el.textContent || '').trim());
                 } catch (_) { return false; }
               });
+              // 境外站点未登录时会跳到 /login、/auth 或停在 Cloudflare 人机验证页（2026-09-15 实测 Claude 先闪出 /new 输入框再跳走）。
+              // 这些页面不能沿用"之前确认过已登录"的结论，按明确的登录页处理。
+              const verificationWall = /^just a moment/i.test(document.title || '') || !!document.querySelector('input[name=cf-turnstile-response], #challenge-form');
+              if (${service.overseas} && (verificationWall || /^\/(login|auth|log-in)(\/|$)/i.test(location.pathname))) return 'explicit_login';
+              if (${service.guestUsable} && hasInput) return hasVisibleLogin ? 'guest' : 'signed_in';
               if (hasVisibleLogin) return 'explicit_login';
               if (hasInput) return 'signed_in';
               return 'unknown';
@@ -1589,6 +1597,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ArenaService.QWEN -> listOf("[role='textbox']", "[contenteditable='true']", "[contenteditable]", "textarea")
         ArenaService.YUANBAO -> listOf("[contenteditable='true']", "textarea", "#chat-input")
         ArenaService.ZHIPU -> listOf("[contenteditable='true']", "[role='textbox']", "textarea")
+        ArenaService.CLAUDE -> listOf("div.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea")
+        // 2026-09 的 ChatGPT 手机网页：输入框是无 id 的普通 textarea（旧版为 #prompt-textarea 富文本）
+        ArenaService.CHATGPT -> listOf("#prompt-textarea", "form textarea", "textarea")
+        ArenaService.GEMINI -> listOf("rich-textarea .ql-editor[contenteditable='true']", ".ql-editor[contenteditable='true']", "[contenteditable='true']", "textarea")
     }
 
     private fun promptInputSelector(service: ArenaService): String =
@@ -1748,6 +1760,24 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[type='submit']",
                 "button[class*='send']",
             )
+            ArenaService.CLAUDE -> listOf(
+                "button[aria-label='Send message']",
+                "button[aria-label*='Send']",
+                "button[aria-label*='发送']",
+            )
+            ArenaService.CHATGPT -> listOf(
+                "button[aria-label='Send message']",
+                "#composer-submit-button",
+                "button[data-testid='send-button']",
+                "button[aria-label*='Send']",
+                "button[aria-label*='发送']",
+            )
+            ArenaService.GEMINI -> listOf(
+                "button.send-button",
+                "button[aria-label='Send message']",
+                "button[aria-label*='Send']",
+                "button[aria-label*='发送']",
+            )
         }
 
         internal fun sendButtonSelector(service: ArenaService): String =
@@ -1864,7 +1894,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L
         private const val SEND_VERIFY_CALLBACK_TIMEOUT_MS = 10_000L
         private const val KIMI_UPGRADE_DETAIL = "Kimi 网页提示当前模型或功能需要会员，问题没有发出；请打开原网页换用可用模型后重试"
-        private const val KIMI_UPGRADE_MODAL_SCRIPT = "(function(){return Array.from(document.querySelectorAll('.modal-mask')).some(function(mask){var r=mask.getBoundingClientRect();return r.width>2&&r.height>2&&/Moderato|Allegretto|Vivace|Upgrade your membership|higher-tier members|升级会员|开通会员|会员专享|会员可用/i.test(String(mask.innerText||''));});})()"
+        private const val KIMI_UPGRADE_MODAL_SCRIPT = "(function(){return Array.from(document.querySelectorAll('.modal-mask')).some(function(mask){var r=mask.getBoundingClientRect();return r.width>2&&r.height>2&&/Upgrade your membership|higher-tier members|members only|升级会员|开通会员|会员专享|仅.{0,8}会员/i.test(String(mask.innerText||''));});})()"
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L

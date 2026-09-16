@@ -63,6 +63,9 @@ internal object ArenaWebCursorScript {
         ArenaService.QWEN -> "($userCountQwen) > Number(state.userBaseline || 0)"
         ArenaService.YUANBAO -> "($userCountYuanbao) > Number(state.userBaseline || 0)"
         ArenaService.ZHIPU -> "($userCountZhipu) > Number(state.userBaseline || 0)"
+        ArenaService.CLAUDE -> "($userCountClaude) > Number(state.userBaseline || 0)"
+        ArenaService.CHATGPT -> "($userCountChatGpt) > Number(state.userBaseline || 0)"
+        ArenaService.GEMINI -> "($userCountGemini) > Number(state.userBaseline || 0)"
     }
 
     fun responseSelectors(service: ArenaService): List<String> = when (service) {
@@ -100,6 +103,19 @@ internal object ArenaWebCursorScript {
             "[class*='answer'] [class*='markdown']",
             "[class*='markdown-body']",
         )
+        ArenaService.CLAUDE -> listOf(
+            ".font-claude-response",
+            ".font-claude-message",
+            "[data-is-streaming] .standard-markdown",
+        )
+        ArenaService.CHATGPT -> listOf(
+            "[data-message-author-role='assistant'] .markdown",
+            "[data-message-author-role='assistant']",
+        )
+        ArenaService.GEMINI -> listOf(
+            "model-response message-content .markdown",
+            "model-response message-content",
+        )
     }
 
     private fun userCountExpression(service: ArenaService): String = when (service) {
@@ -109,6 +125,9 @@ internal object ArenaWebCursorScript {
         ArenaService.QWEN -> userCountQwen
         ArenaService.YUANBAO -> userCountYuanbao
         ArenaService.ZHIPU -> userCountZhipu
+        ArenaService.CLAUDE -> userCountClaude
+        ArenaService.CHATGPT -> userCountChatGpt
+        ArenaService.GEMINI -> userCountGemini
     }
 
     private fun latestUserExpression(service: ArenaService): String = when (service) {
@@ -118,6 +137,9 @@ internal object ArenaWebCursorScript {
         ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question, [class*=user] [class*=content], [class*=human] [class*=text]')).pop() || null"
         ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human')).pop() || null"
         ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).pop() || null"
+        ArenaService.CLAUDE -> "Array.from(document.querySelectorAll('[data-testid=user-message]')).pop() || null"
+        ArenaService.CHATGPT -> "Array.from(document.querySelectorAll('[data-message-author-role=user]')).pop() || null"
+        ArenaService.GEMINI -> "Array.from(document.querySelectorAll('user-query')).pop() || null"
     }
 
     private const val userCountDeepSeek = "(function() { const root = document.querySelector('.ds-virtual-list-visible-items'); if (!root) return 0; return Array.from(root.children).filter(function(row) { return !row.querySelector('.ds-markdown') && (row.innerText || row.textContent || '').trim().length > 0; }).length; })()"
@@ -128,4 +150,7 @@ internal object ArenaWebCursorScript {
     // so its appearance counted as a sent message and a not-sent question waited five minutes.
     private const val userCountYuanbao = "document.querySelectorAll('.agent-chat__list__item--human').length"
     private const val userCountZhipu = "document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]').length"
+    private const val userCountClaude = "document.querySelectorAll('[data-testid=user-message]').length"
+    private const val userCountChatGpt = "document.querySelectorAll('[data-message-author-role=user]').length"
+    private const val userCountGemini = "document.querySelectorAll('user-query').length"
 }

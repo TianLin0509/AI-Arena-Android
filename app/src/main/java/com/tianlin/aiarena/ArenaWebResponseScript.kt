@@ -187,12 +187,14 @@ internal object ArenaWebResponseScript {
                 });
                 // 2026-09-15: with a members-only model selected, Kimi shows an upgrade modal over the send
                 // control and the question never reaches the conversation. Report it instead of waiting minutes.
+                // 只认明确写着「需要升级 / 会员」的弹窗：模型选择浮层里也会列出会员模型名，不能仅凭模型名判定。
                 const upgradeModal = Array.from(document.querySelectorAll('.modal-mask')).find(function(mask) {
                   const rect = mask.getBoundingClientRect();
                   const words = String(mask.innerText || '').replace(/\s+/g, ' ');
-                  return rect.width > 2 && rect.height > 2 && /Moderato|Allegretto|Vivace|Upgrade your membership|higher-tier members|升级会员|开通会员|会员专享|会员可用/i.test(words);
+                  return rect.width > 2 && rect.height > 2 && /Upgrade your membership|higher-tier members|members only|升级会员|开通会员|会员专享|仅.{0,8}会员/i.test(words);
                 });
-                if (upgradeModal && !tagged) {
+                // 只有本轮确实没有新的用户消息时才算「没发出去」；重新提取已发送的问题不受影响。
+                if (upgradeModal && !tagged && users.length <= Number(state.userBaseline || 0)) {
                   throw new Error('Kimi 网页提示当前模型或功能需要会员，问题没有发出；请打开原网页换用可用模型后重试');
                 }
                 const user = tagged || users.slice(Number(state.userBaseline || 0)).pop() || null;
@@ -312,6 +314,47 @@ internal object ArenaWebResponseScript {
                 streaming = stopVisible || (!!lastAnswer && !interactVisible);
                 // .interact 的时序没在真机上采样过，先按弱信号多等两轮
                 weakDoneSignal = true;
+            """.trimIndent()
+            ArenaService.CLAUDE -> """
+                // Claude 网页：回答正文 .font-claude-response；生成期间外层 data-is-streaming="true"
+                const picked = pickSelector(['.font-claude-response', '.font-claude-message', '[data-is-streaming] .standard-markdown']);
+                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
+                text = collectText(scoped, [], picked.selector, scoped.anchored);
+                const clBlocks = Array.from(document.querySelectorAll('[data-is-streaming]'));
+                const clLast = clBlocks.length ? clBlocks[clBlocks.length - 1] : null;
+                thinkingUsed = thinkingIn(clLast, '[class*=think], [class*=thought], [class*=reason]');
+                const stopVisible = Array.from(document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
+                streaming = stopVisible || (!!clLast && clLast.getAttribute('data-is-streaming') === 'true');
+            """.trimIndent()
+            ArenaService.CHATGPT -> """
+                // ChatGPT 网页：消息带 data-message-author-role，正文在 .markdown；结束后出现复制按钮
+                const picked = pickSelector(['[data-message-author-role=assistant] .markdown', '[data-message-author-role=assistant]']);
+                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
+                text = collectText(scoped, [], picked.selector, scoped.anchored);
+                const gptTurns = Array.from(document.querySelectorAll('[data-message-author-role=assistant]'));
+                const gptLast = gptTurns.length ? gptTurns[gptTurns.length - 1] : null;
+                const gptRoot = gptLast ? (gptLast.closest('article, [data-testid^=conversation-turn]') || gptLast.parentElement) : null;
+                thinkingUsed = thinkingIn(gptRoot, '[class*=think], [class*=thought], [class*=reason]');
+                const stopVisible = Array.from(document.querySelectorAll('button[data-testid=stop-button], button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
+                const gptActions = !!gptRoot && isVisible(gptRoot.querySelector('[data-testid=copy-turn-action-button]'));
+                streaming = stopVisible || (!!gptLast && (!gptActions || !!gptLast.querySelector('.result-streaming')));
+            """.trimIndent()
+            ArenaService.GEMINI -> """
+                // Gemini 网页：用户 user-query，回答 model-response message-content；结束后出现 message-actions
+                const picked = pickSelector(['model-response message-content .markdown', 'model-response message-content']);
+                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
+                text = collectText(scoped, [], picked.selector, scoped.anchored);
+                const gmResponses = Array.from(document.querySelectorAll('model-response'));
+                const gmLast = gmResponses.length ? gmResponses[gmResponses.length - 1] : null;
+                thinkingUsed = thinkingIn(gmLast, 'model-thoughts, [class*=thought]');
+                const stopVisible = Array.from(document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
+                // 2026-09-15 实测：生成期间正文 .markdown 带 aria-busy="true"，结束后变 "false" 且 message-actions 展开（高 48px）
+                const gmBusy = !!gmLast && !!gmLast.querySelector('message-content .markdown[aria-busy=true]');
+                const gmActions = !!gmLast && isVisible(gmLast.querySelector('message-actions'));
+                streaming = stopVisible || gmBusy || (!!gmLast && !gmActions);
             """.trimIndent()
         }
         return """

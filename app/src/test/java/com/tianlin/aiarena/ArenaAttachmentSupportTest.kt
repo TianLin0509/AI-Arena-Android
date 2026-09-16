@@ -11,11 +11,18 @@ class ArenaAttachmentSupportTest {
     private fun image(name: String = "photo.png") = ArenaAttachment(name, name, "image/png", 10, "a".repeat(64))
     private fun document(name: String = "notes.pdf") = ArenaAttachment(name, name, "application/pdf", 10, "b".repeat(64))
 
-    @Test fun everyMemberExceptZhipuCanReceiveDraftAttachments() {
+    @Test fun onlyTheFiveAdaptedMembersCanReceiveDraftAttachments() {
+        val adapted = setOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO, ArenaService.KIMI, ArenaService.QWEN, ArenaService.YUANBAO)
         ArenaService.entries.forEach { service ->
-            assertEquals(service != ArenaService.ZHIPU, ArenaAttachmentSupport.supports(service))
+            assertEquals(service.name, service in adapted, ArenaAttachmentSupport.supports(service))
         }
         assertTrue(ArenaAttachmentSupport.unsupportedReason(ArenaService.ZHIPU).contains("智谱"))
+        // 境外成员走通用说明，不能落进「智谱」那条专属文案。
+        listOf(ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI).forEach { service ->
+            val reason = ArenaAttachmentSupport.unsupportedReason(service)
+            assertTrue(reason.contains(service.displayName))
+            assertFalse(reason.contains("智谱"))
+        }
     }
 
     @Test fun noAttachmentsNeverBlocksAnyMember() {

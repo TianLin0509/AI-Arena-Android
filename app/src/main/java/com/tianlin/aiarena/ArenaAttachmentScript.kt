@@ -14,7 +14,8 @@ internal object ArenaAttachmentScript {
         ArenaService.DOUBAO -> "[data-testid=attachment_area] [data-testid^=attachment_],.guidance-input-surface .container-tJHWhP [data-kind][role=button]"
         ArenaService.QWEN -> qwenCloseSelector
         ArenaService.YUANBAO -> yuanbaoCloseSelector
-        ArenaService.ZHIPU -> "[data-arena-no-attachment-support]"
+        // 智谱与境外成员没有草稿附件区，故意匹配不到任何节点。
+        else -> "[data-arena-no-attachment-support]"
     }
 
     /**
@@ -26,7 +27,7 @@ internal object ArenaAttachmentScript {
         ArenaService.DEEPSEEK -> "card=>{const controls=Array.from(card.querySelectorAll(':scope > [tabindex=\"0\"]')).filter(e=>e.querySelector('.ds-icon'));return controls.length===1?controls[0]:null;}"
         ArenaService.DOUBAO -> "card=>{const controls=Array.from(card.querySelectorAll(':scope > svg[aria-label=delete]'));return controls.length===1?controls[0]:null;}"
         ArenaService.KIMI -> "card=>{const controls=Array.from(card.querySelectorAll(card.matches('.image-thumbnail')?':scope > .image-delete-container':':scope > .file-card-delete'));return controls.length===1?controls[0]:null;}"
-        ArenaService.ZHIPU -> "card=>null"
+        else -> "card=>null"
     }
 
     /**
