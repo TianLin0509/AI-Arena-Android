@@ -136,6 +136,75 @@ class ArenaSimpleInstrumentedTest {
         } finally { instrumentation.runOnMainSync { controller!!.destroy() } }
     }
 
+    @Test fun historicalSummaryUsesItsActualAuthorAndDepthInsteadOfNextPreferences() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val prefs = ArenaCaptainPreferences(inst.targetContext)
+        val oldCaptain = prefs.loadCaptain(); val oldDepth = prefs.loadDepth()
+        lateinit var controller: ArenaSessionController
+        inst.runOnMainSync {
+            prefs.saveCaptain(ArenaService.DEEPSEEK); prefs.saveDepth(SummaryDepth.STANDARD)
+            controller = ArenaSessionController(FixtureGateway(), sessionRepository = FixtureRepository(
+                savedSummary = DiscussionSummary(ParticipantPhase.COMPLETE, ArenaService.KIMI, text = "历史综合正文".repeat(20), depth = SummaryDepth.DEEP)))
+        }
+        try {
+            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+                SimpleSummary(controller, ArenaService.defaultMembers, prefs, true, "", {}, {}, null, null, remember { SnackbarHostState() })
+            } } }
+            compose.onNodeWithText("由 Kimi 整理 · 深入").assertIsDisplayed()
+            compose.onNodeWithText("下次由 DeepSeek 整理 · 标准").assertIsDisplayed()
+            compose.onNodeWithContentDescription("打开 Kimi 网页").assertIsDisplayed()
+        } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
+    }
+
+    @Test fun failedPreferredCaptainExplainsWhoWillActuallyGenerate() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val prefs = ArenaCaptainPreferences(inst.targetContext)
+        val oldCaptain = prefs.loadCaptain(); val oldDepth = prefs.loadDepth()
+        var sentTo: ArenaService? = null
+        lateinit var controller: ArenaSessionController
+        inst.runOnMainSync {
+            prefs.saveCaptain(ArenaService.DEEPSEEK); prefs.saveDepth(SummaryDepth.STANDARD)
+            val gateway = object : ArenaGateway {
+                override fun sendPrompt(service: ArenaService, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
+                    sentTo = service; callback(SendOutcome(false, requestId, "test does not use website"))
+                }
+                override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) = Unit
+            }
+            controller = ArenaSessionController(gateway, sessionRepository = FixtureRepository(failedMember = ArenaService.DEEPSEEK))
+        }
+        try {
+            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+                SimpleSummary(controller, ArenaService.defaultMembers, prefs, true, "", {}, {}, null, null, remember { SnackbarHostState() })
+            } } }
+            compose.onNodeWithText("DeepSeek 本轮未完成，将由 豆包 整理。").assertIsDisplayed()
+            compose.onNodeWithText("生成综合答案").performClick()
+            compose.runOnIdle { assertEquals(ArenaService.DOUBAO, sentTo) }
+            compose.onNodeWithText("由 豆包 整理 · 标准").assertIsDisplayed()
+        } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
+    }
+
+    @Test fun summarySecurityChallengeKeepsTheActionVisibleWhileWaiting() {
+        var opened: ArenaService? = null
+        compose.setContent { ArenaTheme { Column {
+            SimpleSummaryResult(DiscussionSummary(ParticipantPhase.WAITING, ArenaService.QWEN,
+                detail = "千问安全验证处理中；完成后将自动继续提取")) { opened = it }
+        } } }
+        compose.onNodeWithText("千问安全验证处理中", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("打开 千问 网页").performClick()
+        compose.runOnIdle { assertEquals(ArenaService.QWEN, opened) }
+    }
+
+    @Test fun placeholderSummaryExplainsTheMissingBodyAndLinksToTheActualAuthor() {
+        var opened: ArenaService? = null
+        compose.setContent { ArenaTheme { Column {
+            SimpleSummaryResult(DiscussionSummary(ParticipantPhase.COMPLETE, ArenaService.DOUBAO,
+                text = "已生成文档，请查收。")) { opened = it }
+        } } }
+        compose.onNodeWithText("总结好像没有正文", substring = true).assertIsDisplayed()
+        compose.onNodeWithContentDescription("打开 豆包 网页").performClick()
+        compose.runOnIdle { assertEquals(ArenaService.DOUBAO, opened) }
+    }
+
     private fun capture(name: String) {
         compose.waitForIdle()
         val inst = InstrumentationRegistry.getInstrumentation()
@@ -150,14 +219,15 @@ class ArenaSimpleInstrumentedTest {
             callback(SendOutcome(false, requestId, "UI fixture must not send"))
         override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) = Unit
     }
-    private class FixtureRepository : ArenaSessionRepository {
+    private class FixtureRepository(savedSummary: DiscussionSummary = DiscussionSummary(), failedMember: ArenaService? = null) : ArenaSessionRepository {
         private val members = ArenaService.defaultMembers
         private val runs = members.associateWith { ParticipantRun(phase = ParticipantPhase.COMPLETE, requestId = "fixture-${it.name}",
             response = "**把这 30 分钟留给开口，而不是继续收藏学习资料。**\n\n先围绕日常交流，重复练少量真正会用到的表达。\n\n### 每天只做三件事\n\n- **5 分钟听：**选一段简短的对话，听懂大意。\n- **15 分钟说：**关掉原文，用自己的话复述。\n- **10 分钟用：**记下卡住的三处。\n\n### 怎样知道自己在进步？\n\n每周录一段一分钟的音频，比较停顿和表达完整度。") }
+        private val restoredRuns = runs.mapValues { (member, run) -> if (member == failedMember) run.copy(phase = ParticipantPhase.ERROR, response = "") else run }
         private var snapshot = ArenaSessionSnapshot("simple-ui", "每天只有 30 分钟，怎么把英语口语练起来？", askedAtMillis = 123L,
             roundNumber = 1, currentRoundKind = RoundKind.INITIAL, currentAnswerMode = AnswerMode.PARALLEL,
-            services = members, runs = runs, history = listOf(RoundRecord(1, RoundKind.INITIAL, AnswerMode.PARALLEL, "", runs, 1L, 2L)),
-            summary = DiscussionSummary(), updatedAtMillis = 123L)
+            services = members, runs = restoredRuns, history = listOf(RoundRecord(1, RoundKind.INITIAL, AnswerMode.PARALLEL, "", restoredRuns, 1L, 2L)),
+            summary = savedSummary, updatedAtMillis = 123L)
         override fun newSessionId() = "simple-ui-new"
         override fun save(snapshot: ArenaSessionSnapshot) { this.snapshot = snapshot }
         override fun load(id: String) = snapshot

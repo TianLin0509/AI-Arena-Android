@@ -305,7 +305,7 @@ internal fun SimpleRoundStage(
 }
 
 @Composable
-private fun SimpleSummary(
+internal fun SimpleSummary(
     controller: ArenaSessionController, members: List<ArenaService>, preferences: ArenaCaptainPreferences,
     ready: Boolean, guidance: String, onStarted: () -> Unit, onOpen: (ArenaService) -> Unit,
     copy: TextCopyRequest?, share: TextShareRequest?, snackbar: SnackbarHostState,
@@ -316,6 +316,9 @@ private fun SimpleSummary(
     val captain = CaptainPolicy.resolve(ArenaService.fromName(captainName), members)
     val depth = SummaryDepth.fromName(depthName)
     val summary = controller.summary
+    val nextJudge = CaptainPolicy.judgePreference(members, captain).firstOrNull {
+        controller.runs[it]?.let { run -> run.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank() } == true
+    }
     val scope = rememberCoroutineScope()
     val start = {
         preferences.saveCaptain(captain); preferences.saveDepth(depth)
@@ -333,7 +336,10 @@ private fun SimpleSummary(
             Text("需要时再生成，保留共识，也留下分歧。", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
         }
         TextButton(onClick = { options = !options }, enabled = !controller.isBusy) {
-            Text("由 ${captain?.shortName ?: "AI"} 整理 · ${depth.displayName}", style = MaterialTheme.typography.bodySmall)
+            Text("下次由 ${nextJudge?.shortName ?: captain?.shortName ?: "AI"} 整理 · ${depth.displayName}", style = MaterialTheme.typography.bodySmall)
+        }
+        if (ready && nextJudge != null && nextJudge != captain) {
+            SimpleNotice("${captain?.shortName} 本轮未完成，将由 ${nextJudge.shortName} 整理。")
         }
         if (options) {
             members.forEach { service ->
@@ -347,13 +353,7 @@ private fun SimpleSummary(
                 }
             }
         }
-        if (summary.text.isNotBlank()) SelectionContainer { MarkdownText(summary.text) }
-        if (summary.phase == ParticipantPhase.ERROR) {
-            SimpleNotice(summary.detail)
-            summary.judge?.let { service -> TextButton(onClick = { onOpen(service) }) { Text("打开 ${service.shortName} 网页") } }
-        } else if (controller.isBusy && summary.phase != ParticipantPhase.IDLE && summary.phase != ParticipantPhase.COMPLETE) {
-            Text("正在整理…", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
-        }
+        SimpleSummaryResult(summary, onOpen)
         Button(onClick = start, enabled = ready) { Text(if (summary.phase == ParticipantPhase.IDLE) "生成综合答案" else "重新生成") }
         if (!ready && !controller.isBusy) Text("至少两家回答完成后可生成。", style = MaterialTheme.typography.bodySmall)
         if (summary.text.isNotBlank()) Row {
@@ -368,6 +368,28 @@ private fun SimpleSummary(
                 if (!ok || prepared.truncated) scope.launch { snackbar.showSnackbar(if (!ok) "分享失败" else "内容过长，已截取后分享") }
             }) { Text("分享") }
         }
+    }
+}
+
+@Composable
+internal fun SimpleSummaryResult(summary: DiscussionSummary, onOpen: (ArenaService) -> Unit) {
+    if (summary.phase == ParticipantPhase.IDLE) return
+    summary.judge?.let { judge ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SimpleAvatar(judge) { onOpen(judge) }
+            Text("由 ${judge.shortName} 整理 · ${summary.depth.displayName}", style = MaterialTheme.typography.bodySmall)
+        }
+    }
+    if (summary.text.isNotBlank()) SelectionContainer { MarkdownText(summary.text) }
+    val needsHelp = summary.detail.contains("安全验证") || summary.detail.contains("迟迟没有回应")
+    val placeholder = summary.phase == ParticipantPhase.COMPLETE && SummarySanityPolicy.looksLikePlaceholder(summary.text)
+    when {
+        summary.phase == ParticipantPhase.ERROR || needsHelp -> SimpleNotice(summary.detail)
+        placeholder -> SimpleNotice("总结好像没有正文，请打开原网页查看，或换一家 AI 重新生成。")
+        summary.phase != ParticipantPhase.COMPLETE -> Text("正在整理…", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
+    }
+    if (summary.phase == ParticipantPhase.ERROR || needsHelp || placeholder) summary.judge?.let { judge ->
+        TextButton(onClick = { onOpen(judge) }) { Text("打开 ${judge.shortName} 网页") }
     }
 }
 
