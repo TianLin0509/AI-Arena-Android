@@ -1441,6 +1441,41 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun nativeSendArmingUsesAndroidMillisecondPrecisionWithoutAcceptingStaleEvents() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val setup = ArenaWebViewPool::class.java.getDeclaredMethod("nativeDoubaoSetupScript", String::class.java, String::class.java)
+                .apply { isAccessible = true }
+            evaluate(view, setup.invoke(pool, "clock-boundary", "clock-boundary") as String)
+            // Replay the captured timing boundary into the production event guard. The separate
+            // menu recovery test continues to exercise real trusted Android touch events.
+            val result = JSONObject(evaluate(view, """
+                (()=>{
+                  const n=window.__aiArenaNativeSend,b=document.getElementById('flow-end-msg-send');
+                  n.target=b;n.input=document.querySelector('textarea');n.armedAt=5474.4;
+                  const event=(type,timeStamp,isTrusted=true,target=b)=>({type,timeStamp,isTrusted,target});
+                  n.pointer(event('pointerup',5475.3));const orphanUp=n.up;
+                  n.pointer(event('pointerdown',5473.4));const stale=n.down;
+                  n.pointer(event('pointerdown',5474.3,false));const untrusted=n.down;
+                  n.pointer(event('pointerdown',5474.3,true,document.body));const wrongTarget=n.down;
+                  n.pointer(event('pointerdown',5474.3));const accepted=n.down;
+                  n.pointer(event('pointerup',5578.3));const up=n.up;
+                  n.down=null;n.up=null;n.armedAt=5475.1;
+                  n.pointer(event('pointerdown',5474.1));const boundary=n.down;
+                  n.pointer(event('pointerdown',5474.9));const crossMillisecond=n.down;
+                  return JSON.stringify({orphanUp,stale,untrusted,wrongTarget,accepted,up,boundary,crossMillisecond});
+                })();
+            """.trimIndent()))
+            listOf("orphanUp", "stale", "untrusted", "wrongTarget", "boundary").forEach { key ->
+                assertTrue("Guard must reject $key", result.isNull(key))
+            }
+            assertFalse("Same-millisecond trusted DOWN must be accepted", result.isNull("accepted"))
+            assertEquals(5474.3, result.getDouble("accepted"), 0.001)
+            assertEquals(5578.3, result.getDouble("up"), 0.001)
+            assertEquals(5474.9, result.getDouble("crossMillisecond"), 0.001)
+        }
+    }
+
     @Test fun doubaoClosedModernMenuRetriesLostTapWithoutRepeatingOpenMenuOrUploadItem() {
         listOf("recover", "exhausted", "open").forEach { mode ->
             withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
