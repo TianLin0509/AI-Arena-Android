@@ -816,7 +816,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               if(native.cancelledAt!==undefined&&e.type==='pointerdown'&&e.isTrusted&&e.timeStamp>=native.cancelledAt){native.cleanup();if(window.__aiArenaNativeSend===native)window.__aiArenaNativeSend=null;}
               return;
             }
-            if(!e.isTrusted||buttonFor(e)!==native.target||e.timeStamp<native.armedAt)return;
+            // MotionEvent uses millisecond uptime; Chromium's time-origin conversion can place
+            // a newly dispatched event a fraction of a millisecond before performance.now().
+            // Allow only that sub-millisecond precision gap; older events remain rejected.
+            if(!e.isTrusted||buttonFor(e)!==native.target||native.armedAt-e.timeStamp>=1)return;
             if(e.type==='pointerdown'){native.down=e.timeStamp;native.up=null;}
             else if(native.down!==null)native.up=e.timeStamp;
           };

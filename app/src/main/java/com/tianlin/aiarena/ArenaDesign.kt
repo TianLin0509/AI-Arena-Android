@@ -133,8 +133,8 @@ private val PurePalette = ArenaPalette(
     surfaceAlt = Color(0xFFE9E9EF),
     ink = Color(0xFF16171A),
     muted = Color(0xFF6B6F7A),
-    accent = Color(0xFF6252F5),
-    accentSoft = Color(0xFFEEEBFF),
+    accent = Color(0xFF4268ED),
+    accentSoft = Color(0xFFEDF1FF),
     onAccent = Color(0xFFFFFFFF),
     border = Color(0xFFE6E6EC),
     borderStrong = Color(0xFFD6D6DE),
@@ -418,11 +418,7 @@ val ArenaSkin.metrics: ArenaMetrics
         )
     }
 
-/**
- * 字号基准整体比 0.6 抬了一档：正文 17sp（iOS 正文的尺寸，也是支付宝默认正文的量级），
- * 次要文字 15sp，说明文字 13sp。长辈皮肤在此基础上再乘 1.18，正文到 20sp，
- * 达到工信部适老化规范对"大字"的要求。
- */
+/** Compact reading defaults; system font scaling and the optional large-text setting still apply. */
 private fun arenaTypography(metrics: ArenaMetrics): Typography {
     val s = metrics.typeScale
     val heading = metrics.headingFamily
@@ -433,44 +429,44 @@ private fun arenaTypography(metrics: ArenaMetrics): Typography {
         headlineLarge = TextStyle(
             fontFamily = heading,
             fontWeight = FontWeight.Medium,
-            fontSize = sp(30f),
-            lineHeight = sp(38f),
+            fontSize = sp(23f),
+            lineHeight = sp(31f),
         ),
         headlineMedium = TextStyle(
             fontFamily = heading,
             fontWeight = FontWeight.Bold,
-            fontSize = sp(26f),
-            lineHeight = sp(33f),
+            fontSize = sp(23f),
+            lineHeight = sp(30f),
         ),
         titleLarge = TextStyle(
             fontFamily = heading,
             fontWeight = FontWeight.Bold,
-            fontSize = sp(22f),
+            fontSize = sp(21f),
             lineHeight = sp(28f),
         ),
         titleMedium = TextStyle(
             fontFamily = heading,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(17f),
+            fontSize = sp(15f),
             lineHeight = sp(24f),
         ),
         titleSmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(15.5f),
-            lineHeight = sp(22f),
+            fontSize = sp(14f),
+            lineHeight = sp(21f),
         ),
         bodyLarge = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Normal,
-            fontSize = sp(17f),
-            lineHeight = sp(26f),
+            fontSize = sp(14f),
+            lineHeight = sp(24f),
         ),
         bodyMedium = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.Normal,
-            fontSize = sp(15f),
-            lineHeight = sp(22f),
+            fontSize = sp(13f),
+            lineHeight = sp(21f),
         ),
         bodySmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
@@ -481,20 +477,20 @@ private fun arenaTypography(metrics: ArenaMetrics): Typography {
         labelLarge = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(16f),
-            lineHeight = sp(22f),
+            fontSize = sp(13f),
+            lineHeight = sp(21f),
         ),
         labelMedium = TextStyle(
             fontFamily = FontFamily.SansSerif,
             fontWeight = FontWeight.SemiBold,
-            fontSize = sp(13.5f),
+            fontSize = sp(12f),
             lineHeight = sp(18f),
         ),
         labelSmall = TextStyle(
             fontFamily = FontFamily.SansSerif,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = sp(12f),
-            lineHeight = sp(16f),
+            fontWeight = FontWeight.Normal,
+            fontSize = sp(11f),
+            lineHeight = sp(17f),
         ),
     )
 }

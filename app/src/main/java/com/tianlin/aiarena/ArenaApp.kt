@@ -19,10 +19,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemColors
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -39,6 +35,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -69,7 +66,7 @@ internal enum class RoundtablePage {
 
     companion object {
         fun fromName(value: String?): RoundtablePage =
-            entries.firstOrNull { it.name == value } ?: HOME
+            entries.firstOrNull { it.name == value }?.let { if (it == APPEARANCE) SETTINGS else it } ?: HOME
     }
 }
 
@@ -84,7 +81,6 @@ internal val QuestionExamples = listOf(
 fun ArenaApp(
     pool: ArenaWebViewPool,
     debugInitialQuestion: String = "",
-    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)? = null,
     copyText: TextCopyRequest? = null,
     shareText: TextShareRequest? = null,
     /** 用系统浏览器打开外链（下载新版 APK）。返回 false 表示没有可用浏览器。 */
@@ -94,6 +90,7 @@ fun ArenaApp(
     skin: ArenaSkin = ArenaSkin.default,
     onSkinChange: (ArenaSkin) -> Unit = {},
 ) {
+    val contentStateHolder = rememberSaveableStateHolder()
     val colors = ArenaStyle.colors
     val context = LocalContext.current
     val accessibilityPreferences = remember(context) { AccessibilityPreferences(context) }
@@ -101,11 +98,8 @@ fun ArenaApp(
     val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
     val sessionRepository = remember(context) { ArenaSessionStore(context) }
     val sessionController = remember(pool, sessionRepository) {
-        ArenaSessionController(pool = pool, sessionRepository = sessionRepository)
+        ArenaSessionController(pool = ArenaTextOnlyGateway(pool), sessionRepository = sessionRepository)
     }
-    // Keep the draft while switching to login/original web pages; those pages remove DiscussionHome from composition.
-    val attachmentDraft = rememberSaveable(saver = AttachmentDraft.Saver) { AttachmentDraft() }
-    DisposableEffect(attachmentDraft) { onDispose { attachmentDraft.invalidate() } }
     val questionDraft = rememberSaveable { mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion }) }
     val guidanceDraft = rememberSaveable { mutableStateOf("") }
     val network = remember(context) { ArenaNetworkMonitor(context) }
@@ -223,11 +217,6 @@ fun ArenaApp(
         }
     }
 
-    fun selectTab(target: RoundtablePage) {
-        returnToRoundtable()
-        pageName = target.name
-    }
-
     LaunchedEffect(selectedMemberNames) {
         pool.saveSelectedServices(selectedMembers)
     }
@@ -291,25 +280,11 @@ fun ArenaApp(
             with(LocalDensity.current) { providerHeaderPx.toDp() }
         }
 
-        val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
-        val bottomBarVisible = !imeVisible && selectedService == null && !onboardingVisible
 
         Scaffold(
             containerColor = colors.page,
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             snackbarHost = { SnackbarHost(snackbarHostState) },
-            bottomBar = {
-                // 键盘弹出时底栏本来就被完全挡住，但它仍然占着 innerPadding.bottom，
-                // 而内容侧又叠了一层 imePadding() —— 两份底部内边距叠加会把中间可滚区
-                // 挤到只剩一行。键盘打开时直接不摆它；看网页和首次引导时也不摆。
-                if (bottomBarVisible) {
-                    ArenaBottomBar(
-                        page = if (connectionGuideVisible) RoundtablePage.HOME else page,
-                        historyCount = sessionController.recentSessions.size,
-                        onSelect = ::selectTab,
-                    )
-                }
-            },
         ) { innerPadding ->
             Box(
                 modifier = Modifier
@@ -344,7 +319,7 @@ fun ArenaApp(
                         },
                     )
 
-                    else -> RoundtableRoot(
+                    else -> contentStateHolder.SaveableStateProvider("roundtable") { RoundtableRoot(
                         pool = pool,
                         sessionController = sessionController,
                         selectedServices = selectedMembers,
@@ -364,8 +339,6 @@ fun ArenaApp(
                         membersReturnPage = RoundtablePage.fromName(membersReturnPageName),
                         onMembersReturnPageChange = { membersReturnPageName = it.name },
                         snackbarHostState = snackbarHostState,
-                        chooseAttachments = chooseAttachments,
-                        attachmentDraft = attachmentDraft,
                         questionDraft = questionDraft,
                         guidanceDraft = guidanceDraft,
                         largeTextEnabled = largeTextEnabled,
@@ -399,7 +372,7 @@ fun ArenaApp(
                         },
                         onRestartApp = restart,
                         onShowOnboarding = { onboardingVisible = true },
-                    )
+                    ) }
                 }
             }
         }
@@ -422,8 +395,6 @@ private fun RoundtableRoot(
     membersReturnPage: RoundtablePage,
     onMembersReturnPageChange: (RoundtablePage) -> Unit,
     snackbarHostState: SnackbarHostState,
-    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)?,
-    attachmentDraft: AttachmentDraft,
     questionDraft: MutableState<String>,
     guidanceDraft: MutableState<String>,
     largeTextEnabled: Boolean,
@@ -465,8 +436,6 @@ private fun RoundtableRoot(
             membersReturnPage = membersReturnPage,
             onMembersReturnPageChange = onMembersReturnPageChange,
             snackbarHostState = snackbarHostState,
-            chooseAttachments = chooseAttachments,
-            attachmentDraft = attachmentDraft,
             questionDraft = questionDraft,
             guidanceDraft = guidanceDraft,
             largeTextEnabled = largeTextEnabled,
@@ -523,8 +492,6 @@ private fun DiscussionHome(
     membersReturnPage: RoundtablePage,
     onMembersReturnPageChange: (RoundtablePage) -> Unit,
     snackbarHostState: SnackbarHostState,
-    chooseAttachments: ((Set<String>, (Result<List<ArenaAttachment>>) -> Unit) -> Unit)?,
-    attachmentDraft: AttachmentDraft,
     questionDraft: MutableState<String>,
     guidanceDraft: MutableState<String>,
     largeTextEnabled: Boolean,
@@ -551,13 +518,10 @@ private fun DiscussionHome(
     val context = LocalContext.current
     val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
     var question by questionDraft
-    var answerModeName by rememberSaveable { mutableStateOf(guidePreferences.loadAnswerMode().name) }
     // 队长与总结深度的记忆：结果页「队长总结」用它记住上次的选择。
     val captainPreferences = remember(context) { ArenaCaptainPreferences(context) }
     var roundGuidance by guidanceDraft
-    val expandedAnswers = remember { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
-    val answerMode = AnswerMode.fromName(answerModeName)
     val usableServices = selectedServices.filter {
         pool.statuses[it]?.state?.isUsable() == true
     }
@@ -573,16 +537,6 @@ private fun DiscussionHome(
         }
     }
     val sessionStage = sessionController.stage
-    val completedCount = sessionController.completedCount
-    val questionWithinLimit = question.length <= ArenaLimits.MAX_QUESTION_CHARS
-    val pickAttachments: () -> Unit = {
-        chooseAttachments?.let { choose ->
-            val retainedIds = (attachmentDraft.attachments + sessionController.lastRoundAttachments +
-                sessionController.summary.attachments + sessionController.history.flatMap { it.attachments }).map { it.id }.toSet()
-            attachmentDraft.choose { callback -> choose(retainedIds, callback) }
-        }
-    }
-
     val toggleMember: (ArenaService) -> Unit = { service ->
         // 轮次进行中改成员会销毁正在收答案的 WebView，并让下一轮的参与者集合
         // 与界面上显示的成员对不上。直接挡在这里，比事后补偿可靠。
@@ -614,10 +568,8 @@ private fun DiscussionHome(
     val startFresh: () -> Boolean = {
         val resetSucceeded = sessionController.reset()
         if (resetSucceeded) {
-            attachmentDraft.clear()
             question = ""
             roundGuidance = ""
-            expandedAnswers.clear()
         } else {
             scope.launch { snackbarHostState.showSnackbar(sessionController.storageWarning ?: "当前讨论未能保存，暂未开始新会话") }
         }
@@ -625,13 +577,10 @@ private fun DiscussionHome(
     }
 
     val restoreRecentSession: (String) -> Unit = { sessionId ->
-        attachmentDraft.invalidate()
         val outcome = sessionController.restoreSession(sessionId)
         if (outcome == RestoreOutcome.OK || outcome == RestoreOutcome.OK_AFTER_STOP) {
-            attachmentDraft.clear()
             question = sessionController.originalQuestion
             roundGuidance = ""
-            expandedAnswers.clear()
             onPageChange(RoundtablePage.HOME)
             onSelectedServicesChange(sessionController.sessionServices)
         }
@@ -658,9 +607,8 @@ private fun DiscussionHome(
                 onRestore = restoreRecentSession,
             )
 
-            RoundtablePage.SETTINGS -> RoundtableSettingsPage(
+            RoundtablePage.SETTINGS -> SimpleSettingsPage(
                 selectedServices = selectedServices,
-                usableCount = usableCount,
                 crashReport = crashReport,
                 onClearCrashReport = onClearCrashReport,
                 onShareCrashReport = shareText?.let { share ->
@@ -676,14 +624,7 @@ private fun DiscussionHome(
                 onInstallUpdate = onInstallUpdate,
                 largeTextEnabled = largeTextEnabled,
                 onLargeTextChange = onLargeTextChange,
-                skin = skin,
-                answerMode = answerMode,
-                onAnswerModeChange = { mode ->
-                    answerModeName = mode.name
-                    guidePreferences.saveAnswerMode(mode)
-                },
                 onBack = { onPageChange(RoundtablePage.HOME) },
-                onAppearance = { onPageChange(RoundtablePage.APPEARANCE) },
                 onMembers = {
                     onMembersReturnPageChange(RoundtablePage.SETTINGS)
                     onPageChange(RoundtablePage.MEMBERS)
@@ -729,72 +670,28 @@ private fun DiscussionHome(
             )
 
             RoundtablePage.HOME -> if (sessionStage == SessionStage.IDLE) {
-                AskHome(
-                    question = question,
-                    onQuestionChange = { question = it },
-                    questionWithinLimit = questionWithinLimit,
-                    lengthAdvisory = QuestionLengthPolicy.advisory(question, selectedServices),
-                    selectedServices = selectedServices,
-                    usableCount = usableCount,
-                    onMembers = {
-                        onMembersReturnPageChange(RoundtablePage.HOME)
-                        onPageChange(RoundtablePage.MEMBERS)
-                    },
-                    onConnections = onManageConnections,
-                    attachmentDraft = attachmentDraft,
-                    attachmentsEnabled = chooseAttachments != null,
-                    onChooseAttachments = pickAttachments,
-                    offline = offline,
-                    crashNotice = unacknowledgedCrash,
-                    onCrashRestart = {
-                        if (startFresh()) onAcknowledgeCrash()
-                    },
-                    onCrashDismiss = onAcknowledgeCrash,
-                    availableUpdate = bannerUpdate,
-                    onInstallUpdate = onInstallUpdate,
-                    onDismissUpdate = onDismissUpdate,
-                    onNeedQuestion = {
-                        scope.launch { snackbarHostState.showSnackbar("先写下问题，或者添加照片 / 文件") }
-                    },
-                    onTooLong = {
-                        scope.launch {
-                            snackbarHostState.showSnackbar("问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字了，删掉一些再发")
-                        }
-                    },
+                SimpleAskHome(
+                    question = question, onQuestionChange = { question = it },
+                    selectedServices = selectedServices, usableCount = usableCount,
+                    onMembers = { onMembersReturnPageChange(RoundtablePage.HOME); onPageChange(RoundtablePage.MEMBERS) },
+                    onConnections = onManageConnections, onOpenService = onOpenService, onNavigate = onPageChange,
+                    lengthAdvisory = QuestionLengthPolicy.advisory(question, selectedServices), offline = offline,
+                    crashNotice = unacknowledgedCrash, onCrashDismiss = onAcknowledgeCrash,
+                    onNeedQuestion = { scope.launch { snackbarHostState.showSnackbar("先写下问题") } },
+                    onTooLong = { scope.launch { snackbarHostState.showSnackbar("问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字了") } },
                     onStart = {
-                        expandedAnswers.clear()
-                        if (sessionController.startInitial(question, usableServices, answerMode, attachmentDraft.attachments)) {
-                            attachmentDraft.clear()
-                            scope.launch {
-                                snackbarHostState.showSnackbar(
-                                    "开始向 ${usableServices.size} 位 AI 发送，请留意各家状态",
-                                )
-                            }
+                        if (!sessionController.startInitial(question, usableServices, AnswerMode.PARALLEL)) {
+                            scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
                         }
                     },
                 )
             } else {
-                RoundStage(
-                    statuses = pool.statuses,
-                    sessionController = sessionController,
-                    selectedServices = selectedServices,
-                    usableCount = usableCount,
-                    completedCount = completedCount,
-                    sessionStage = sessionStage,
-                    answerMode = answerMode,
-                    roundGuidance = roundGuidance,
-                    onRoundGuidanceChange = { roundGuidance = it },
-                    expandedAnswers = expandedAnswers,
-                    onNewSession = { startFresh() },
-                    attachmentDraft = attachmentDraft,
-                    attachmentsEnabled = chooseAttachments != null,
-                    onChooseAttachments = pickAttachments,
-                    onOpenService = onOpenService,
-                    snackbarHostState = snackbarHostState,
-                    copyText = copyText,
-                    shareText = shareText,
-                    offline = offline,
-                    captainPreferences = captainPreferences,
+                SimpleRoundStage(
+                    statuses = pool.statuses, sessionController = sessionController,
+                    roundGuidance = roundGuidance, onRoundGuidanceChange = { roundGuidance = it },
+                    onNewSession = { startFresh() }, onNavigate = onPageChange, onOpenService = onOpenService,
+                    snackbarHostState = snackbarHostState, copyText = copyText, shareText = shareText,
+                    offline = offline, captainPreferences = captainPreferences,
                 )
             }
         }
@@ -814,95 +711,22 @@ private fun ProviderHeader(
     modifier: Modifier = Modifier,
 ) {
     val colors = ArenaStyle.colors
-    val metrics = ArenaStyle.metrics
-    // 这次打开期间是否见过"需要登录"：见过、之后又变成可用，就是刚登录成功。
-    var sawNeedsLogin by remember(service) { mutableStateOf(false) }
-    LaunchedEffect(status.state) {
-        if (status.state == ConnectionState.NEEDS_LOGIN) sawNeedsLogin = true
-    }
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        color = colors.surface,
-        shadowElevation = if (metrics.flatSurfaces) 0.dp else 4.dp,
-    ) {
-        Column(modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 60.dp)
-                    .padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                ArenaBackButton(
-                    onClick = onBack,
-                    label = "返回圆桌",
-                    contentDescriptionText = "返回 AI 圆桌主界面",
-                )
+    Surface(modifier = modifier.fillMaxWidth(), color = colors.page) {
+        Column(Modifier.windowInsetsPadding(WindowInsets.statusBars)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                SimpleIcon(R.drawable.ic_arrow_back, "返回 AI 圆桌主界面", onBack)
                 BrandAvatar(service = service, size = 26.dp)
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        text = service.displayName,
-                        color = colors.ink,
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = status.detail,
-                        color = colors.muted,
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                StatusPill(status.state)
-                ArenaTextAction(
-                    text = "刷新",
-                    onClick = onReload,
-                    contentDescriptionText = "刷新 ${service.displayName} 网页",
-                )
+                Text(service.shortName, Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.titleSmall)
+                SimpleIcon(R.drawable.ic_refresh, "刷新 ${service.shortName} 网页", onReload)
             }
-            if (metrics.flatSurfaces) HorizontalDivider(color = colors.border)
-            val hint: (@Composable () -> Unit)? = when {
-                status.state == ConnectionState.SIGNED_IN && sawNeedsLogin -> {
-                    {
-                        ArenaNotice(
-                            tone = NoticeTone.SUCCESS,
-                            title = "${service.displayName} 已登录",
-                            text = "登录信息已记住，以后不用再登。可以回圆桌继续了。",
-                            actionLabel = "返回圆桌",
-                            onAction = onBack,
-                            actionContentDescription = "登录完成，返回圆桌",
-                        )
-                    }
-                }
-                status.state == ConnectionState.NEEDS_LOGIN -> {
-                    {
-                        ArenaNotice(
-                            tone = NoticeTone.INFO,
-                            title = "在下面的网页里登录 ${service.displayName}",
-                            text = "${service.loginHint}，和平时用它一样。登录成功后这里会提示你返回。",
-                        )
-                    }
-                }
-                status.state == ConnectionState.ERROR -> {
-                    {
-                        ArenaNotice(
-                            tone = NoticeTone.ERROR,
-                            title = "网页没有打开",
-                            text = ArenaErrorHelp.explain(status.detail, service.displayName).let { "${it.what} ${it.next}" }
-                                .replace("「重发」", "「重新加载」"),
-                            actionLabel = "重新加载",
-                            onAction = onReload,
-                        )
-                    }
-                }
-                else -> null
+            when (status.state) {
+                ConnectionState.NEEDS_LOGIN -> Text("请在下方官网登录，完成后返回圆桌。", Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.bodySmall, color = colors.muted)
+                ConnectionState.ERROR -> Text(ArenaErrorHelp.explain(status.detail, service.shortName).what,
+                    Modifier.padding(horizontal = 16.dp, vertical = 6.dp), style = MaterialTheme.typography.bodySmall, color = colors.error)
+                else -> Unit
             }
-            if (hint != null) {
-                Box(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) { hint() }
-            }
+            HorizontalDivider(color = colors.border, thickness = 0.5.dp)
         }
     }
 }
@@ -910,91 +734,6 @@ private fun ProviderHeader(
 // ---------------------------------------------------------------------------
 // 底部三个入口：圆桌 / 历史 / 设置
 // ---------------------------------------------------------------------------
-
-@Composable
-private fun ArenaBottomBar(
-    page: RoundtablePage,
-    historyCount: Int,
-    onSelect: (RoundtablePage) -> Unit,
-) {
-    val colors = ArenaStyle.colors
-    val settingsSelected = page == RoundtablePage.SETTINGS || page == RoundtablePage.APPEARANCE
-    NavigationBar(
-        containerColor = colors.navSurface,
-        tonalElevation = 0.dp,
-    ) {
-        NavigationBarItem(
-            selected = page == RoundtablePage.HOME || page == RoundtablePage.MEMBERS,
-            onClick = { onSelect(RoundtablePage.HOME) },
-            icon = {
-                ArenaIcon(
-                    R.drawable.ic_roundtable,
-                    tint = if (page == RoundtablePage.HOME) colors.accent else colors.muted,
-                    size = 26.dp,
-                )
-            },
-            label = { BottomLabel("圆桌", "回到圆桌") },
-            alwaysShowLabel = true,
-            colors = navColors(),
-        )
-        NavigationBarItem(
-            selected = page == RoundtablePage.HISTORY,
-            onClick = { onSelect(RoundtablePage.HISTORY) },
-            icon = {
-                ArenaIcon(
-                    R.drawable.ic_history,
-                    tint = if (page == RoundtablePage.HISTORY) colors.accent else colors.muted,
-                    size = 26.dp,
-                )
-            },
-            label = { BottomLabel(if (historyCount > 0) "历史 $historyCount" else "历史", "查看最近问题") },
-            alwaysShowLabel = true,
-            colors = navColors(),
-        )
-        NavigationBarItem(
-            selected = settingsSelected,
-            onClick = { onSelect(RoundtablePage.SETTINGS) },
-            icon = {
-                ArenaIcon(
-                    R.drawable.ic_settings,
-                    tint = if (settingsSelected) colors.accent else colors.muted,
-                    size = 26.dp,
-                )
-            },
-            label = { BottomLabel("设置", "打开设置") },
-            alwaysShowLabel = true,
-            colors = navColors(),
-        )
-    }
-}
-
-/**
- * 底栏文字。读屏描述放在文字上而不是图标上：Material 的 NavigationBarItem 会把图标描述
- * 合并进条目，但 uiautomator 看不到合并后的节点（真机 QA 脚本靠这个描述找入口）。
- */
-@Composable
-private fun BottomLabel(text: String, description: String) {
-    Text(
-        text = text,
-        modifier = Modifier.semantics { contentDescription = description },
-        style = MaterialTheme.typography.labelMedium,
-        maxLines = 1,
-        softWrap = false,
-        overflow = TextOverflow.Clip,
-    )
-}
-
-@Composable
-private fun navColors(): NavigationBarItemColors {
-    val colors = ArenaStyle.colors
-    return NavigationBarItemDefaults.colors(
-        selectedIconColor = colors.accent,
-        selectedTextColor = colors.accent,
-        indicatorColor = colors.accentSoft,
-        unselectedIconColor = colors.muted,
-        unselectedTextColor = colors.muted,
-    )
-}
 
 internal fun formatRecentTime(value: Long): String =
     if (value <= 0L) "时间未知" else SimpleDateFormat("MM-dd HH:mm", Locale.CHINA).format(Date(value))

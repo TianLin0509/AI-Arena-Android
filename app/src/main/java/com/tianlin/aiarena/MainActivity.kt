@@ -91,21 +91,16 @@ class MainActivity : ComponentActivity() {
             ""
         }
         setContent {
-            var skin by remember { mutableStateOf(skinPreferences.loadSkin()) }
+            val skin = ArenaSkin.PURE
             ArenaTheme(skin = skin) {
                 ArenaApp(
                     pool = webViewPool,
                     debugInitialQuestion = debugInitialQuestion,
-                    chooseAttachments = ::chooseAttachments,
                     copyText = ::copyText,
                     shareText = ::shareText,
                     openExternalUrl = ::openExternalUrl,
                     restartApp = { ArenaRestart.trigger(this) },
                     skin = skin,
-                    onSkinChange = { next ->
-                        skin = next
-                        skinPreferences.saveSkin(next)
-                    },
                 )
             }
         }
