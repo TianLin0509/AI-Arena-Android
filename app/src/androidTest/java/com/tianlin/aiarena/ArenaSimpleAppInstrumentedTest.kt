@@ -1,6 +1,7 @@
 package com.tianlin.aiarena
 
 import android.graphics.Bitmap
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -42,6 +43,14 @@ class ArenaSimpleAppInstrumentedTest {
         capture("production-answer")
         compose.onNodeWithTag("answer-tab-KIMI").performClick()
         compose.onNodeWithTag("simple-composer").performTextInput("保留这条追问草稿")
+        // On compact screens the IME moves the answer avatar outside the lazy viewport.
+        // Finish editing as a user would before navigating, without clearing the draft.
+        compose.runOnUiThread {
+            compose.activity.getSystemService(InputMethodManager::class.java)
+                .hideSoftInputFromWindow(compose.activity.window.decorView.windowToken, 0)
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag("answer-scroll").performScrollToNode(hasContentDescription("打开 Kimi 网页"))
         compose.onNodeWithContentDescription("打开 Kimi 网页").performClick()
         // Header's explicit back bypasses webpage history and must restore the selected tab.
         compose.onNodeWithContentDescription("返回 AI 圆桌主界面").performClick()
