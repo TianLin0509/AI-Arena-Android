@@ -113,6 +113,7 @@ internal fun SimpleAskHome(
     onMembers: () -> Unit, onConnections: () -> Unit, onOpenService: (ArenaService) -> Unit,
     onNavigate: (RoundtablePage) -> Unit, onStart: () -> Unit, onNeedQuestion: () -> Unit, onTooLong: () -> Unit,
     lengthAdvisory: String?, offline: Boolean, crashNotice: ArenaCrashReport?, onCrashDismiss: () -> Unit,
+    pendingConnectionCount: Int = 0,
 ) {
     val colors = ArenaStyle.colors
     Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
@@ -133,7 +134,7 @@ internal fun SimpleAskHome(
                 selectedServices.forEach { service -> SimpleAvatar(service) { onOpenService(service) } }
                 TextButton(onClick = onMembers) { Text("更换", style = MaterialTheme.typography.bodySmall) }
             }
-            if (usableCount < ArenaService.MIN_MEMBERS) TextButton(onClick = onConnections) { Text("先登录至少两家 AI") }
+            if (usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS) TextButton(onClick = onConnections) { Text("先登录至少两家 AI") }
             if (question.isBlank()) TextButton(onClick = { onQuestionChange("每天只有 30 分钟，怎么把英语口语练起来？") }) {
                 Text("每天 30 分钟，怎么练好口语？", style = MaterialTheme.typography.bodySmall, color = colors.muted)
             }
@@ -144,7 +145,7 @@ internal fun SimpleAskHome(
                 when {
                     question.isBlank() -> onNeedQuestion()
                     question.length > ArenaLimits.MAX_QUESTION_CHARS -> onTooLong()
-                    usableCount < ArenaService.MIN_MEMBERS -> onConnections()
+                    usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS -> onConnections()
                     else -> onStart()
                 }
             })
@@ -188,7 +189,7 @@ internal fun SimpleAnswer(
     var confirmResend by remember { mutableStateOf(false) }
     var details by rememberSaveable { mutableStateOf(false) }
     val colors = ArenaStyle.colors
-    if (confirmResend) ConfirmDialog("重新发送给 ${service.shortName}？", "会再次发送本轮问题。若网页已有回答，请先尝试重新读取。", "确认重发",
+    if (confirmResend) ConfirmDialog("重新发送给 ${service.shortName}？", "会再次发送本轮问题。请先打开网页确认是否已收到或仍在排队，避免重复发送。", "确认重发",
         onConfirm = { confirmResend = false; onResend() }, onDismiss = { confirmResend = false })
     Row(verticalAlignment = Alignment.CenterVertically) {
         SimpleAvatar(service, onOpen)
@@ -237,6 +238,7 @@ internal fun SimpleRoundStage(
     val members = sessionController.sessionServices
     var selected by rememberSaveable(sessionController.askedAtMillis) { mutableStateOf(members.first().name) }
     val current = selected.takeIf { it == "summary" || members.any { m -> m.name == it } } ?: members.first().name
+    val currentQuestion = sessionController.currentQuestion
     val busy = sessionController.isBusy
     val ready = sessionController.stage == SessionStage.READY && sessionController.completedCount >= ArenaService.MIN_MEMBERS && !busy
     val scope = rememberCoroutineScope()
@@ -256,7 +258,10 @@ internal fun SimpleRoundStage(
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item("question") {
                     Surface(Modifier.fillMaxWidth().padding(start = 20.dp), color = colors.card, shape = RoundedCornerShape(14.dp)) {
-                        SelectionContainer { Text(sessionController.originalQuestion, Modifier.padding(13.dp), style = MaterialTheme.typography.bodyMedium) }
+                        SelectionContainer {
+                            Text(if (current == "summary") "讨论主题：${sessionController.originalQuestion}" else currentQuestion,
+                                Modifier.padding(13.dp).testTag("current-question"), style = MaterialTheme.typography.bodyMedium)
+                        }
                     }
                 }
                 if (current == "summary") item("summary") {
@@ -268,12 +273,12 @@ internal fun SimpleRoundStage(
                     Column {
                         SimpleAnswer(service, run, statuses[service] ?: ServiceStatus(), { onOpenService(service) },
                             onCopy = copyText?.let { copy -> { scope.launch {
-                                val prepared = ShareTextPolicy.discussionSummary(sessionController.originalQuestion, run.response)
+                                val prepared = ShareTextPolicy.discussionSummary(currentQuestion, run.response)
                                 val ok = copy("${service.shortName} 的回答", prepared.text)
                                 snackbarHostState.showSnackbar(if (!ok) "复制失败" else if (prepared.truncated) "回答过长，已截取后复制" else "已复制")
                             }; Unit } },
                             onShare = shareText?.let { share -> { scope.launch {
-                                val prepared = ShareTextPolicy.discussionSummary(sessionController.originalQuestion, run.response)
+                                val prepared = ShareTextPolicy.discussionSummary(currentQuestion, run.response)
                                 if (!share("${service.shortName} 的回答", prepared.text)) snackbarHostState.showSnackbar("分享失败")
                                 else if (prepared.truncated) snackbarHostState.showSnackbar("回答过长，已截取后分享")
                             }; Unit } }, busy = busy,

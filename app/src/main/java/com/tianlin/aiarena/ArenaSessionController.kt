@@ -120,6 +120,21 @@ class ArenaSessionController(
     val completedCount: Int
         get() = runs.values.count { it.phase == ParticipantPhase.COMPLETE }
 
+    /** User-facing question paired with the current member answers, never an internal debate prompt. */
+    val currentQuestion: String
+        get() {
+            val number = roundNumber
+            val guidance = activeExecution?.takeIf { it.number == number }?.guidance?.takeIf { it.isNotBlank() }
+                ?: history.lastOrNull { it.number == number }?.guidance?.takeIf { it.isNotBlank() }
+            return when (currentRoundKind) {
+                RoundKind.ITERATION -> guidance
+                    ?: lastRoundPrompts.values.firstOrNull { it.isNotBlank() }
+                    ?: "本轮问题未保存"
+                RoundKind.DEBATE -> originalQuestion + (guidance?.let { "\n\n本轮讨论要求：$it" } ?: "")
+                else -> originalQuestion
+            }
+        }
+
     fun startInitial(
         question: String,
         services: List<ArenaService>,
@@ -675,9 +690,9 @@ class ArenaSessionController(
                 finishRecovery(execution, runs.getValue(service).copy(phase = ParticipantPhase.ERROR, detail = "重发超时，已停止；请打开原网页确认"))
             }
         }
-        handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
         val send = send@{
             if (sendSettled || !isRecoveryActive(execution)) return@send
+            handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
             pool.sendPromptWithAttachments(service, prompt.orEmpty(), requestId, lastRoundAttachments) { outcome ->
                 if (sendSettled || !isRecoveryActive(execution)) return@sendPromptWithAttachments
                 sendSettled = true

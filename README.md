@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.15.0`（`versionCode 24`）
+当前版本：`v0.15.1`（`versionCode 25`）
 
 ## 开发入口
 
@@ -28,6 +28,13 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 每次可选择 2-4 家 AI。
 - 聚焦普通用户，尤其是中老年用户的日常提问、群策群力和幻觉风险提示。
 - 登录信息、成员选择和讨论历史只保存在 Android 应用沙箱内。
+
+## 0.15.1 回答提取修复
+
+- 适配豆包当前官网的消息结构，避免网页已回答而圆桌一直等待。
+- 豆包、Kimi 依据本轮正文与消息身份确认送达和提取，不把旧对话当成本轮结果；定位丢失时明确提示核对原网页，不自动重复发送。
+- 对网页缓慢加载、输入框重建和发送回调延迟采用分阶段、有总上限的等待；冷启动保留全部已选成员。
+- 官网会改版，也会因网络、账号权限或安全验证拒绝请求；无法确认的状态保持明确，不承诺所有条件下永无失败。真实回归要求见 `.agents/TESTING.md`。
 
 ## A 方案简洁界面（0.15.0）
 
@@ -185,9 +192,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.15.0`，`versionCode=24`。
-- 下一次小修复示例：`0.15.1 / versionCode 25`。
-- 下一次向后兼容新功能示例：`0.16.0 / versionCode 25`（与上例二选一，实际发布时继续递增）。
+- 当前基线：`versionName=0.15.1`，`versionCode=25`。
+- 下一次小修复示例：`0.15.2 / versionCode 26`。
+- 下一次向后兼容新功能示例：`0.16.0 / versionCode 26`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：

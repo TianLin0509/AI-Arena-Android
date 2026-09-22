@@ -27,6 +27,31 @@ object ArenaErrorHelp {
     fun explain(detail: String, serviceName: String): Advice {
         val d = detail
         return when {
+            d.contains("官网当前繁忙") -> Advice(
+                what = "$serviceName 官网当前繁忙，本轮尚未确认送达。",
+                next = "请稍后打开网页核对；不会自动重复发送。",
+                primary = Action.OPEN_PAGE,
+            )
+            d.contains("待发送队列") -> Advice(
+                what = "$serviceName 网页把本轮问题放入了待发送队列，尚未确认送达。",
+                next = "请打开网页核对队列，勿重复发送。",
+                primary = Action.OPEN_PAGE,
+            )
+            d.contains("当前模型或功能需要会员") -> Advice(
+                what = "$serviceName 当前选择的模型或功能需要会员，本轮问题没有发出。",
+                next = "请打开网页确认，换用可用模型后再试。",
+                primary = Action.OPEN_PAGE,
+            )
+            d.contains("不会自动重复发送") || d.contains("未确认送达") || d.contains("勿重复发送") -> Advice(
+                what = "无法确认 $serviceName 本轮问题的送达或回答状态。",
+                next = "请先打开网页核对是否已经收到或仍在排队，勿直接重复发送。",
+                primary = Action.OPEN_PAGE,
+            )
+            d.contains("登录状态尚未确认") -> Advice(
+                what = "还不能确认 $serviceName 是否已登录，本轮尚未发送。",
+                next = "请打开网页检查登录状态，再回来提问。",
+                primary = Action.OPEN_PAGE,
+            )
             d.contains("已跳过") -> Advice(
                 what = "这一家本轮跳过了。",
                 next = "其他 AI 的回答不受影响；想让它回答，点「重发」。",

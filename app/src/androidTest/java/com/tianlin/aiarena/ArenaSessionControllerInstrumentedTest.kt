@@ -27,6 +27,47 @@ class ArenaSessionControllerInstrumentedTest {
         requiredStablePolls = 1,
     )
 
+    @Test fun iterationQuestionTracksSendingCompletionAndRestoredHistory() {
+        val repository = FakeSessionRepository()
+        val controller = onMain { ArenaSessionController(FakeGateway(), fastTiming, repository) }
+        onMain { assertTrue(controller.startInitial("first question", ArenaService.defaultMembers)) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            assertTrue(controller.startIteration(guidance = "current independent question"))
+            assertEquals("current independent question", controller.currentQuestion)
+            assertEquals(1, controller.history.size)
+        }
+        awaitHistorySize(controller, 2)
+        onMain {
+            assertEquals("current independent question", controller.currentQuestion)
+            assertEquals("first question", controller.originalQuestion)
+            controller.destroy()
+            repository.save(repository.loadActive()!!.copy(lastRoundPrompts = emptyMap()))
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("current independent question", restored.currentQuestion)
+            assertEquals("first question", restored.originalQuestion)
+            restored.destroy()
+        }
+    }
+
+    @Test fun unfinishedRestoredIterationNeverUsesPreviousRoundQuestion() {
+        val repository = FakeSessionRepository()
+        val snapshot = recoverySnapshot("unfinished current question").let {
+            it.copy(roundNumber = 2, currentRoundKind = RoundKind.ITERATION,
+                history = listOf(RoundRecord(1, RoundKind.INITIAL, AnswerMode.PARALLEL, "older guidance", it.runs, 1, 2)))
+        }
+        repository.save(snapshot); repository.setActiveSession(snapshot.id)
+        onMain {
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("unfinished current question", restored.currentQuestion)
+            restored.destroy()
+            repository.save(snapshot.copy(lastRoundPrompts = emptyMap()))
+            val legacy = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("本轮问题未保存", legacy.currentQuestion)
+            legacy.destroy()
+        }
+    }
+
     @Test
     fun newSessionResetPreservesCompletedHistoryButClearsColdStartSelection() {
         val repository = FakeSessionRepository()
@@ -382,6 +423,31 @@ class ArenaSessionControllerInstrumentedTest {
                 assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
                 assertEquals(1, controller.history.size)
             }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun initialRetryKeepsFreshAndSendBudgetsSeparate() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(
+            freshConversationTimeoutMillis = 2_000, sendTimeoutMillis = 600, responseTimeoutMillis = 5_000)) }
+        try {
+            onMain {
+                controller.startInitial("separate retry budgets", ArenaService.defaultMembers)
+                gateway.completeFresh(ArenaService.DEEPSEEK, false)
+                gateway.completeSend(ArenaService.DOUBAO); gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain { assertTrue(controller.retrySend(ArenaService.DEEPSEEK)) }
+            Thread.sleep(750)
+            onMain {
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertFalse(gateway.sentServices.contains(ArenaService.DEEPSEEK))
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+            }
+            Thread.sleep(250)
+            onMain { gateway.completeSend(ArenaService.DEEPSEEK) }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
         } finally { onMain { controller.destroy() } }
     }
 
