@@ -87,6 +87,92 @@ class ArenaMessageIdentityInstrumentedTest {
         assertFalse(JSONObject(js(view, ArenaWebResponseScript.build(ArenaService.KIMI, request, requireIdentity = true))).getBoolean("found"))
     }
 
+    @Test fun boundStableIdentityCannotDriftToLaterIdenticalQuestion() = bothIdentityProviders { view, service ->
+        prepare(view, service, "same question")
+        html(view, user(service, "owner", "same question"))
+        submit(view, service)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        html(view, user(service, "other", "same question") + answer(service, "OTHER ANSWER"))
+        assertEquals(service.name, "false", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        assertFalse(service.name, response(view, service).getBoolean("found"))
+    }
+
+    @Test fun boundStableIdentityOutranksCopiedRequestTag() = bothIdentityProviders { view, service ->
+        prepare(view, service, "same question")
+        html(view, user(service, "owner", "same question"))
+        submit(view, service)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        html(view, user(service, "other", "same question") + answer(service, "OTHER ANSWER") + user(service, "owner", "same question") + answer(service, "OWN ANSWER"))
+        js(view, "document.body.firstElementChild.setAttribute('data-ai-arena-request', '$request');true")
+        assertEquals(service.name, "OWN ANSWER", response(view, service).getString("text"))
+    }
+
+    @Test fun missingOwnAnswerMustNotCrossTheNextUserBoundary() = bothIdentityProviders { view, service ->
+        prepare(view, service, "current question")
+        html(view, user(service, "owner", "current question"))
+        submit(view, service)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        html(view, user(service, "owner", "current question") + "<div>decorative spacer</div>" + user(service, "next", "next question") + answer(service, "NEXT ANSWER"))
+        assertFalse(service.name, response(view, service).getBoolean("found"))
+    }
+
+    @Test fun ownAnswerBeforeNextUserRemainsReadableAfterSameIdRemount() = bothIdentityProviders { view, service ->
+        prepare(view, service, "current question")
+        html(view, user(service, "owner", "current question"))
+        submit(view, service)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        html(view, user(service, "owner", "current question") + answer(service, "OWN ANSWER") + user(service, "next", "next question") + answer(service, "NEXT ANSWER"))
+        js(view, "delete window.__aiArenaRequests;true")
+        assertEquals(service.name, "OWN ANSWER", response(view, service).getString("text"))
+    }
+
+    @Test fun lateWebsiteIdIsPinnedBeforeAnIdenticalReplacementAppears() = bothIdentityProviders { view, service ->
+        prepare(view, service, "current question")
+        html(view, user(service, "", "current question"))
+        submit(view, service)
+        assertEquals("false", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        val selector = if (service == ArenaService.KIMI) ".chat-content-item-user" else "[data-message-id]"
+        val attribute = if (service == ArenaService.KIMI) "data-conversation-turn-id" else "data-message-id"
+        js(view, "document.querySelector('$selector').setAttribute('$attribute','assigned-later');document.body.insertAdjacentHTML('beforeend'," + JSONObject.quote(answer(service, "OWN ANSWER")) + ");true")
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
+        assertEquals("OWN ANSWER", response(view, service).getString("text"))
+        html(view, user(service, "replacement", "current question") + answer(service, "REPLACEMENT ANSWER"))
+        js(view, "delete window.__aiArenaRequests;true")
+        assertFalse(service.name, response(view, service).getBoolean("found"))
+    }
+
+    @Test fun unnumberedBoundRowCannotBecomeAnotherIdenticalMessage() = bothIdentityProviders { view, service ->
+        prepare(view, service, "current question")
+        html(view, user(service, "", "current question"))
+        submit(view, service)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request)))
+        html(view, user(service, "other", "current question") + answer(service, "OTHER ANSWER"))
+        assertFalse(service.name, response(view, service).getBoolean("found"))
+    }
+
+    @Test fun kimiAcceptedRowThatBecomesFailedNeverExposesNextAnswer() = page { view ->
+        prepare(view, ArenaService.KIMI, "current question")
+        html(view, user(ArenaService.KIMI, "owner", "current question"))
+        submit(view, ArenaService.KIMI)
+        assertEquals("true", js(view, ArenaWebCursorScript.bind(ArenaService.KIMI, request, requireIdentity = true)))
+        html(view, user(ArenaService.KIMI, "owner", "current question").replace("chat-content-item-user", "chat-content-item-user awaiting-failure") + user(ArenaService.KIMI, "other", "current question") + answer(ArenaService.KIMI, "OTHER ANSWER"))
+        assertFalse(response(view, ArenaService.KIMI).getBoolean("found"))
+    }
+
+    private fun bothIdentityProviders(block: (WebView, ArenaService) -> Unit) {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { service -> page { block(it, service) } }
+    }
+    private fun html(view: WebView, body: String) { js(view, "document.body.innerHTML=" + JSONObject.quote(body)) }
+    private fun user(service: ArenaService, id: String, text: String): String = when (service) {
+        ArenaService.KIMI -> """<div class="chat-content-item-user" data-conversation-turn-id="$id">$text</div>"""
+        else -> """<div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="$id">$text</div></div>"""
+    }
+    private fun answer(service: ArenaService, text: String): String = when (service) {
+        ArenaService.KIMI -> """<div class="chat-content-item-assistant"><div class="markdown-container">$text</div><div class="segment-assistant-actions" style="height:30px">Copy</div></div>"""
+        else -> """<div data-target-id="message-box-target-id"><div data-reply-message><div class="md-box-root">$text</div></div><div class="message-action-bar" style="height:30px">Copy</div></div>"""
+    }
+    private fun response(view: WebView, service: ArenaService) = JSONObject(js(view, ArenaWebResponseScript.build(service, request, requireIdentity = true)))
+
     private fun prepare(view: WebView, service: ArenaService, prompt: String) {
         js(view, ArenaWebCursorScript.prepare(service, request, prompt))
     }

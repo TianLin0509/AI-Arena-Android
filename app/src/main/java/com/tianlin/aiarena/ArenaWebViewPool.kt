@@ -682,14 +682,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
     ) {
         val token = automations[service]
-        webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId, requireIdentity = token?.strictReceipt == true)) { bound ->
+        if (token?.strictReceipt == true) {
+            // verifySendScript already verified and bound in one synchronous DOM read.
+            if (!isCurrent(service, token)) return
+            sentSinceLoad += service
+            finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
+            return
+        }
+        webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId)) {
             if (!isCurrent(service, token)) return@evaluateJavascript
-            if (token?.strictReceipt == true && bound != "true") {
-                finishSend(service, SendOutcome(false, requestId, "未能确认本轮问题，请检查原网页；不会自动重复发送"), callback)
-            } else {
-                sentSinceLoad += service
-                finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
-            }
+            sentSinceLoad += service
+            finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
         }
     }
 
@@ -718,7 +721,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             token?.sending = true
             webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
                 // Rich-editor insertText can commit on a later task; release before the guarded send click.
-                handler.postDelayed({ release() }, 220L)
+                if (service == ArenaService.KIMI && token?.strictReceipt == true) {
+                    awaitKimiInput(webView, requestId, release, callback)
+                } else handler.postDelayed({ release() }, 220L)
                 if (!isCurrent(service, token)) return@evaluateJavascript
                 if (scriptCallbackConsumed) return@evaluateJavascript
                 scriptCallbackConsumed = true
@@ -740,6 +745,35 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 handler.postDelayed({
                     if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback)
                 }, 2_500L)
+            }
+        }
+    }
+
+    /** Keep the input lease until Lexical has committed the paste, under the request watchdog. */
+    private fun awaitKimiInput(webView: WebView, requestId: String, release: () -> Unit, callback: (SendOutcome) -> Unit) {
+        val service = ArenaService.KIMI
+        val token = automations[service]
+        if (token?.requestId != requestId || !isCurrent(service, token)) { release(); return }
+        val probe = """
+            (function() {
+              ${ArenaWebCursorScript.stateBootstrap(requestId)}
+              if (!state.inputPhase) return 'legacy';
+              if (state.inputFailure) return 'failed';
+              const input = document.querySelector('.chat-input-editor');
+              const text = String(input?.innerText || input?.textContent || '').replace(/\s+/g,' ').trim();
+              return state.submittedAt || (state.inputPhase === 'pasted' && text === state.expectedPrompt) ? 'ready' : 'pending';
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(probe) { raw ->
+            if (!isCurrent(service, token)) { release(); return@evaluateJavascript }
+            when (decodeJsValue(raw)) {
+                "ready" -> release()
+                "legacy" -> handler.postDelayed({ release() }, 220L)
+                "failed" -> {
+                    release()
+                    finishSend(service, SendOutcome(false, requestId, "网页输入状态发生变化，未发送问题；请检查原网页"), callback)
+                }
+                else -> handler.postDelayed({ awaitKimiInput(webView, requestId, release, callback) }, 100L)
             }
         }
     }
@@ -772,11 +806,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             } else if (service == ArenaService.KIMI) {
                 // A receipt can arrive between these evaluations. Check it again atomically
                 // with the dialog classification so a stale dialog cannot override delivery.
-                val rejectionScript = "(function(){return (${verifySendScript(service, requestId).removeSuffix(";")}) ? 'accepted' : ${ArenaKimiRejection.expression};})()"
+                val rejectionScript = "(function(){return (${verifySendScript(service, requestId).removeSuffix(";")}) ? 'accepted' : (window.__aiArenaRequests?.[${ArenaJs.quote(requestId)}]?.inputFailure ? 'input_error' : ${ArenaKimiRejection.expression});})()"
                 webView.evaluateJavascript(rejectionScript) { modal ->
                     if (!isCurrent(service, token)) return@evaluateJavascript
                     val rejection = decodeJsValue(modal)
                     if (rejection == "accepted") finishSuccessfulSend(webView, service, requestId, callback)
+                    else if (rejection == "input_error") finishSend(service, SendOutcome(false, requestId,
+                        "网页输入失败，请检查原网页；未发送问题"), callback)
                     else if (rejection == "busy" || rejection == "membership") finishSend(service, SendOutcome(false, requestId,
                         if (rejection == "busy") ArenaKimiRejection.busyDetail else ArenaKimiRejection.membershipDetail), callback)
                     else if (attempt < 15) handler.postDelayed({
@@ -1506,6 +1542,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun verifySendScript(service: ArenaService, requestId: String): String {
+        if (automations[service]?.strictReceipt == true) {
+            return ArenaWebCursorScript.bind(service, requestId, requireIdentity = true)
+        }
         val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val selectorHelper = selectorHelperScript()
         val requireIdentity = automations[service]?.strictReceipt == true
@@ -1589,8 +1628,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             ""
         } else {
             """
-                setTimeout(attemptSend, $firstClickDelayMs);
-                setTimeout(attemptSend, $retryClickDelayMs);
+                if (!delayedInput) {
+                  setTimeout(attemptSend, $firstClickDelayMs);
+                  setTimeout(attemptSend, $retryClickDelayMs);
+                }
             """.trimIndent()
         }
         val focusInput = "input.focus();"
@@ -1612,20 +1653,56 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 if (!input) return 'no_input';
                 $focusInput
                 let needsSyntheticInput = true;
+                let delayedInput = false;
                 if ($browserInputOnly) {
                   // Doubao attachments must pass through the browser's editing/input path.
                   // Do not substitute its private setter or a synthetic input event here.
                   document.execCommand('selectAll', false, null);
                   if (!document.execCommand('insertText', false, text)) return '豆包正文浏览器输入失败，未发送问题';
                   needsSyntheticInput = false;
-                } else if (${service == ArenaService.KIMI} && input.getAttribute('data-lexical-editor') === 'true' && /[\r\n]/.test(text)) {
-                  // Kimi's single-line Lexical insertText path drops newlines. Its plain-text
-                  // paste handler preserves paragraphs; the existing exact-body guard still
-                  // refuses submission if the editor rejects or changes the pasted content.
-                  document.execCommand('selectAll', false, null);
-                  const transfer = new DataTransfer();
-                  transfer.setData('text/plain', text);
-                  input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+                } else if (${service == ArenaService.KIMI} && input.getAttribute('data-lexical-editor') === 'true') {
+                  // Lexical keeps its own selection. Paste only after selectionchange has
+                  // reached that editor; immediate execCommand/selectAll can append to an old draft.
+                  delayedInput = true;
+                  const original = input.textContent;
+                  state.inputPhase = 'focus';
+                  const abortInput = reason => { state.inputFailure = reason; };
+                  // focus() can schedule a Lexical caret reset. Select only after that task.
+                  setTimeout(function() {
+                    if (cancelled()) return;
+                    if (!input.isConnected || document.activeElement !== input) return abortInput('focus_changed');
+                    if (input.textContent !== original) return abortInput('draft_changed');
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(input);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    state.inputPhase = 'selected';
+                    document.dispatchEvent(new Event('selectionchange'));
+                    setTimeout(function() {
+                      if (cancelled()) return;
+                      if (!input.isConnected || document.activeElement !== input) return abortInput('focus_changed');
+                      if (input.textContent !== original) return abortInput('draft_changed');
+                      const selected = window.getSelection();
+                      if (!selected || selected.rangeCount !== 1) return abortInput('selection_changed');
+                      const current = selected.getRangeAt(0);
+                      if (!input.contains(current.startContainer) || !input.contains(current.endContainer) ||
+                          current.cloneContents().textContent !== original) return abortInput('selection_changed');
+                      try {
+                        const transfer = new DataTransfer();
+                        transfer.setData('text/plain', text);
+                        input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        state.inputPhase = 'pasted';
+                      } catch (error) {
+                        return abortInput('paste_exception');
+                      }
+                      if ($scheduleSubmit) {
+                        setTimeout(attemptSend, $firstClickDelayMs);
+                        setTimeout(attemptSend, $retryClickDelayMs);
+                      }
+                    }, 80);
+                  }, 80);
                   needsSyntheticInput = false;
                 } else if (input.editor && input.editor.commands && typeof input.editor.commands.setContent === 'function') {
                   const paragraphs = text.split(/\r?\n/).map(function(line) {

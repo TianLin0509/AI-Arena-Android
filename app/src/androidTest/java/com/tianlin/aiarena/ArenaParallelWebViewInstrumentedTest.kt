@@ -61,7 +61,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   document.body.appendChild(modal);
                   const quote=document.createElement('p');quote.textContent='Too many people are chatting with Kimi';document.body.appendChild(quote);
                   const accept=()=>{
-                    const user=document.createElement('div');user.className='chat-content-item-user';
+                    const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);
                     user.setAttribute('data-conversation-turn-id','busy-negative');user.textContent=document.querySelector('textarea').value;
                     document.body.appendChild(user);document.querySelector('textarea').value='';
                   };
@@ -166,7 +166,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
                   const user=document.createElement('div');
                   if (${service == ArenaService.KIMI}) {
-                    user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','cold');user.textContent=sentText;
+                    user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','cold');user.textContent=sentText;
                   } else {
                     user.setAttribute('data-target-id','message-box-target-id');
                     const body=document.createElement('div');body.setAttribute('data-send-message-boundary','');body.setAttribute('data-message-id','cold');body.textContent=sentText;user.appendChild(body);
@@ -195,7 +195,156 @@ class ArenaParallelWebViewInstrumentedTest {
 
     @Test fun cancelledSlowKimiPasteCannotSendLaterOrBlockAnotherProvider() = verifyKimiMultilinePaste(15_000, cancel = true)
 
-    private fun verifyKimiMultilinePaste(busyMillis: Int, cancel: Boolean = false) {
+    @Test fun kimiSingleLineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true, singleLine = true)
+
+    @Test fun kimiMultilineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true)
+
+    @Test fun deferredKimiPasteCannotOverwriteAfterItsPreconditionsChange() {
+        val interruptions = listOf(
+            "window.__aiArenaCancelledRequests={'deferred-guard':true}",
+            "editor.blur()",
+            "editor.replaceWith(editor.cloneNode(true))",
+            "editor.textContent='USER EDIT'",
+            "window.getSelection().collapse(editor,0)",
+        )
+        interruptions.forEach { interrupt ->
+            withPool(emptyMap()) { pool, views, _ ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const editor=document.createElement('div');editor.contentEditable='true';
+                    editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
+                    editor.textContent='OLD DRAFT';editor.style='min-height:80px';
+                    document.querySelector('textarea').replaceWith(editor);
+                    window.pastes=0;window.interrupted=false;
+                    editor.addEventListener('paste',e=>{pastes++;e.preventDefault();});
+                    document.addEventListener('selectionchange',()=>{
+                      if(!interrupted && String(window.getSelection())==='OLD DRAFT') {
+                        interrupted=true;$interrupt;
+                      }
+                    });true;
+                """.trimIndent())
+                val settled = CountDownLatch(1)
+                onMain {
+                    pool.sendPrompt(ArenaService.KIMI, "NEW QUESTION", "deferred-guard") {}
+                }
+                waitUntil("selection interception actually occurred") { evaluate(view, "interrupted") == "true" }
+                onMain { view.postDelayed({ settled.countDown() }, 250L) }
+                assertTrue(settled.await(8, TimeUnit.SECONDS))
+                assertEquals(interrupt, "true", evaluate(view, "interrupted"))
+                assertEquals(interrupt, "0", evaluate(view, "pastes"))
+                assertEquals(interrupt, "0", evaluate(view, "sendCount"))
+                assertEquals(if (interrupt.contains("USER EDIT")) "USER EDIT" else "OLD DRAFT",
+                    evaluate(view, "document.querySelector('.chat-input-editor').textContent"))
+                onMain { pool.cancelAutomation(ArenaService.KIMI) }
+            }
+        }
+    }
+
+    @Test fun temporaryProviderRowsWaitForStableIdsWithoutResending() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { service ->
+            listOf(false, true).forEach { remount ->
+                verifyTemporaryProviderRow(service, remount, true, false)
+            }
+        }
+    }
+
+    @Test fun permanentlyUnnumberedProviderRowsNeverConfirmDelivery() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { verifyTemporaryProviderRow(it, false, false, false) }
+    }
+
+    @Test fun cancelledTemporaryProviderRowsCannotConfirmLateDelivery() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { verifyTemporaryProviderRow(it, true, true, true) }
+    }
+
+    private fun verifyTemporaryProviderRow(service: ArenaService, remount: Boolean, assignId: Boolean, cancel: Boolean) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(service)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  let row=document.createElement('div');
+                  if (${service == ArenaService.KIMI}) row.className='chat-content-item-user';
+                  else row.setAttribute('data-target-id','message-box-target-id');
+                  const body=document.createElement('div');body.textContent=sentText;
+                  if (${service == ArenaService.DOUBAO}) body.setAttribute('data-send-message-boundary','');
+                  row.appendChild(body);document.body.appendChild(row);
+                  window.earlyBound=false;
+                  setTimeout(()=>{earlyBound=!!window.__aiArenaRequests?.['temporary-id']?.bound;},3000);
+                  if ($assignId) setTimeout(()=>{
+                    if ($remount) {const replacement=row.cloneNode(true);row.replaceWith(replacement);row=replacement;}
+                    if (${service == ArenaService.KIMI}) row.setAttribute('data-conversation-turn-id','stable-id');
+                    else row.firstElementChild.setAttribute('data-message-id','stable-id');
+                  },4000);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(service, "temporary row question", "temporary-id") { outcome.set(it);done.countDown() }
+            }
+            // Wait for the actual send, then cancel before its website ID becomes available.
+            if (cancel) {
+                val sentDeadline = System.currentTimeMillis() + 12_000
+                while (evaluate(view, "sendCount") == "0" && System.currentTimeMillis() < sentDeadline) Thread.sleep(100)
+                assertEquals("1", evaluate(view, "sendCount"))
+                onMain { pool.cancelAutomation(service) }
+                val settled = CountDownLatch(1)
+                onMain { view.postDelayed({ settled.countDown() }, 5_000L) }
+                assertTrue(settled.await(8, TimeUnit.SECONDS))
+                assertNull(outcome.get())
+            } else {
+                assertTrue(done.await(30, TimeUnit.SECONDS))
+                assertEquals(outcome.get().toString(), assignId, outcome.get().success)
+                assertEquals("false", evaluate(view, "earlyBound"))
+                if (assignId) assertEquals("stable-id", evaluate(view, "window.__aiArenaRequests['temporary-id'].boundUserId"))
+            }
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun cancelledPendingKimiInputDoesNotPollOrCompleteDuringItsReplacement() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const editor=document.createElement('div');editor.contentEditable='true';
+                editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
+                editor.textContent='OLD DRAFT';editor.style='min-height:80px';document.querySelector('textarea').replaceWith(editor);
+                window.pastes=0;window.oldProbeReads=0;
+                editor.addEventListener('paste',e=>{
+                  e.preventDefault();pastes++;
+                  if(pastes===1) {
+                    const old=window.__aiArenaRequests['pending-a'];
+                    Object.defineProperty(old,'inputFailure',{get(){oldProbeReads++;return undefined;}});
+                  } else editor.textContent=e.clipboardData.getData('text/plain');
+                });
+                window.send=()=>{
+                  sendCount++;sentText=editor.innerText;editor.textContent='';
+                  const user=document.createElement('div');user.className='chat-content-item-user';
+                  user.setAttribute('data-conversation-turn-id','replacement-id');user.textContent=sentText;document.body.appendChild(user);
+                };true;
+            """.trimIndent())
+            val oldOutcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "QUESTION A", "pending-a") { oldOutcome.set(it) } }
+            val deadline = System.currentTimeMillis() + 12_000
+            while (evaluate(view, "pastes") == "0" && System.currentTimeMillis() < deadline) Thread.sleep(100)
+            assertEquals("1", evaluate(view, "pastes"))
+            val before = evaluate(view, "oldProbeReads").toInt()
+            val done = CountDownLatch(1)
+            val next = AtomicReference<SendOutcome>()
+            onMain {
+                pool.cancelAutomation(ArenaService.KIMI)
+                pool.sendPrompt(ArenaService.KIMI, "QUESTION B", "pending-b") { next.set(it);done.countDown() }
+            }
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(next.get().toString(), next.get().success)
+            assertNull(oldOutcome.get())
+            assertTrue("Only an already queued old probe may finish", evaluate(view, "oldProbeReads").toInt() <= before + 1)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("QUESTION B", evaluate(view, "sentText"))
+        }
+    }
+
+    private fun verifyKimiMultilinePaste(busyMillis: Int, cancel: Boolean = false, existingDraft: Boolean = false, singleLine: Boolean = false) {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.KIMI)
             evaluate(view, """
@@ -203,18 +352,29 @@ class ArenaParallelWebViewInstrumentedTest {
                 editor.contentEditable='true';editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
                 editor.style='white-space:pre-wrap;min-height:80px';old.replaceWith(editor);
                 window.pastes=0;window.pastedText='';
+                editor.textContent=$existingDraft ? 'OLD DRAFT MUST BE REPLACED' : '';
+                let editorSelection='';
+                // Model Lexical's committed selection independently of the DOM selection.
+                document.addEventListener('selectionchange',()=>{
+                  const selected=String(window.getSelection());
+                  setTimeout(()=>{editorSelection=selected;},40);
+                });
+                if ($existingDraft) editor.addEventListener('beforeinput',e=>{
+                  if(e.inputType==='insertText') e.preventDefault();
+                });
                 editor.addEventListener('paste',e=>{
                   e.preventDefault();pastes++;pastedText=e.clipboardData.getData('text/plain');
                   const until=Date.now()+$busyMillis;while(Date.now()<until){}
-                  setTimeout(()=>{editor.textContent=pastedText;},150);
+                  const replaced=(!$existingDraft || editorSelection===editor.textContent) ? pastedText : editor.textContent+pastedText;
+                  setTimeout(()=>{editor.textContent=replaced;},150);
                 });
                 window.send=()=>{
                   sendCount++;sentText=editor.innerText;
-                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','multiline');
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','multiline');
                   user.textContent=sentText;document.body.appendChild(user);editor.textContent='';
                 };true;
             """.trimIndent())
-            val prompt = "第一行 <不是 HTML>\n第二行 & 中文\n\n第四行"
+            val prompt = if (singleLine) "NEW SINGLE LINE QUESTION" else "第一行 <不是 HTML>\n第二行 & 中文\n\n第四行"
             if (cancel) evaluate(views.getValue(ArenaService.DEEPSEEK), """
                 window.send=()=>{
                   sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
@@ -315,7 +475,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 window.send=()=>{
                   window.sendCount++;const text=document.querySelector('textarea').value;document.querySelector('textarea').value='';
                   const until=Date.now()+15000;while(Date.now()<until){}
-                  const user=document.createElement('div');user.className='chat-content-item-user';
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);
                   user.setAttribute('data-conversation-turn-id','busy-accepted');user.textContent=text;document.body.appendChild(user);
                 };true;
             """.trimIndent())
@@ -365,7 +525,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 document.body.insertAdjacentHTML('beforeend','<div class="chat-content-item-user" data-conversation-turn-id="old">old question</div><div class="chat-content-item-assistant"><div class="markdown-container">old answer</div></div>');
                 window.send=()=>{
                   window.sendCount++;const text=document.querySelector('textarea').value;document.querySelector('textarea').value='';
-                  setTimeout(()=>{const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','new');user.textContent=text;document.body.appendChild(user);
+                  setTimeout(()=>{const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','new');user.textContent=text;document.body.appendChild(user);
                     const answer=document.createElement('div');answer.className='chat-content-item-assistant';answer.innerHTML='<div class="markdown-container">new complete answer</div><div class="segment-assistant-actions" style="height:30px"><button>Copy</button></div>';document.body.appendChild(answer);},4500);
                 };true;
             """.trimIndent())
@@ -390,7 +550,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 const old=document.querySelector('textarea');old.value='old restored draft';
                 setTimeout(()=>{const replacement=old.cloneNode(true);replacement.value='restored draft';old.replaceWith(replacement);window.editorReplaced=true;},1200);
                 window.send=()=>{window.sendCount++;window.sentText=document.querySelector('textarea').value;
-                  const user=document.createElement('div');user.className='chat-content-item-user';user.textContent=window.sentText;document.body.appendChild(user);document.querySelector('textarea').value='';};true;
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.textContent=window.sentText;document.body.appendChild(user);document.querySelector('textarea').value='';};true;
             """.trimIndent())
             val done = CountDownLatch(1)
             val outcome = AtomicReference<SendOutcome>()

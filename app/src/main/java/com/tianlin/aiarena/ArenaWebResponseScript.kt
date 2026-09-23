@@ -163,10 +163,10 @@ internal object ArenaWebResponseScript {
                 const userRows = rows.filter(function(row) { return !!row.querySelector('[data-send-message-boundary], [class*=bg-g-send]'); });
                 const user = state.expectedPrompt ? arenaFindRequestUser() : tagged || userRows.slice(Number(state.userBaseline || 0)).pop() || null;
                 if (user) {
+                  arenaBindRequestUser(user);
                   const index = rows.indexOf(user);
-                  const answerRow = rows.slice(index + 1).find(function(row) {
-                    return !row.querySelector('[data-send-message-boundary], [class*=bg-g-send]');
-                  });
+                  const next = rows[index + 1];
+                  const answerRow = next && !next.querySelector('[data-send-message-boundary], [class*=bg-g-send]') ? next : null;
                   // 深度思考 / 联网搜索会多出别的容器，正式回答只认不在思考容器里的 .md-box-root，多块按顺序拼
                   const boxes = answerRow ? Array.from(answerRow.querySelectorAll('.md-box-root')) : [];
                   thinkingUsed = thinkingIn(answerRow, '[class*=think], [class*=thought], [class*=reason]');
@@ -192,8 +192,10 @@ internal object ArenaWebResponseScript {
                   throw new Error(rejection === 'busy' ? ${ArenaJs.quote(ArenaKimiRejection.busyDetail)} : ${ArenaJs.quote(ArenaKimiRejection.membershipDetail)});
                 }
                 if (user) {
+                  arenaBindRequestUser(user);
                   let assistant = user.nextElementSibling;
-                  while (assistant && !String(assistant.className).includes('chat-content-item-assistant')) {
+                  while (assistant && !assistant.classList.contains('chat-content-item-assistant')) {
+                    if (assistant.classList.contains('chat-content-item-user')) { assistant = null; break; }
                     assistant = assistant.nextElementSibling;
                   }
                   thinkingUsed = thinkingIn(assistant, '.thinking-container, [class*=thinking], [class*=thought]');
@@ -374,6 +376,7 @@ internal object ArenaWebResponseScript {
                   ${ArenaWebModeScript.body(service)}
                 } catch (_) {}
                 if ($requireIdentity && !state.expectedPrompt && state.legacyAttachment !== true) throw new Error("本轮消息定位信息已丢失，请打开原网页核对；不会自动重复发送");
+                if ($requireIdentity && ${ArenaWebMessageIdentity.supported(service)} && state.expectedPrompt && !state.boundUserId) throw new Error("本轮消息尚未取得官网编号，请打开原网页核对；不会自动重复发送");
                 $serviceBody
                 const originalLength = text.length;
                 let truncated = originalLength > ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS};

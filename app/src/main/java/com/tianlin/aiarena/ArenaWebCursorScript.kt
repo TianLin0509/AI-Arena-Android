@@ -49,11 +49,8 @@ internal object ArenaWebCursorScript {
               ${ArenaWebMessageIdentity.helper(service)}
               if ($requireIdentity && !state.expectedPrompt) return false;
               const user = $latestUser;
-              if (!user) return false;
-              user.setAttribute('data-ai-arena-request', requestId);
-              state.bound = true;
-              state.boundUserId = arenaUserId(user);
-              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              if (!user || ($requireIdentity && !arenaUserId(user))) return false;
+              arenaBindRequestUser(user);
               return true;
             })();
         """.trimIndent()

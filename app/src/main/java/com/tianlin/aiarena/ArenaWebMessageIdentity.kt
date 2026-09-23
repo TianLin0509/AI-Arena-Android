@@ -29,8 +29,19 @@ internal object ArenaWebMessageIdentity {
           if (!state.expectedPrompt) return users.find(row => row.getAttribute('data-ai-arena-request') === requestId) || users.slice(Number(state.userBaseline || 0)).pop() || null;
           if (!state.submittedAt && !(window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) && !state.boundUserId && !state.bound) return null;
           const matches = users.filter(row => arenaUserText(row) === state.expectedPrompt);
-          const bound = matches.find(row => row.getAttribute('data-ai-arena-request') === requestId || (state.boundUserId && arenaUserId(row) === state.boundUserId));
-          if (bound) return bound;
+          // Once the website gives this request an identity, never drift to a later
+          // identical question or a copied DOM tag while its row is temporarily absent.
+          if (state.boundUserId) {
+            const pinned = matches.filter(row => arenaUserId(row) === state.boundUserId);
+            return pinned.length === 1 ? pinned[0] : null;
+          }
+          if (state.bound) {
+            const original = window.__aiArenaBoundUsers && window.__aiArenaBoundUsers[requestId];
+            return original && matches.includes(original) ? original : null;
+          }
+          const tagged = matches.filter(row => row.getAttribute('data-ai-arena-request') === requestId);
+          if (tagged.length === 1) return tagged[0];
+          if (tagged.length > 1) return null;
           const fresh = matches.filter(row => row.getAttribute('data-ai-arena-before') !== requestId && !(state.beforeUserIds || []).includes(arenaUserId(row)));
           if (fresh.length === 1 && (arenaUserId(fresh[0]) || !(state.beforeUserTexts || []).includes(state.expectedPrompt))) return fresh[0];
           const before = state.beforeUserTexts || [];
@@ -39,6 +50,17 @@ internal object ArenaWebMessageIdentity {
             if (arenaUserText(last) === state.expectedPrompt) return last;
           }
           return null;
+        };
+        const arenaBindRequestUser = user => {
+          user.setAttribute('data-ai-arena-request', requestId);
+          state.bound = true;
+          window.__aiArenaBoundUsers = window.__aiArenaBoundUsers || {};
+          window.__aiArenaBoundUsers[requestId] = user;
+          const id = arenaUserId(user);
+          if (id) state.boundUserId = id;
+          window.__aiArenaRequests = window.__aiArenaRequests || {};
+          window.__aiArenaRequests[requestId] = state;
+          try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
         };
         const arenaRecordSubmission = () => {
           state.submittedAt = Date.now();
