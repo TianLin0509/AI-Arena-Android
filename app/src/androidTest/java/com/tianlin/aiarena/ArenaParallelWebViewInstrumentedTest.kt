@@ -588,6 +588,213 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun freshSlowLoadRetainsASeparateHydratedEditorBudget() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val loaded = CountDownLatch(1)
+            val page = """
+                <textarea id="ssr" readonly></textarea><img src="/fresh-slow-resource">
+                <script>addEventListener('load',()=>setTimeout(()=>{
+                  document.querySelector('#ssr').outerHTML='<div class="tiptap ProseMirror" contenteditable="true"></div>';
+                  window.editorReplaced=true;
+                },1200));</script>
+            """.trimIndent()
+            onMain {
+                val production = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(v: WebView, url: String?, icon: android.graphics.Bitmap?) = production.onPageStarted(v, url, icon)
+                    override fun onPageFinished(v: WebView, url: String?) { loaded.countDown(); production.onPageFinished(v, url) }
+                    override fun shouldInterceptRequest(v: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse {
+                        if (request.url.path == "/fresh-slow-resource") {
+                            Thread.sleep(54_000L)
+                            return android.webkit.WebResourceResponse("image/png", "UTF-8", byteArrayOf().inputStream())
+                        }
+                        return android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+                    }
+                }
+            }
+            val dispatched = CountDownLatch(1)
+            val calls = AtomicInteger()
+            val gateway = object : ArenaGateway by pool {
+                override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+                    attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+                    if (service == ArenaService.DOUBAO) { calls.incrementAndGet(); dispatched.countDown() }
+                    callback(SendOutcome(false, requestId, "fixture stops at dispatch"))
+                }
+            }
+            lateinit var controller: ArenaSessionController
+            onMain { controller = ArenaSessionController(gateway); assertTrue(controller.startInitial("fresh slow load", members)) }
+            try {
+                assertFalse("A not-yet-loaded page cannot send", dispatched.await(3, TimeUnit.SECONDS))
+                assertTrue("Real subresource load must finish", loaded.await(60, TimeUnit.SECONDS))
+                assertTrue("Editor hydration gets its own budget after the 54 second load", dispatched.await(22, TimeUnit.SECONDS))
+                assertEquals("true", evaluate(view, "window.editorReplaced === true"))
+                assertEquals(1, calls.get())
+            } finally { onMain { controller.destroy() } }
+        }
+    }
+
+    @Test fun freshPageRejectsAssistantOnlyHistoryAndFailedUserPlaceholders() {
+        val pages = listOf(
+            ArenaService.KIMI to "<div class='chat-content-item-user awaiting-failure'>failed old prompt</div>",
+            ArenaService.KIMI to "<div class='chat-content-item-assistant'>old answer</div>",
+            ArenaService.DOUBAO to "<div data-target-id='message-box-target-id'><div data-reply-message>old answer</div></div>",
+            ArenaService.DEEPSEEK to "<div class='ds-virtual-list-visible-items'><div><div class='ds-message'><div class='ds-markdown ds-assistant-message-main-content'>old answer</div></div></div></div>",
+        )
+        for ((service, history) in pages) withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(service)
+            interceptFreshPage(view, "<textarea></textarea>$history")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertFalse("Restored history cannot become a new conversation: $service $history", ready.get())
+            assertTrue(evaluate(view, "document.body.innerText").contains("old"))
+        }
+    }
+
+    @Test fun freshEditorRejectsRestoredDraftWithoutChangingIt() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, "<textarea>unsent existing draft</textarea>")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(26, TimeUnit.SECONDS))
+            assertFalse("A root URL with an unsent draft is not fresh", ready.get())
+            assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun freshEditorWaitsForVisibleEnabledUniqueCurrentInput() {
+        for (body in listOf("<textarea disabled></textarea>", "<textarea readonly></textarea>",
+            "<div style='opacity:0'><textarea></textarea></div>", "<textarea></textarea><textarea></textarea>")) {
+            withPool(emptyMap()) { pool, views, _ ->
+                val view = views.getValue(ArenaService.DOUBAO)
+                interceptFreshPage(view, body)
+                val done = CountDownLatch(1)
+                val ready = AtomicBoolean(false)
+                onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+                assertFalse("Invalid input must not become ready: $body", done.await(4, TimeUnit.SECONDS))
+                evaluate(view, "document.body.innerHTML='<textarea id=live></textarea>'; true")
+                assertTrue(done.await(6, TimeUnit.SECONDS))
+                assertTrue(ready.get())
+                assertEquals("live", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+            }
+        }
+    }
+
+    @Test fun freshEditorCancellationSettlesWhileJavascriptCallbackIsMissing() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val calls = AtomicInteger()
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            onMain { pool.cancelAutomation(ArenaService.DOUBAO) }
+            assertTrue("Cancellation must not depend on a JavaScript callback", done.await(1, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+            onMain { view.held?.onReceiveValue("true") }
+            Thread.sleep(500)
+            assertEquals(1, calls.get())
+        }
+    }
+
+    @Test fun freshEditorLateTrueCannotBeatAnExpiredDeadline() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val method = ArenaWebViewPool::class.java.declaredMethods.single { it.name == "waitForFreshPage" }.apply { isAccessible = true }
+            onMain {
+                val generation = (field(pool, "navigationGenerations") as Map<*, *>)[ArenaService.DOUBAO]
+                method.invoke(pool, ArenaService.DOUBAO, view, generation, SystemClock.elapsedRealtime() + 300L,
+                    { value: Boolean -> ready.set(value); done.countDown() })
+            }
+            assertTrue(view.probed.await(2, TimeUnit.SECONDS))
+            Thread.sleep(500)
+            onMain { view.held?.onReceiveValue("true") }
+            assertTrue(done.await(1, TimeUnit.SECONDS))
+            assertFalse("An expired probe cannot grant permission to send", ready.get())
+        }
+    }
+
+    @Test fun freshEditorReplacedWebViewCannotAcceptLateTrue() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val original = views.getValue(ArenaService.DOUBAO)
+            val view = installHeldFreshView(pool, original)
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            onMain {
+                @Suppress("UNCHECKED_CAST")
+                val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+                map[ArenaService.DOUBAO] = views.getValue(ArenaService.KIMI)
+                view.held?.onReceiveValue("true")
+                map[ArenaService.DOUBAO] = view
+            }
+            assertTrue(done.await(1, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+        }
+    }
+
+    @Test fun freshEditorNativeWatchdogSettlesWithoutJavascriptReply() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val calls = AtomicInteger()
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            assertFalse(done.await(2, TimeUnit.SECONDS))
+            assertTrue("The independent editor budget must expire without any JS callback", done.await(23, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+            onMain { view.held?.onReceiveValue("true") }
+            Thread.sleep(500)
+            assertEquals(1, calls.get())
+        }
+    }
+
+    private fun interceptFreshPage(view: WebView, page: String) {
+        onMain {
+            val production = view.webViewClient
+            view.webViewClient = object : android.webkit.WebViewClient() {
+                override fun onPageStarted(v: WebView, url: String?, icon: android.graphics.Bitmap?) = production.onPageStarted(v, url, icon)
+                override fun onPageFinished(v: WebView, url: String?) = production.onPageFinished(v, url)
+                override fun shouldInterceptRequest(v: WebView, request: android.webkit.WebResourceRequest) =
+                    android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+            }
+        }
+    }
+
+    private class HeldFreshWebView(context: android.content.Context) : WebView(context) {
+        val probed = CountDownLatch(1)
+        var held: android.webkit.ValueCallback<String>? = null
+        override fun evaluateJavascript(script: String, callback: android.webkit.ValueCallback<String>?) {
+            if (script.contains("__aiArenaFreshPage")) { held = callback; probed.countDown() }
+            else super.evaluateJavascript(script, callback)
+        }
+    }
+
+    private fun installHeldFreshView(pool: ArenaWebViewPool, original: WebView): HeldFreshWebView {
+        lateinit var replacement: HeldFreshWebView
+        onMain {
+            replacement = HeldFreshWebView(original.context)
+            replacement.settings.javaScriptEnabled = true
+            replacement.webViewClient = original.webViewClient
+            @Suppress("UNCHECKED_CAST")
+            val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+            map[ArenaService.DOUBAO] = replacement
+            pool.container.removeView(original)
+            original.stopLoading(); original.destroy()
+            pool.container.addView(replacement, FrameLayout.LayoutParams(-1, -1))
+        }
+        interceptFreshPage(replacement, "<textarea></textarea>")
+        return replacement
+    }
+
     @Test fun freshPageWaitsForLateEditorHydrationUnderSharedBudget() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)

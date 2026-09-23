@@ -408,8 +408,8 @@ data class ControllerTiming(
     /** 控制器端到端兜底，须比网页池内部超时宽；测试可缩短以验证失联回调。 */
     val sendTimeoutMillis: Long = 60_000L,
     val attachmentSendTimeoutMillis: Long = 200_000L,
-    /** Covers a 45s owned navigation plus editor hydration and callback margin. */
-    val freshConversationTimeoutMillis: Long = 60_000L,
+    /** Covers the pool's bounded 85s fresh-page preparation plus callback margin. */
+    val freshConversationTimeoutMillis: Long = 90_000L,
 )
 
 object ArenaLimits {

@@ -230,6 +230,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     /** 等某个 WebView 完成一次由我们发起的加载；onPageFinished 时兑现。 */
     private val pendingLoads = mutableMapOf<ArenaService, (Boolean) -> Unit>()
+    private val pendingFreshPages = mutableMapOf<ArenaService, (Boolean) -> Unit>()
     private val navigationGenerations = mutableMapOf<ArenaService, Long>()
     private val navigationTargets = mutableMapOf<ArenaService, String>()
 
@@ -242,10 +243,34 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (ArenaWebMessageIdentity.supported(service)) {
             // A restored root URL is not evidence of an empty conversation. Start a navigation
             // owned by this request, then require an empty, hydrated editor on the root page.
-            val deadline = SystemClock.elapsedRealtime() + 55_000L
-            navigate(service, webView, service.url, timeoutMillis = 45_000L) { ok ->
-                if (!ok) callback(false)
-                else waitForFreshPage(service, webView, navigationGenerations[service], deadline, callback)
+            pendingFreshPages.remove(service)?.invoke(false)
+            val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
+            var deadline = hardDeadline
+            var settled = false
+            lateinit var complete: (Boolean) -> Unit
+            val watchdog = Runnable { complete(false) }
+            complete = { ok ->
+                if (!settled) {
+                    settled = true
+                    handler.removeCallbacks(watchdog)
+                    if (pendingFreshPages[service] === complete) pendingFreshPages.remove(service)
+                    callback(ok && !destroyed && webViews[service] === webView && SystemClock.elapsedRealtime() < deadline)
+                }
+            }
+            pendingFreshPages[service] = complete
+            handler.postDelayed(watchdog, hardDeadline - SystemClock.elapsedRealtime())
+            navigate(service, webView, service.url, timeoutMillis = 60_000L, freshOwner = complete) { ok ->
+                if (!settled) {
+                    if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
+                    else {
+                        // Slow page resources must not consume the editor's hydration window.
+                        // The native watchdog also covers a renderer that never returns JS results.
+                        deadline = minOf(hardDeadline, SystemClock.elapsedRealtime() + 20_000L)
+                        handler.removeCallbacks(watchdog)
+                        handler.postDelayed(watchdog, deadline - SystemClock.elapsedRealtime())
+                        waitForFreshPage(service, webView, navigationGenerations[service], deadline, complete)
+                    }
+                }
             }
             return
         }
@@ -262,9 +287,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         navigate(service, webView, url, callback = callback)
     }
 
-    private fun navigate(service: ArenaService, webView: WebView, url: String, timeoutMillis: Long = NAVIGATION_TIMEOUT_MS, callback: (Boolean) -> Unit) {
+    private fun navigate(service: ArenaService, webView: WebView, url: String, timeoutMillis: Long = NAVIGATION_TIMEOUT_MS,
+        freshOwner: ((Boolean) -> Unit)? = null, callback: (Boolean) -> Unit) {
         // 自动化进行中不能换页面：会把正在收的回答和在途的 JS 回调一起弄丢
         if (service in automations) return callback(false)
+        if (pendingFreshPages[service] !== freshOwner) pendingFreshPages.remove(service)?.invoke(false)
         pendingLoads.remove(service)?.invoke(false)
         navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
         navigationTargets[service] = url
@@ -315,17 +342,40 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         deadline: Long,
         callback: (Boolean) -> Unit,
     ) {
-        if (destroyed || navigationGenerations[service] != generation) return callback(false)
+        if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
+            SystemClock.elapsedRealtime() >= deadline) return callback(false)
+        // Fresh-page history is broader than accepted-user identity: failed user placeholders
+        // and assistant-only restored history must also prevent starting a new conversation.
+        val historySelector = when (service) {
+            ArenaService.DEEPSEEK -> ".ds-virtual-list-visible-items .ds-message"
+            ArenaService.DOUBAO -> "[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row], [data-reply-message]"
+            ArenaService.KIMI -> ".chat-content-item-user, .chat-content-item-assistant"
+            else -> "[data-ai-arena-request]"
+        }
         val probe = """
             (() => {
               ${selectorHelperScript()}
-              const input = arenaFirstMatch(${ArenaJs.quoteArray(promptInputSelectors(service))});
+              const candidates = [...new Set(${ArenaJs.quoteArray(promptInputSelectors(service))}.flatMap(selector => [...document.querySelectorAll(selector)]))];
+              const usable = candidates.filter(input => {
+                if (!input.isConnected || input.disabled || input.readOnly || input.matches(':disabled') || input.closest('[inert]')) return false;
+                if (!/^(TEXTAREA|INPUT)$/.test(input.tagName) && !input.isContentEditable) return false;
+                if (input.getAttribute('aria-disabled') === 'true' || input.getAttribute('aria-readonly') === 'true') return false;
+                const rect = input.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) return false;
+                for (let node = input; node; node = node.parentElement) {
+                  const style = getComputedStyle(node);
+                  if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+                }
+                return true;
+              });
+              const input = usable.length === 1 ? usable[0] : null;
+              const draft = input && String(/^(TEXTAREA|INPUT)$/.test(input.tagName) ? input.value : input.innerText).trim();
               const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
               const expected = ${ArenaJs.quote(service.url.trimEnd('/'))};
-              const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0;
+              const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
               if (${service == ArenaService.DOUBAO} && document.querySelector('[data-item-status=Pending], [data-item-status=Sending]') && root === expected) return 'restored_history';
               if (!empty && root === expected && document.readyState === 'complete') return 'restored_history';
-              if (!input || !empty || root !== expected || document.readyState !== 'complete') {
+              if (!input || draft || !empty || root !== expected || document.readyState !== 'complete') {
                 window.__aiArenaFreshPage = null; return false;
               }
               const previous = window.__aiArenaFreshPage;
@@ -336,7 +386,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             })();
         """.trimIndent()
         webView.evaluateJavascript(probe) { raw ->
-            if (destroyed || navigationGenerations[service] != generation) callback(false)
+            if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
+                SystemClock.elapsedRealtime() >= deadline) callback(false)
             else if (raw == "true") callback(true)
             else if (raw == "\"restored_history\"") callback(false)
             else if (SystemClock.elapsedRealtime() < deadline) handler.postDelayed({
@@ -529,6 +580,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val services = if (only == null) navigationGenerations.keys.toList() else listOf(only)
         services.forEach { service ->
             navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
+            pendingFreshPages.remove(service)?.invoke(false)
             pendingLoads.remove(service)?.let { pending ->
                 webViews[service]?.stopLoading()
                 pending(false)
@@ -1131,6 +1183,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         confirmedSignedIn.remove(service)
         explicitLoginProbeCounts.remove(service)
         sentSinceLoad.remove(service)
+        pendingFreshPages.remove(service)?.invoke(false)
         pendingLoads.remove(service)?.invoke(false)
         statuses[service] = ServiceStatus()
         container.removeView(webView)
@@ -1294,6 +1347,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         url = request.url.toString(),
                     )
                     pendingLoads.remove(service)?.invoke(false)
+                    pendingFreshPages.remove(service)?.invoke(false)
                 }
 
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -1308,6 +1362,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     webViews.remove(service)
                     confirmedSignedIn.remove(service)
                     sentSinceLoad.remove(service)
+                    pendingFreshPages.remove(service)?.invoke(false)
                     pendingLoads.remove(service)?.invoke(false)
                     container.removeView(view)
                     view.destroy()
