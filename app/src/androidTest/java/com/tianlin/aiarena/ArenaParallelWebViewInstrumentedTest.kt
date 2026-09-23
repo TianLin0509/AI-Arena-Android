@@ -214,7 +214,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(52, TimeUnit.SECONDS))
+            assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse(ready.get())
         }
     }
@@ -649,7 +649,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(52, TimeUnit.SECONDS))
+            assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse("Restored history cannot become a new conversation: $service $history", ready.get())
             assertTrue(evaluate(view, "document.body.innerText").contains("old"))
         }
@@ -662,7 +662,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(52, TimeUnit.SECONDS))
+            assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse("A root URL with an unsent draft is not fresh", ready.get())
             assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
         }
@@ -751,7 +751,7 @@ class ArenaParallelWebViewInstrumentedTest {
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
             assertTrue(view.probed.await(8, TimeUnit.SECONDS))
             assertFalse(done.await(2, TimeUnit.SECONDS))
-            assertTrue("The independent editor budget must expire without any JS callback", done.await(48, TimeUnit.SECONDS))
+            assertTrue("The independent editor budget must expire without any JS callback", done.await(90, TimeUnit.SECONDS))
             assertFalse(ready.get())
             onMain { view.held?.onReceiveValue("true") }
             Thread.sleep(500)
@@ -1149,7 +1149,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val fresh = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.KIMI) { fresh.set(it); done.countDown() } }
-            assertTrue(done.await(52, TimeUnit.SECONDS))
+            assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse("A root URL whose history hydrates later is not a fresh chat", fresh.get())
             val cancelled = CountDownLatch(1)
             val calls = AtomicInteger()

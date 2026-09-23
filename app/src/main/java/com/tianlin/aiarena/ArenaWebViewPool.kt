@@ -270,7 +270,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // owned by this request, then require an empty, hydrated editor on the root page.
             pendingFreshPages.remove(service)?.invoke(false)
             val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
-            var deadline = hardDeadline
+            val deadline = hardDeadline
             var settled = false
             lateinit var complete: (Boolean) -> Unit
             val watchdog = Runnable { complete(false) }
@@ -292,11 +292,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 if (!settled) {
                     if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
                     else {
-                        // Slow page resources must not consume the editor's hydration window.
-                        // The native watchdog also covers a renderer that never returns JS results.
-                        deadline = minOf(hardDeadline, SystemClock.elapsedRealtime() + 45_000L)
-                        handler.removeCallbacks(watchdog)
-                        handler.postDelayed(watchdog, deadline - SystemClock.elapsedRealtime())
+                        // The editor may mount 40+ s after load while other pages occupy the shared renderer
+                        // thread (2026-09-23), so it keeps the whole remaining budget. Waiting never sends;
+                        // the native watchdog still covers a renderer that never returns JS results.
                         waitForFreshPage(service, webView, navigationGenerations[service], deadline, complete)
                     }
                 }
