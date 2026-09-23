@@ -43,6 +43,8 @@ internal object ArenaMarkdownScript {
          */
         const arenaIsCitation = function(el) {
           if (!el || el.nodeType !== 1) return false;
+          // Literal numeric code is not a citation even when its font is smaller.
+          if (el.tagName === 'CODE' || (el.querySelector && el.querySelector('code'))) return false;
           if (el.querySelectorAll && el.querySelectorAll('*').length > 1) return false;
           const txt = (el.textContent || '').trim();
           if (!/^[0-9]{1,3}(?![\s\S])/.test(txt)) return false;
@@ -70,8 +72,10 @@ internal object ArenaMarkdownScript {
           return String(value).replace(/([\\`*~\[\]])/g, function(m) { return '\\' + m; });
         };
 
-        const arenaRtrim = function(value) {
-          return String(value).replace(/\s+(?![\s\S])/, '');
+        const arenaBacktickFence = function(value, minimum) {
+          const runs = String(value).match(/`+/g) || [];
+          const length = runs.reduce(function(size, run) { return Math.max(size, run.length + 1); }, minimum);
+          return '`'.repeat(length);
         };
 
         const arenaHidden = function(el) {
@@ -81,55 +85,82 @@ internal object ArenaMarkdownScript {
           return false;
         };
 
+        // Observed provider code-widget chrome, not answer text. Require a PRE
+        // belonging to the nearest widget; lookalike classes elsewhere stay intact.
+        const arenaCodeChrome = function(el) {
+          if (!el.matches || !el.closest || el.closest('pre') || el.querySelector('pre')) return false;
+          const widgets = '.md-code-block,.segment-code,.code-area';
+          const owner = el.closest(widgets);
+          if (!owner || !Array.from(owner.querySelectorAll('pre')).some(function(pre) { return pre.closest(widgets) === owner; })) return false;
+          return (owner.matches('.md-code-block') && el.matches('.md-code-block-banner-wrap')) ||
+            (owner.matches('.segment-code') && el.matches('.segment-code-header')) ||
+            (owner.matches('.code-area') && el.matches('[data-copy-ignore="true"]'));
+        };
+
         /** 行内内容 → Markdown。遇到块级标签直接跳过，交给 arenaSerialize 处理。 */
-        const arenaInline = function(node) {
-          let out = '';
+        const arenaInlineParts = function(node) {
+          const out = [];
+          const text = function(value) { if (value) out.push({ text: value, code: false }); };
           const kids = node.childNodes || [];
           for (let i = 0; i < kids.length; i++) {
             const child = kids[i];
             if (child.nodeType === 3) {
-              out += arenaEsc(String(child.nodeValue || '').replace(/\s+/g, ' '));
+              text(arenaEsc(String(child.nodeValue || '').replace(/\s+/g, ' ')));
               continue;
             }
             if (child.nodeType !== 1) continue;
             const tag = child.tagName;
-            if (arenaSkipTags[tag] || arenaHidden(child) || arenaSkipInline.test(tag)) continue;
+            if (arenaSkipTags[tag] || arenaHidden(child) || arenaCodeChrome(child) || arenaSkipInline.test(tag)) continue;
             if (arenaIsCitation(child)) {
-              out += arenaSuperscript((child.textContent || '').trim());
+              text(arenaSuperscript((child.textContent || '').trim()));
               continue;
             }
-            if (tag === 'BR') { out += '\n'; continue; }
+            if (tag === 'BR') { text('\n'); continue; }
             if (tag === 'CODE') {
-              const raw = (child.textContent || '').trim();
-              if (raw) out += '`' + raw.replace(/`/g, '') + '`';
+              const raw = String(child.textContent || '').replace(/\r\n?|\n/g, ' ');
+              if (raw) out.push({ text: raw, code: true });
               continue;
             }
-            if (tag === 'STRONG' || tag === 'B') {
+            if (tag === 'STRONG' || tag === 'B' || tag === 'EM' || tag === 'I' || tag === 'DEL' || tag === 'S' || tag === 'STRIKE') {
               const inner = arenaInline(child).trim();
-              if (inner) out += '**' + inner + '**';
-              continue;
-            }
-            if (tag === 'EM' || tag === 'I') {
-              const inner = arenaInline(child).trim();
-              if (inner) out += '*' + inner + '*';
-              continue;
-            }
-            if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') {
-              const inner = arenaInline(child).trim();
-              if (inner) out += '~~' + inner + '~~';
+              const marker = tag === 'STRONG' || tag === 'B' ? '**' : tag === 'EM' || tag === 'I' ? '*' : '~~';
+              if (inner) text(marker + inner + marker);
               continue;
             }
             if (tag === 'A') {
               const inner = arenaInline(child).trim();
               if (!inner) continue;
-              // DeepSeek 联网搜索的引用是文字为 "-1" / "3" 这类短数字的链接，按角标处理，别输出 [-1](https://…)
-              if (/^[-–]?[0-9]{1,3}$/.test(inner)) { out += arenaSuperscript(inner.replace(/[-–]/g, '')); continue; }
+              if (/^[-\u2013]?[0-9]{1,3}$/.test(inner)) { text(arenaSuperscript(inner.replace(/[-\u2013]/g, ''))); continue; }
               const href = child.getAttribute('href') || '';
-              out += /^https?:/i.test(href) ? ('[' + inner + '](' + href + ')') : inner;
+              if (/^https?:/i.test(href)) {
+                text('[' + inner + '](' + href + ')');
+              } else {
+                const nested = arenaInlineParts(child);
+                for (let j = 0; j < nested.length; j++) out.push(nested[j]);
+              }
               continue;
             }
             if (tag === 'IMG') continue;
-            out += arenaInline(child);
+            const nested = arenaInlineParts(child);
+            for (let j = 0; j < nested.length; j++) out.push(nested[j]);
+          }
+          return out;
+        };
+
+        const arenaInline = function(node) {
+          const parts = arenaInlineParts(node);
+          let out = '';
+          for (let i = 0; i < parts.length; i++) {
+            if (!parts[i].code) { out += parts[i].text; continue; }
+            let raw = parts[i].text;
+            // Adjacent code nodes render contiguously. One delimiter pair avoids
+            // merging closing/opening backticks into literal content in Markdown.
+            while (i + 1 < parts.length && parts[i + 1].code) raw += parts[++i].text;
+            const fence = arenaBacktickFence(raw, 1);
+            const edgeTicks = raw.charAt(0) === '`' || raw.charAt(raw.length - 1) === '`';
+            const edgeSpaces = raw.charAt(0) === ' ' && raw.charAt(raw.length - 1) === ' ' && /\S/.test(raw);
+            const padding = edgeTicks || edgeSpaces ? ' ' : '';
+            out += fence + padding + raw + padding + fence;
           }
           return out;
         };
@@ -150,8 +181,25 @@ internal object ArenaMarkdownScript {
 
         const arenaChildren = function(node, depth) {
           let out = '';
+          let inline = [];
+          const flush = function() {
+            // A childNodes view preserves the real DOM, event handlers and selection.
+            const text = arenaInline({ childNodes: inline }).trim();
+            if (text) out += text + '\n\n';
+            inline = [];
+          };
           const kids = node.childNodes || [];
-          for (let i = 0; i < kids.length; i++) out += arenaSerialize(kids[i], depth);
+          for (let i = 0; i < kids.length; i++) {
+            const child = kids[i];
+            if (child.nodeType === 1 && (arenaSkipTags[child.tagName] || arenaHidden(child) || arenaCodeChrome(child))) continue;
+            if (child.nodeType === 1 && arenaBlockTags.test(child.tagName)) {
+              flush();
+              out += arenaSerialize(child, depth);
+            } else {
+              inline.push(child);
+            }
+          }
+          flush();
           return out;
         };
 
@@ -174,7 +222,7 @@ internal object ArenaMarkdownScript {
           }
           if (node.nodeType !== 1) return '';
           const tag = node.tagName;
-          if (arenaSkipTags[tag] || arenaHidden(node)) return '';
+          if (arenaSkipTags[tag] || arenaHidden(node) || arenaCodeChrome(node)) return '';
 
           if (/^H[1-6](?![\s\S])/.test(tag)) {
             const text = arenaInline(node).trim();
@@ -191,9 +239,10 @@ internal object ArenaMarkdownScript {
             const holder = node.querySelector ? (node.querySelector('code') || node) : node;
             const classes = arenaClassOf(holder) + ' ' + arenaClassOf(node);
             const matched = classes.match(/language-([A-Za-z0-9+#._-]+)/);
-            const body = arenaRtrim(String(holder.innerText || holder.textContent || ''));
+            const body = String(holder.textContent || holder.innerText || '').replace(/\r\n?/g, '\n').replace(/\n+(?![\s\S])/, '');
             if (!body) return '';
-            return '```' + (matched ? matched[1] : '') + '\n' + body + '\n```\n\n';
+            const fence = arenaBacktickFence(body, 3);
+            return fence + (matched ? matched[1] : '') + '\n' + body + '\n' + fence + '\n\n';
           }
 
           if (tag === 'BLOCKQUOTE') {
@@ -262,10 +311,8 @@ internal object ArenaMarkdownScript {
         const arenaToMarkdown = function(node) {
           if (!node) return '';
           try {
-            const markdown = arenaSerialize(node, 0)
-              .replace(/[ \t]+\n/g, '\n')
-              .replace(/\n{3,}/g, '\n\n')
-              .trim();
+            // Global whitespace cleanup would corrupt code strings and blank lines.
+            const markdown = arenaSerialize(node, 0).trim();
             if (markdown) return markdown;
           } catch (_) {}
           return String(node.innerText || node.textContent || '').trim();

@@ -119,6 +119,25 @@ internal object ArenaWebResponseScript {
                 const user = tagged || items.filter(function(row) {
                   return !row.querySelector('.ds-markdown') && clean(row.innerText || row.textContent || '').length > 0;
                 }).pop();
+                // Observed 2026-09-23: server refusal is a sibling of the user's
+                // message inside that tagged turn, with a warning retry control.
+                // Do not interpret quoted text, older turns or hidden notices.
+                if (tagged && items.includes(tagged)) {
+                  const refusalVisible = function(node) {
+                    if (!isVisible(node)) return false;
+                    for (let parent = node; parent; parent = parent.parentElement) {
+                      const style = getComputedStyle(parent);
+                      if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+                    }
+                    return true;
+                  };
+                  const warning = tagged.querySelector('.ds-message .ds-button--warning');
+                  const busy = Array.from(tagged.querySelectorAll('._11d6b3a ._1ce76f5')).some(function(node) {
+                    return !node.closest('.ds-message,.ds-markdown,.ds-think-content') && refusalVisible(node) &&
+                      /^Server busy, please try again later\.(?![\s\S])/i.test(clean(node.innerText || ''));
+                  });
+                  if (warning && refusalVisible(warning) && busy) throw new Error('DeepSeek 官网当前繁忙，本轮未取得回答；请稍后到原网页核对，不会自动重复发送');
+                }
                 // 2026-09 的 DeepSeek 页面：深度思考的内容也是 .ds-markdown，只是包在 .ds-think-content 里；
                 // 正式回答带 .ds-assistant-message-main-content。原来取行内第一个 .ds-markdown，
                 // 开了深度思考就永远抓到思考过程，真正的回答一个字都没存（用户反馈 2026-09-05）。

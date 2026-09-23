@@ -308,6 +308,106 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertFalse(payload.getBoolean("streaming"))
     }
 
+    @Test
+    fun doubaoMixedContainerPreservesInlineCodeAndTextContinuity() {
+        val result = evaluateMarkdown("""<div class="container-fBOrXO"><div class="container-enLQFx">START<div></div>
+            网页收到一条<code>{"status":"running"}</code>的消息。</div><div class="container-enLQFx">末段<code>输入不符合规范</code>是提示。<div></div>END</div></div>""")
+        assertEquals("START\n\n网页收到一条`{\"status\":\"running\"}`的消息。\n\n末段`输入不符合规范`是提示。\n\nEND", result)
+    }
+
+    @Test
+    fun mixedInlineRunsKeepFormattingAroundNestedBlocks() {
+        val result = evaluateMarkdown("""<div>前<code>x</code><strong>粗体</strong><a href="https://example.test/">链接</a><br>后<ul><li>条目<code>y</code></li></ul>尾<em>强调</em><blockquote>引<code>z</code><div>子块</div>末</blockquote></div>""")
+        assertEquals("前`x`**粗体**[链接](https://example.test/)\n后\n\n- 条目`y`\n\n尾*强调*\n\n> 引`z`\n>\n> 子块\n>\n> 末", result)
+    }
+
+    @Test
+    fun codeBlockRetainsInternalBlankLinesSpacesAndBackticks() {
+        val code = "def f():\n    text = \"\"\"a  \n\n\nb\"\"\"\n    return text\n# ```literal```"
+        val result = evaluateMarkdown("<div>前<pre><code class='language-python'>$code</code></pre>后</div>")
+        val block = ArenaMarkdown.parse(result).filterIsInstance<ArenaMdBlock.Code>().single()
+        assertEquals("python", block.language)
+        assertEquals(code, block.code)
+        assertEquals("后", (ArenaMarkdown.parse(result).last() as ArenaMdBlock.Paragraph).text)
+    }
+
+    @Test
+    fun inlineCodeRoundTripsLiteralBackticksAndEdgeSpaces() {
+        assertEquals("数`42`和`7`", evaluateMarkdown("<div style='font-size:20px'>数<code style='font-size:12px'>42</code>和<span style='font-size:12px'><code>7</code></span></div>"))
+        val result = evaluateMarkdown("<div>前<code>`x`</code><div></div>后<code> a  b </code></div>")
+        assertEquals(listOf("`x`", " a  b "), ArenaMarkdown.parse(result).filterIsInstance<ArenaMdBlock.Paragraph>()
+            .flatMap { ArenaMarkdown.inline(it.text) }.filter { it.code }.map { it.text })
+    }
+
+    @Test
+    fun adjacentInlineCodeDoesNotCreateDelimiterCharacters() {
+        val result = evaluateMarkdown("<div>前<code>x</code><code>y</code>中<span><code>a</code></span><code>b</code>后</div>")
+        assertEquals("前`xy`中`ab`后", result)
+        assertEquals("前xy中ab后", ArenaMarkdown.plainText(result))
+        assertEquals("前`xy`后", evaluateMarkdown("<div>前<a href='#local'><code>x</code></a><code>y</code>后</div>"))
+    }
+
+    @Test
+    fun citationEnDashRemainsDistinctFromQuestionMarkLinks() {
+        val result = evaluateMarkdown("<div><a href='https://example.test/'>\u20133</a><a href='https://example.test/'>?3</a></div>")
+        assertEquals("³[?3](https://example.test/)", result)
+    }
+
+    @Test
+    fun providerCodeHeadersAreExcludedWithoutDroppingLiteralAnswerText() {
+        val widgets = listOf(
+            "<div class='md-code-block'><div class='md-code-block-banner-wrap'><div class='md-code-block-banner'>python<div role='button'>Copy</div><div role='button'>Download</div></div></div><pre>Copy\n运行</pre></div>",
+            "<div class='segment-code'><div class='sticky-release'><header class='segment-code-header'><span>Python</span>Copy</header></div><div class='segment-code-content'><pre><code>Copy\n运行</code></pre></div></div>",
+            "<div class='code-area'><div data-copy-ignore='true'>python 运行 Copy</div><div class='code-content'><pre><code>Copy\n运行</code></pre></div></div>",
+        )
+        for (widget in widgets) {
+            assertEquals("Copy 运行\n\n```\nCopy\n运行\n```\n\nDownload", evaluateMarkdown("<p>Copy 运行</p>" + widget + "<p>Download</p>"))
+        }
+    }
+
+    @Test
+    fun codeHeaderLookalikesOutsideWidgetsRemainAnswerContent() {
+        assertEquals("Copy\n\n运行\n\nDownload", evaluateMarkdown("<div class='md-code-block-banner-wrap'>Copy</div><div data-copy-ignore='true'>运行</div><div class='segment-code-header'>Download</div>"))
+        assertEquals("Copy", evaluateMarkdown("<div class='md-code-block'><div class='md-code-block-banner-wrap'>Copy</div></div>"))
+    }
+
+    @Test
+    fun codeHeaderContainmentCannotDiscardCodeOrNestedWidgetProse() {
+        assertEquals("```\nCopy\n```", evaluateMarkdown("<div class='md-code-block'><div class='md-code-block-banner-wrap'><pre>Copy</pre></div></div>"))
+        assertEquals("```\nCopy 运行\n```", evaluateMarkdown("<div class='code-area'><pre><span data-copy-ignore='true'>Copy 运行</span></pre></div>"))
+        assertEquals("Copy\n\n```\nx\n```", evaluateMarkdown("<div class='md-code-block'><div class='md-code-block-banner-wrap'>Copy</div><div class='segment-code'><pre>x</pre></div></div>"))
+    }
+
+    @Test
+    fun deepSeekCurrentRequestBusyRefusalIsExplicit() {
+        val result = evaluate(ArenaService.DEEPSEEK, "busy_current", "<div class='ds-virtual-list-visible-items' style='width:360px'><div><div class='ds-message'>问题<div role='button' class='ds-button--warning'>重试</div></div><div class='_11d6b3a'><span class='_1ce76f5'>Server busy, please try again later.</span></div></div></div>")
+        assertTrue(result.toString(), result.has("error"))
+        assertTrue(result.getString("error").contains("DeepSeek 官网当前繁忙"))
+        assertFalse(result.getBoolean("found"))
+    }
+
+    @Test
+    fun deepSeekBusyTextInQuestionOrOldRequestDoesNotRejectCurrentAnswer() {
+        val result = evaluate(ArenaService.DEEPSEEK, "busy_old", "<div class='ds-virtual-list-visible-items' style='width:360px'><div><div class='ds-message'>旧问题<div role='button' class='ds-button--warning'>重试</div></div><div class='_11d6b3a'><span class='_1ce76f5'>Server busy, please try again later.</span></div></div><div><div class='ds-message'><span class='_1ce76f5'>Server busy, please try again later.</span></div></div><div><div class='ds-markdown'>当前回答</div><div style='height:32px'><button class='ds-button--icon'>复制</button></div></div></div>")
+        assertFalse(result.has("error"))
+        assertEquals("当前回答", result.getString("text"))
+    }
+
+    @Test
+    fun deepSeekHiddenBusyRefusalDoesNotRejectCurrentRequest() {
+        for (hiddenStyle in listOf("display:none", "visibility:hidden", "opacity:0")) {
+            val result = evaluate(ArenaService.DEEPSEEK, "busy_hidden", "<div class='ds-virtual-list-visible-items' style='width:360px'><div><div class='ds-message'>问题<div role='button' class='ds-button--warning'>重试</div></div><div class='_11d6b3a' style='$hiddenStyle'><span class='_1ce76f5'>Server busy, please try again later.</span></div></div></div>")
+            assertFalse(result.has("error"))
+        }
+    }
+
+    private fun evaluateMarkdown(body: String): String = evaluate(
+        ArenaService.DOUBAO, "markdown_mixed",
+        "<div class='v_list_row' data-observe-row><div class='bg-g-send'>用户问题</div></div>" +
+            "<div class='v_list_row' data-observe-row><div class='md-box-root'>$body</div>" +
+            "<div class='message-action-bar' style='height:32px'><button>复制</button></div></div>",
+    ).getString("text")
+
     private fun evaluate(service: ArenaService, requestId: String, bodyHtml: String): JSONObject {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val result = AtomicReference<JSONObject>()

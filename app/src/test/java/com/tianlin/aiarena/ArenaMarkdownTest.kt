@@ -158,4 +158,24 @@ class ArenaMarkdownTest {
         assertEquals(3, table.header.size)
         assertEquals(listOf(listOf("1")), table.rows)
     }
+
+    @Test
+    fun inlineCodeSupportsExactLengthBacktickDelimiters() {
+        val spans = ArenaMarkdown.inline("前`` `x` ``中``` a``b ```后")
+        assertEquals(listOf("`x`", "a``b"), spans.filter { it.code }.map { it.text })
+        assertEquals("前`x`中a``b后", spans.joinToString("") { it.text })
+    }
+
+    @Test
+    fun inlineCodePreservesInteriorAndPaddedEdgeSpaces() {
+        assertEquals(listOf(" a  b ", "   ", "a b"),
+            ArenaMarkdown.inline("`  a  b  `与`   `与`a\nb`").filter { it.code }.map { it.text })
+    }
+
+    @Test
+    fun unmatchedBacktickRunStaysLiteral() {
+        val spans = ArenaMarkdown.inline("保留``abc`未闭合")
+        assertEquals("保留``abc`未闭合", spans.joinToString("") { it.text })
+        assertTrue(spans.none { it.code })
+    }
 }
