@@ -22,6 +22,7 @@ class ArenaMessageIdentityInstrumentedTest {
             <div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="user-new"><div class="bg-g-send"><p>本轮问题</p></div></div></div>
             <div data-target-id="message-box-target-id"><div data-reply-message="true"><div data-message-id="answer-new"><div class="md-box-root">本轮完整答案</div></div><div class="message-action-bar" style="height:30px"><button>Copy</button></div></div></div>
         """))
+        js(view, "${ArenaReactFixture.script}fixtureDoubaoMessage(document.querySelector('[data-target-id=message-box-target-id]'),'本轮问题');true")
         submit(view, ArenaService.DOUBAO)
         assertEquals("true", js(view, ArenaWebCursorScript.bind(ArenaService.DOUBAO, request)))
         val response = JSONObject(js(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, request)))
@@ -134,6 +135,7 @@ class ArenaMessageIdentityInstrumentedTest {
         val selector = if (service == ArenaService.KIMI) ".chat-content-item-user" else "[data-message-id]"
         val attribute = if (service == ArenaService.KIMI) "data-conversation-turn-id" else "data-message-id"
         js(view, "document.querySelector('$selector').setAttribute('$attribute','assigned-later');document.body.insertAdjacentHTML('beforeend'," + JSONObject.quote(answer(service, "OWN ANSWER")) + ");true")
+        if (service == ArenaService.DOUBAO) js(view, "fixtureDoubaoMessage(document.querySelector('[data-target-id=message-box-target-id]'),'current question');true")
         assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true)))
         assertEquals("OWN ANSWER", response(view, service).getString("text"))
         html(view, user(service, "replacement", "current question") + answer(service, "REPLACEMENT ANSWER"))
@@ -143,7 +145,8 @@ class ArenaMessageIdentityInstrumentedTest {
 
     @Test fun unnumberedBoundRowCannotBecomeAnotherIdenticalMessage() = bothIdentityProviders { view, service ->
         prepare(view, service, "current question")
-        html(view, user(service, "", "current question"))
+        // Only the legacy DOM protocol supports an unnumbered object-bound receipt.
+        html(view, if (service == ArenaService.DOUBAO) """<div class="v_list_row" data-observe-row><span class="bg-g-send">current question</span></div>""" else user(service, "", "current question"))
         submit(view, service)
         assertEquals("true", js(view, ArenaWebCursorScript.bind(service, request)))
         html(view, user(service, "other", "current question") + answer(service, "OTHER ANSWER"))
@@ -162,7 +165,10 @@ class ArenaMessageIdentityInstrumentedTest {
     private fun bothIdentityProviders(block: (WebView, ArenaService) -> Unit) {
         listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { service -> page { block(it, service) } }
     }
-    private fun html(view: WebView, body: String) { js(view, "document.body.innerHTML=" + JSONObject.quote(body)) }
+    private fun html(view: WebView, body: String) {
+        js(view, "document.body.innerHTML=" + JSONObject.quote(body))
+        js(view, "${ArenaReactFixture.script}document.querySelectorAll('[data-send-message-boundary]').forEach(boundary=>fixtureDoubaoMessage(boundary.closest('[data-target-id=message-box-target-id]'),boundary.textContent));true")
+    }
     private fun user(service: ArenaService, id: String, text: String): String = when (service) {
         ArenaService.KIMI -> """<div class="chat-content-item-user" data-conversation-turn-id="$id">$text</div>"""
         else -> """<div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="$id">$text</div></div>"""

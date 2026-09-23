@@ -17,7 +17,9 @@ internal object ArenaWebMessageIdentity {
 
     fun helper(service: ArenaService): String = """
         const arenaNormalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        ${if (service == ArenaService.DOUBAO) doubaoRawTextHelper else ""}
         const arenaUserText = row => {
+          ${if (service == ArenaService.DOUBAO) "const raw = arenaDoubaoRawText(row); if (raw.present) return raw.valid ? arenaNormalize(raw.text) : '';" else ""}
           const body = row.querySelector('${if (service == ArenaService.DEEPSEEK) ".ds-message .ds-collapsible-text" else "[class*=bg-g-send], .user-content__text, .segment-content"}') || row;
           const copy = body.cloneNode(true);
           copy.querySelectorAll('button, [role=button], [class*=actions], [class*=action-bar], img').forEach(n => n.remove());
@@ -26,6 +28,14 @@ internal object ArenaWebMessageIdentity {
           return arenaNormalize(copy.textContent);
         };
         const arenaUserId = row => ${if (service == ArenaService.DEEPSEEK) "row.getAttribute('data-virtual-list-item-key') || ''" else "row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || row.id || ''"};
+        const arenaMatchesRequestUser = row => {
+          ${if (service == ArenaService.DOUBAO) """
+          const raw = arenaDoubaoRawText(row);
+          if (raw.present) return raw.valid && typeof state.expectedRawPrompt === 'string' &&
+            arenaNormalize(raw.text) === state.expectedPrompt && raw.text.replace(/\r\n/g, '\n').trim() === state.expectedRawPrompt;
+          """.trimIndent() else ""}
+          return arenaUserText(row) === state.expectedPrompt;
+        };
         const arenaRequestScopeValid = () => {
           ${if (service == ArenaService.DEEPSEEK) """
           if (state.expectedPrompt && state.legacyAttachment !== true) {
@@ -51,7 +61,7 @@ internal object ArenaWebMessageIdentity {
           const users = ${users(service)};
           if (!state.expectedPrompt) return users.find(row => row.getAttribute('data-ai-arena-request') === requestId) || users.slice(Number(state.userBaseline || 0)).pop() || null;
           if (!state.submittedAt && !(window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) && !state.boundUserId && !state.bound) return null;
-          const matches = users.filter(row => arenaUserText(row) === state.expectedPrompt);
+          const matches = users.filter(arenaMatchesRequestUser);
           // Once the website gives this request an identity, never drift to a later
           // identical question or a copied DOM tag while its row is temporarily absent.
           if (state.boundUserId) {
@@ -70,7 +80,7 @@ internal object ArenaWebMessageIdentity {
           const before = state.beforeUserTexts || [];
           if (users.length === before.length + 1 && before.every((text, i) => arenaUserText(users[i]) === text)) {
             const last = users[users.length - 1];
-            if (arenaUserText(last) === state.expectedPrompt) return last;
+            if (arenaMatchesRequestUser(last)) return last;
           }
           return null;
         };
@@ -91,6 +101,52 @@ internal object ArenaWebMessageIdentity {
           try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
           window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
           window.__aiArenaSendClicks[requestId] = state.submittedAt;
+        };
+    """.trimIndent()
+
+    private val doubaoRawTextHelper: String get() = """
+        ${ArenaAttachmentScript.reactHelpers}
+        const arenaDoubaoRawCache = new Map();
+        const arenaDoubaoRawText = row => {
+          if (arenaDoubaoRawCache.has(row)) return arenaDoubaoRawCache.get(row);
+          const save = value => { arenaDoubaoRawCache.set(row, value); return value; };
+          const boundaries = row.querySelectorAll('[data-send-message-boundary]');
+          if (!boundaries.length) return save({present:false});
+          if (boundaries.length !== 1) return save({present:true,valid:false});
+          const boundary = boundaries[0];
+          if (!Object.keys(boundary).some(key => key.startsWith('__reactFiber${'$'}'))) {
+            // Even visually plain Markdown can have decoded entities or escapes.
+            // A modern bubble without its original message is not a raw receipt.
+            return save({present:true,valid:false});
+          }
+          // Only read committed React props owned by this exact DOM row. The attached
+          // fiber can point at the stale alternate after a render or shared bailout.
+          const path = currentReactPath(boundary);
+          const ownerEnd = path ? path.findIndex(fiber => fiber.stateNode === row) : -1;
+          if (ownerEnd < 0) return save({present:true,valid:false});
+          const id = arenaUserId(row);
+          if (!id) return save({present:true,valid:false});
+          const messages = [];
+          for (const fiber of path.slice(0, ownerEnd)) {
+            const props = fiber.memoizedProps;
+            for (const message of [props && props.message, props && props.value && props.value.message]) {
+              if (message && !messages.includes(message)) messages.push(message);
+            }
+          }
+          if (!messages.length) return save({present:true,valid:false});
+          let text = null;
+          for (const message of messages) {
+            // Observed Doubao text-message schema; do not substitute TTS, a rendered
+            // snippet, unknown blocks, or a parent conversation's other message.
+            const blocks = message.content_blocks;
+            if (message.message_id !== id || !Array.isArray(blocks) || blocks.length !== 1 ||
+                blocks.some(block => !block || block.block_type !== 10000 || block.is_deleted === true ||
+                  !block.content_obj || typeof block.content_obj.text !== 'string')) return save({present:true,valid:false});
+            const candidate = blocks[0].content_obj.text;
+            if (text !== null && text !== candidate) return save({present:true,valid:false});
+            text = candidate;
+          }
+          return save({present:true,valid:true,text});
         };
     """.trimIndent()
 }

@@ -43,6 +43,34 @@ class ArenaParallelWebViewInstrumentedTest {
     private val members = ArenaService.defaultMembers
     private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
 
+    @Test fun doubaoRenderedMarkdownPromptConfirmsOneSubmissionUsingOriginalMessage() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val prompt = "Keep `x` exactly.\n```python\n    return 7\n```"
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;sentText=document.querySelector('textarea').value;
+                  document.querySelector('textarea').value='';
+                  setTimeout(()=>{
+                    const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                    row.innerHTML='<div data-send-message-boundary data-message-id="markdown-question"><div class="bg-g-send"><div class="md-box-root"><p>Keep <code>x</code> exactly.</p><pre><code>    return 7</code></pre></div><span>展开全部</span></div></div>';
+                    document.body.appendChild(row);fixtureDoubaoMessage(row,sentText);
+                    document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-reply-message><div class="md-box-root">Strict raw receipt answer</div></div><div class="message-action-bar" style="height:30px">Copy</div></div>');
+                  },1800);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, prompt, "raw-markdown-pool") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(22, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals(prompt, evaluate(view, "sentText"))
+            val answer = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, "raw-markdown-pool", requireIdentity = true)))
+            assertEquals("Strict raw receipt answer", answer.getString("text"))
+        }
+    }
+
     @Test fun kimiVisibleBusyDialogIsExplicitFailureWithoutResubmission() = verifyKimiBusyDialog(false)
 
     @Test fun kimiHiddenBusyDialogAndQuotedBodyDoNotRejectAcceptedQuestion() = verifyKimiBusyDialog(true)
@@ -116,7 +144,7 @@ class ArenaParallelWebViewInstrumentedTest {
                     requestAnimationFrame(()=>{
                       const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
                       row.innerHTML='<div data-send-message-boundary data-message-id="accepted-queue">queued question</div>';
-                      document.body.appendChild(row);pending.remove();
+                      document.body.appendChild(row);fixtureDoubaoMessage(row,'queued question');pending.remove();
                     });
                   },18000);
                 };true;
@@ -172,6 +200,7 @@ class ArenaParallelWebViewInstrumentedTest {
                     const body=document.createElement('div');body.setAttribute('data-send-message-boundary','');body.setAttribute('data-message-id','cold');body.textContent=sentText;user.appendChild(body);
                   }
                   document.body.appendChild(user);
+                  if (${service == ArenaService.DOUBAO}) fixtureDoubaoMessage(user,sentText);
                 };
                 if ($loginVisible) {const login=document.createElement('button');login.textContent='Log in';document.body.appendChild(login);}
                 true;
@@ -370,7 +399,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   if ($assignId) setTimeout(()=>{
                     if ($remount) {const replacement=row.cloneNode(true);row.replaceWith(replacement);row=replacement;}
                     if (${service == ArenaService.KIMI}) row.setAttribute('data-conversation-turn-id','stable-id');
-                    else row.firstElementChild.setAttribute('data-message-id','stable-id');
+                    else {row.firstElementChild.setAttribute('data-message-id','stable-id');fixtureDoubaoMessage(row,sentText);}
                   },4000);
                 };true;
             """.trimIndent())
@@ -676,7 +705,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val view = views.getValue(ArenaService.DOUBAO)
             val page = """
                 <textarea>navigation question</textarea><button id="flow-end-msg-send" onclick="sessionStorage.setItem('duplicateClicks',String(Number(sessionStorage.getItem('duplicateClicks')||0)+1))">Send</button>
-                <script>setTimeout(()=>{document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="new"><span class="bg-g-send">navigation question</span></div></div>');},5000);</script>
+                <script>${ArenaReactFixture.script}setTimeout(()=>{document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="new"><span class="bg-g-send">navigation question</span></div></div>');fixtureDoubaoMessage(document.querySelector('[data-target-id=message-box-target-id]'),'navigation question');},5000);</script>
             """.trimIndent()
             onMain {
                 val productionClient = view.webViewClient
@@ -870,7 +899,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   const input=document.querySelector('textarea');window.sentText=input.value;window.sendCount++;input.value='';
                   const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
                   const user=document.createElement('div');user.setAttribute('data-send-message-boundary','');user.setAttribute('data-message-id','plain-accepted');
-                  user.textContent=sentText;row.appendChild(user);document.body.appendChild(row);
+                  user.textContent=sentText;row.appendChild(user);document.body.appendChild(row);fixtureDoubaoMessage(row,sentText);
                 };true;
             """.trimIndent())
             listOf(doubao, kimi).forEach { view -> evaluate(view, "const sendButton=document.querySelector('.send-msg-btn');window.sendTrusted=null;sendButton.addEventListener('click',e=>sendTrusted=e.isTrusted,true);true") }

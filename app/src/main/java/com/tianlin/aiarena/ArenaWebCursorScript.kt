@@ -26,7 +26,8 @@ internal object ArenaWebCursorScript {
                 userBaseline,
                 startedAt: Date.now(),
                 initialUrl: location.href,
-                expectedPrompt: ${ArenaJs.quote(prompt)}.replace(/\s+/g, ' ').trim()
+                expectedPrompt: ${ArenaJs.quote(prompt)}.replace(/\s+/g, ' ').trim(),
+                expectedRawPrompt: ${ArenaJs.quote(prompt)}.replace(/\r\n/g, '\n').trim()
               };
               ${if (service == ArenaService.DEEPSEEK) """
               // DeepSeek virtual keys are local to a document, unlike a server UUID.
