@@ -36,7 +36,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ArenaService.entries.forEach { service -> put(service, ServiceStatus()) }
     }
 
-    val container: FrameLayout = FrameLayout(activity).apply {
+    /** True while pages are drawn only for the websites' own frame-driven work; the user cannot see them. */
+    private var blockUserTouches = true
+
+    val container: FrameLayout = object : FrameLayout(activity) {
+        // A see-through page below blank Compose areas must not receive the user's taps.
+        // Automation touches are dispatched to the WebView directly and are unaffected.
+        override fun onInterceptTouchEvent(event: android.view.MotionEvent): Boolean = blockUserTouches
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouchEvent(event: android.view.MotionEvent): Boolean = blockUserTouches
+    }.apply {
         setBackgroundColor(Color.WHITE)
         visibility = View.GONE
         isClickable = false
@@ -78,6 +87,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      * 销毁会让已经生成一半的回答直接丢失，而且清掉登录确认后连"重发"都会失败。
      */
     private var protectedServices: Set<ArenaService> = emptySet()
+    /** Pages whose answer is being polled (rounds, single retries, summaries) stay drawn until shortly after. */
+    private val readingUntil = mutableMapOf<ArenaService, Long>()
     @SuppressLint("MissingOnRenderProcessGone")
     private val destroyedWebViewClient = object : WebViewClient() {
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean = true
@@ -135,19 +146,32 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         else handler.post { drainBackgroundProbes() }
     }
 
-    /** Keep each uploading page laid out; only a short input/touch action borrows the front surface. */
+    /**
+     * Keep every page taking part in the current round laid out; only a short input/touch action
+     * borrows the front surface. A GONE WebView still reports `visibilityState=visible`, but a page
+     * that changes every frame only gets ~8 animation frames/s instead of ~35 when VISIBLE, whatever
+     * the alpha or stacking (measured 2026-09-23, emulator). Doubao mounts its editor and advances its
+     * send status on frames, so round members stay VISIBLE (alpha 0.01) until the round ends. A parked
+     * page is never front. Pages still share one renderer thread, so this removes only the GONE penalty.
+     */
     private fun refreshVisibility() {
         if (destroyed) return
-        val front = focusAction?.service ?: uiSelectedService ?: backgroundProbeService ?: automations.keys.firstOrNull()
+        val front = focusAction?.service ?: uiSelectedService ?: backgroundProbeService
+            ?: automations.entries.firstOrNull { !it.value.parked }?.key ?: pendingFreshPages.keys.firstOrNull()
+        val live = ArenaService.entries.filter { candidate ->
+            candidate == front || candidate == uiSelectedService || candidate in automations ||
+                candidate == backgroundProbeService || candidate in pendingFreshPages || candidate in protectedServices ||
+                (readingUntil[candidate] ?: 0L) > SystemClock.elapsedRealtime()
+        }.toSet()
         val hidden = focusAction != null || uiSelectedService == null
-        container.visibility = if (front == null) View.GONE else View.VISIBLE
+        blockUserTouches = hidden
+        container.visibility = if (live.none { it in webViews }) View.GONE else View.VISIBLE
         container.alpha = if (hidden) 0.01f else 1f
         container.isClickable = front != null && !hidden
         container.isFocusable = front != null && !hidden
         ArenaService.entries.forEach { candidate ->
             val webView = webViews[candidate]
-            val active = candidate == front || candidate == uiSelectedService || candidate in automations || candidate == backgroundProbeService
-            val visible = active && automations[candidate]?.parked != true
+            val visible = candidate in live
             if (webView != null) updateWebViewInteraction(candidate, webView, visible)
             webView?.visibility = if (visible) View.VISIBLE else View.GONE
             webView?.alpha = if (candidate == front) 1f else 0.01f
@@ -216,6 +240,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** 由控制器在开轮/收轮时告知，哪些成员的 WebView 现在不能回收。 */
     override fun setProtectedServices(services: Set<ArenaService>) {
         protectedServices = services
+        refreshVisibility()
     }
 
     // -----------------------------------------------------------------------
@@ -250,22 +275,26 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             lateinit var complete: (Boolean) -> Unit
             val watchdog = Runnable { complete(false) }
             complete = { ok ->
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service complete ok=$ok settled=$settled left=${deadline - SystemClock.elapsedRealtime()} hardLeft=${hardDeadline - SystemClock.elapsedRealtime()}")
                 if (!settled) {
                     settled = true
                     handler.removeCallbacks(watchdog)
                     if (pendingFreshPages[service] === complete) pendingFreshPages.remove(service)
+                    refreshVisibility()
                     callback(ok && !destroyed && webViews[service] === webView && SystemClock.elapsedRealtime() < deadline)
                 }
             }
             pendingFreshPages[service] = complete
+            refreshVisibility()
             handler.postDelayed(watchdog, hardDeadline - SystemClock.elapsedRealtime())
             navigate(service, webView, service.url, timeoutMillis = 60_000L, freshOwner = complete) { ok ->
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service navigated ok=$ok hardLeft=${hardDeadline - SystemClock.elapsedRealtime()} url=${webView.url}")
                 if (!settled) {
                     if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
                     else {
                         // Slow page resources must not consume the editor's hydration window.
                         // The native watchdog also covers a renderer that never returns JS results.
-                        deadline = minOf(hardDeadline, SystemClock.elapsedRealtime() + 20_000L)
+                        deadline = minOf(hardDeadline, SystemClock.elapsedRealtime() + 45_000L)
                         handler.removeCallbacks(watchdog)
                         handler.postDelayed(watchdog, deadline - SystemClock.elapsedRealtime())
                         waitForFreshPage(service, webView, navigationGenerations[service], deadline, complete)
@@ -373,9 +402,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
               const expected = ${ArenaJs.quote(service.url.trimEnd('/'))};
               const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
-              if (${service == ArenaService.DOUBAO} && document.querySelector('[data-item-status=Pending], [data-item-status=Sending]') && root === expected) return 'restored_history';
-              if (!empty && root === expected && document.readyState === 'complete') return 'restored_history';
-              if (!input || draft || !empty || root !== expected || document.readyState !== 'complete') {
+              const queued = ${service == ArenaService.DOUBAO} && !!document.querySelector('[data-item-status=Pending], [data-item-status=Sending]');
+              ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
+              // History or a website send queue on the root page is never ready. Keep polling:
+              // a single hydration sample must not fail the round; the deadline still decides.
+              if (!input || draft || !empty || queued || root !== expected || document.readyState !== 'complete') {
                 window.__aiArenaFreshPage = null; return false;
               }
               const previous = window.__aiArenaFreshPage;
@@ -386,10 +417,12 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             })();
         """.trimIndent()
         webView.evaluateJavascript(probe) { raw ->
+            if (BuildConfig.DEBUG) webView.evaluateJavascript("window.__aiArenaFreshDiag") { diag ->
+                android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - SystemClock.elapsedRealtime()} raw=$raw diag=${decodeJsValue(diag)}")
+            }
             if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
                 SystemClock.elapsedRealtime() >= deadline) callback(false)
             else if (raw == "true") callback(true)
-            else if (raw == "\"restored_history\"") callback(false)
             else if (SystemClock.elapsedRealtime() < deadline) handler.postDelayed({
                 waitForFreshPage(service, webView, generation, deadline, callback)
             }, 400L)
@@ -523,6 +556,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             callback(ResponseSnapshot(false, "", false, "网页尚未加载"))
             return
         }
+        keepDrawnWhileReading(service)
         webView.evaluateJavascript(ArenaWebResponseScript.build(service, requestId, requireIdentity = ArenaWebMessageIdentity.supported(service))) { raw ->
             try {
                 val payload = JSONObject(decodeJsValue(raw))
@@ -549,6 +583,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 callback(ResponseSnapshot(false, "", false, error.message ?: "解析回答失败"))
             }
         }
+    }
+
+    /** A streaming answer advances on animation frames; polling it keeps the page drawn for [READING_LIVE_MS]. */
+    private fun keepDrawnWhileReading(service: ArenaService) {
+        val wasLive = (readingUntil[service] ?: 0L) > SystemClock.elapsedRealtime()
+        readingUntil[service] = SystemClock.elapsedRealtime() + READING_LIVE_MS
+        if (!wasLive) refreshVisibility()
+        handler.postDelayed({
+            if (!destroyed && (readingUntil[service] ?: 0L) <= SystemClock.elapsedRealtime()) {
+                readingUntil.remove(service)
+                refreshVisibility()
+            }
+        }, READING_LIVE_MS + 50L)
     }
 
     private fun submissionCurrent(service: ArenaService, epoch: Long, serviceEpoch: Long) =
@@ -787,8 +834,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 }
                 if (service == ArenaService.DOUBAO) {
                     // Doubao's current mobile web build accepts the same programmatic click
-                    // once the host WebView is no longer the visible automation surface.
-                    // Keep the page alive, but hide the Android view before issuing clicks.
+                    // once the host WebView is no longer the front automation surface. It stays
+                    // drawn (not GONE): its send pipeline advances on animation frames.
                     token?.parked = true
                     refreshVisibility()
                     verifyDoubaoSend(webView, requestId, callback)
@@ -898,6 +945,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         var issued = false
         var geometryFailures = 0
         var preparationDeadline = 0L
+        var busySeen = false
         fun current() = isCurrent(service, token)
         fun sameDocument() = current() && fileBroker.generation(webView) == generation && webView.url == origin && ArenaFileChooserBroker.trusted(service, webView.url)
         fun fail(detail: String) { if (current()) finishSend(service, SendOutcome(false, requestId, detail), callback) }
@@ -942,12 +990,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         fun prepareTouch() {
             if (!current() || issued) return
             if (!sameDocument()) return fail("豆包网页已切换，未发送问题")
-            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail("豆包发送按钮或当前正文尚未就绪，未发送问题")
+            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送按钮或当前正文尚未就绪，未发送问题")
             webView.evaluateJavascript(nativeDoubaoControlScript(requestId, arm = false)) probe@{ raw ->
                 if (!current() || issued) return@probe
                 val ready = read(raw) ?: return@probe fail("豆包发送控件状态无法读取，未发送问题")
                 if (ready.has("error")) return@probe fail(ready.optString("error"))
                 if (!ready.optBoolean("ready")) {
+                    busySeen = busySeen || ready.optBoolean("busy")
                     handler.postDelayed({ prepareTouch() }, 250L)
                     return@probe
                 }
@@ -1010,7 +1059,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 val result = decodeJsValue(raw)
                 if (!result.startsWith("sent")) return@evaluateJavascript fail(result.ifBlank { "豆包正文注入失败，未发送问题" })
                 preparationDeadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
-                handler.postDelayed({ if (!issued) fail("豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                handler.postDelayed({ if (!issued) fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                 handler.postDelayed({ prepareTouch() }, 220L)
             }
         }
@@ -1066,6 +1115,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
           const native=window.__aiArenaNativeSend;
           if(!native||native.id!==${ArenaJs.quote(requestId)}||window.__aiArenaCancelledRequests?.[native.id])return JSON.stringify({error:'豆包发送请求已取消'});
           if(window.__aiArenaSendClicks?.[native.id])return JSON.stringify({error:'豆包已点击发送，未重复提交'});
+          if(${doubaoBusyExpression(ArenaService.DOUBAO)})return JSON.stringify({ready:false,busy:true});
           const shown=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>2&&r.height>2&&s.display!=='none'&&s.visibility!=='hidden'};
           const buttons=Array.from(document.querySelectorAll('button#flow-end-msg-send')).filter(shown);
           if(buttons.length>1)return JSON.stringify({error:'无法确认豆包唯一发送按钮，未发送问题'});
@@ -1100,8 +1150,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val clickDelayMs = if (attempt == 0) 900L else 1_400L
         handler.postDelayed({
             if (!isCurrent(service, token)) return@postDelayed
-            webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) {
+            webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) { clickRaw ->
                 if (!isCurrent(service, token)) return@evaluateJavascript
+                when (decodeJsValue(clickRaw)) {
+                    // Waiting for idle keeps the question in the input and relies on the request watchdog.
+                    "busy" -> token?.timeoutDetail = DOUBAO_BUSY_DETAIL
+                    // Once submitted, a slow website receipt is observed until the watchdog; never click again.
+                    "clicked", "awaiting_confirmation" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL)
+                        token?.timeoutDetail = DOUBAO_UNCONFIRMED_DETAIL
+                }
                 handler.postDelayed({
                     if (!isCurrent(service, token)) return@postDelayed
                     webView.evaluateJavascript(verifySendScript(ArenaService.DOUBAO, requestId)) { raw ->
@@ -1110,13 +1167,12 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                             finishSuccessfulSend(webView, ArenaService.DOUBAO, requestId, callback)
                         } else {
                             fun continueOrFail(queued: Boolean) {
+                                if (BuildConfig.DEBUG) android.util.Log.i("ArenaDoubaoSend", "$requestId attempt=$attempt verify=$raw queued=$queued timeoutDetail=${token?.timeoutDetail != null}")
                                 if (!isCurrent(service, token)) return
                                 if (queued && token != null) {
                                     token.timeoutDetail = "本轮消息进入了豆包网页待发送队列，尚未确认送达；请打开原网页核对，勿重复发送"
-                                    // Queue dispatch may need animation frames. Keep this pending
-                                    // page laid out without granting focus or clicking its queue.
-                                    token.parked = false
-                                    refreshVisibility()
+                                    // Parked pages stay drawn, so queue dispatch keeps its animation frames.
+                                    // Never grant focus to or click the website queue.
                                 }
                                 if (queued || token?.timeoutDetail != null || attempt + 1 < DOUBAO_SEND_ATTEMPTS)
                                     verifyDoubaoSend(webView, requestId, callback, attempt + 1)
@@ -1647,6 +1703,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
               if (state.expectedPrompt && arenaNormalize(inputText) !== state.expectedPrompt) return 'prompt_changed';
+              if (${doubaoBusyExpression(service)}) return 'busy';
               const send = arenaFirstMatch($sendSelectors);
               if (!arenaSendEnabled(send)) return 'not_ready';
               window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
@@ -1851,6 +1908,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (state.submittedAt || (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId])) return;
                   if (!input.isConnected || !currentInputText().trim()) return;
                   if (state.expectedPrompt && arenaNormalize(currentInputText()) !== state.expectedPrompt) return;
+                  if (${doubaoBusyExpression(service)}) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
                   if (send) {
@@ -1897,7 +1955,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      */
     private fun promptInputSelectors(service: ArenaService): List<String> = when (service) {
         ArenaService.DEEPSEEK -> listOf("#chat-input", "textarea[placeholder]", "[contenteditable='true']")
-        ArenaService.DOUBAO -> listOf(".tiptap.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea")
+        // Doubao first hydrates an interim TEXTAREA (data-testid=chat_input_input) and swaps in tiptap
+        // later; the swap can take 15+ s when other pages occupy the shared renderer thread (measured
+        // 2026-09-23). A question typed into the interim box moved into tiptap unsent. Never use it.
+        ArenaService.DOUBAO -> listOf(".tiptap.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea:not([data-testid=chat_input_input])")
         ArenaService.KIMI -> listOf(".chat-input-editor", "[role='textbox']", "[contenteditable='true']", "textarea")
         ArenaService.QWEN -> listOf("[role='textbox']", "[contenteditable='true']", "[contenteditable]", "textarea")
         ArenaService.YUANBAO -> listOf("[contenteditable='true']", "textarea", "#chat-input")
@@ -2181,6 +2242,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 window.__aiArenaQwenPendingRequestId = requestId;
             """.trimIndent()
 
+        /**
+         * Doubao is still answering or holds a send queue (JS expression, false for other sites).
+         * While `sendMessageStatus` is Submitting/Sending/Receiving the site shows its local break
+         * button, and a new send goes into its input queue instead of the conversation (2026-09-23
+         * failure: the queued question waited behind a status stuck at Sending for 6+ minutes).
+         * Never click in that state; the caller waits for idle or reports that nothing was sent.
+         */
+        internal fun doubaoBusyExpression(service: ArenaService): String =
+            if (service != ArenaService.DOUBAO) "false"
+            else "(() => { const b = document.querySelector('[data-testid=chat_input_local_break_button]'); " +
+                "const shown = !!b && (r => r.width > 0 && r.height > 0)(b.getBoundingClientRect()) && getComputedStyle(b).display !== 'none' && getComputedStyle(b).visibility !== 'hidden'; " +
+                "return shown || !!document.querySelector('[data-testid=queue-message-item], [data-item-id][data-item-status=Pending], [data-item-id][data-item-status=Sending]'); })()"
+
         /** 注入到页面的按优先级查找辅助函数。 */
         internal fun selectorHelperScript(): String = """
             const arenaFirstMatch = function(selectors) {
@@ -2195,6 +2269,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
+        private const val READING_LIVE_MS = 5_000L
+        private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
+        private const val DOUBAO_BUSY_DETAIL = "豆包网页上一条回答仍在进行或有待发送队列，本轮问题未发送；请打开原网页核对后重试"
         private const val AUTOMATION_READY_ATTEMPTS = 15
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L

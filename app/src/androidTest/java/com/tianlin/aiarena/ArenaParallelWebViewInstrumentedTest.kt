@@ -190,10 +190,12 @@ class ArenaParallelWebViewInstrumentedTest {
             onMain { pool.sendPrompt(ArenaService.DOUBAO, "queued question", "queue-probe") { outcome.set(it); done.countDown() } }
             assertTrue(done.await(55, TimeUnit.SECONDS))
             assertEquals(outcome.get().toString(), mode == "late", outcome.get().success)
-            assertEquals("1", evaluate(view, "sendCount"))
+            // An existing website queue means Doubao is busy: the question must stay unsent, not join it.
+            assertEquals(if (mode == "old") "0" else "1", evaluate(view, "sendCount"))
             assertEquals("0", evaluate(view, "alternateClicks"))
             if (mode == "pending") assertTrue(outcome.get().detail.contains("待发送队列"))
             if (mode == "old") assertFalse(outcome.get().detail.contains("待发送队列"))
+            if (mode == "old") assertTrue(outcome.get().detail.contains("未发送"))
         }
     }
 
@@ -212,7 +214,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(done.await(52, TimeUnit.SECONDS))
             assertFalse(ready.get())
         }
     }
@@ -647,7 +649,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertTrue(done.await(52, TimeUnit.SECONDS))
             assertFalse("Restored history cannot become a new conversation: $service $history", ready.get())
             assertTrue(evaluate(view, "document.body.innerText").contains("old"))
         }
@@ -660,7 +662,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
-            assertTrue(done.await(26, TimeUnit.SECONDS))
+            assertTrue(done.await(52, TimeUnit.SECONDS))
             assertFalse("A root URL with an unsent draft is not fresh", ready.get())
             assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
         }
@@ -676,7 +678,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 val ready = AtomicBoolean(false)
                 onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
                 assertFalse("Invalid input must not become ready: $body", done.await(4, TimeUnit.SECONDS))
-                evaluate(view, "document.body.innerHTML='<textarea id=live></textarea>'; true")
+                evaluate(view, "document.body.innerHTML='<div id=live class=\"tiptap ProseMirror\" contenteditable=true></div>'; true")
                 assertTrue(done.await(6, TimeUnit.SECONDS))
                 assertTrue(ready.get())
                 assertEquals("live", evaluate(view, "window.__aiArenaFreshPage.input.id"))
@@ -749,11 +751,169 @@ class ArenaParallelWebViewInstrumentedTest {
             onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
             assertTrue(view.probed.await(8, TimeUnit.SECONDS))
             assertFalse(done.await(2, TimeUnit.SECONDS))
-            assertTrue("The independent editor budget must expire without any JS callback", done.await(23, TimeUnit.SECONDS))
+            assertTrue("The independent editor budget must expire without any JS callback", done.await(48, TimeUnit.SECONDS))
             assertFalse(ready.get())
             onMain { view.held?.onReceiveValue("true") }
             Thread.sleep(500)
             assertEquals(1, calls.get())
+        }
+    }
+
+    @Test fun freshDoubaoWaitsForTiptapEditorInsteadOfInterimTextarea() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // Real 2026-09-23 sequence: a hydrated interim TEXTAREA stays for seconds, then tiptap replaces it.
+            interceptFreshPage(view, """
+                <textarea class="textarea-YelHeN" data-testid="chat_input_input" placeholder="发消息..."></textarea>
+                <script>setTimeout(()=>{document.querySelector('textarea').outerHTML='<div id="rich" class="tiptap ProseMirror" contenteditable="true"></div>';window.swappedAt=Date.now();},5000);</script>
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertFalse("The interim textarea is replaced later and must not become ready", done.await(4, TimeUnit.SECONDS))
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            assertEquals("rich", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+        }
+    }
+
+    @Test fun freshDoubaoLongInterimEditorIsNeverTypedInto() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // Under a busy shared renderer thread the interim editor stayed ~16 s before tiptap mounted.
+            interceptFreshPage(view, "<textarea data-testid=chat_input_input placeholder=发消息...></textarea>")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertFalse("A stable interim editor is still not ready", done.await(18, TimeUnit.SECONDS))
+            evaluate(view, "document.querySelector('textarea').outerHTML='<div id=\"rich\" class=\"tiptap ProseMirror\" contenteditable=\"true\"></div>';true")
+            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            assertEquals("rich", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+        }
+    }
+
+    @Test fun doubaoFollowupWaitsForTiptapWhenOnlyTheInterimEditorExists() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                const old=document.querySelector('textarea');old.setAttribute('data-testid','chat_input_input');
+                window.send=()=>{window.sendCount++;};
+                setTimeout(()=>{window.richAt=Date.now();const rich=document.createElement('div');rich.className='tiptap ProseMirror';rich.contentEditable='true';rich.id='rich';old.replaceWith(rich);},6000);
+                true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "must not enter the interim box", "interim-followup") { done.countDown() } }
+            Thread.sleep(5_000)
+            assertEquals("The interim editor must stay untouched", "", evaluate(view, "document.querySelector('textarea')?.value ?? 'gone'"))
+            assertTrue(done.await(45, TimeUnit.SECONDS))
+            assertEquals("true", evaluate(view, "!!window.richAt"))
+        }
+    }
+
+    @Test fun freshPageTransientHistoryDuringHydrationDoesNotFailTheRound() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, """
+                <div class="tiptap ProseMirror" contenteditable="true"></div>
+                <div id="transient" data-target-id="message-box-target-id"><div data-reply-message>skeleton</div></div>
+                <script>setTimeout(()=>document.getElementById('transient').remove(),2500);</script>
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(12, TimeUnit.SECONDS))
+            assertTrue("A single hydration sample with history must not decide the round", ready.get())
+        }
+    }
+
+    @Test fun freshPreparingPageStaysLaidOutUntilSettled() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, "<textarea></textarea><script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',3000)</script>")
+            onMain { pool.setProtectedServices(emptySet()) }
+            waitUntil("idle page is not drawn") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            // Drawn but not interactive for the whole preparation: a GONE WebView gets ~1 frame per second.
+            repeat(25) {
+                onMain {
+                    assertEquals(View.VISIBLE, view.visibility)
+                    assertEquals(View.VISIBLE, pool.container.visibility)
+                    assertFalse(pool.container.isClickable)
+                    assertFalse(view.isFocusable)
+                }
+                Thread.sleep(100)
+            }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            waitUntil("settled page returns to GONE") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+        }
+    }
+
+    @Test fun roundMembersStayDrawnAndHiddenPagesDoNotTakeUserTaps() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, "window.userTaps=0;document.addEventListener('pointerdown',()=>userTaps++,true);true")
+            onMain { pool.setProtectedServices(setOf(ArenaService.DOUBAO)) }
+            waitUntil("round member drawn") { var shown = false; onMain { shown = view.visibility == View.VISIBLE && pool.container.visibility == View.VISIBLE }; shown }
+            // A tap that reaches the hidden container (e.g. through a blank Compose area) is swallowed.
+            onMain {
+                val now = SystemClock.uptimeMillis()
+                listOf(android.view.MotionEvent.ACTION_DOWN, android.view.MotionEvent.ACTION_UP).forEach { action ->
+                    val event = android.view.MotionEvent.obtain(now, now, action, 50f, 50f, 0)
+                    pool.container.dispatchTouchEvent(event); event.recycle()
+                }
+            }
+            Thread.sleep(500)
+            assertEquals("0", evaluate(view, "userTaps"))
+            onMain { pool.setProtectedServices(emptySet()) }
+            waitUntil("finished round member is not drawn") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+        }
+    }
+
+    @Test fun doubaoBusyPageIsNotClickedUntilIdleThenSendsOnce() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                document.getElementById('input-engine-container').insertAdjacentHTML('beforeend','<button id="break" data-testid="chat_input_local_break_button" style="width:36px;height:36px">Stop</button>');
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  window.sentWhileBusy=!!document.getElementById('break');document.querySelector('textarea').value='';
+                  const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                  row.innerHTML='<div data-send-message-boundary data-message-id="idle-'+number+'"><div class="bg-g-send">'+raw+'</div></div>';
+                  document.body.appendChild(row);fixtureDoubaoMessage(row,raw);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "question after the previous answer ends", "busy-then-idle") { outcome.set(it); done.countDown() } }
+            assertFalse(done.await(8, TimeUnit.SECONDS))
+            assertEquals("A busy Doubao page would queue the question", "0", evaluate(view, "sendCount"))
+            assertEquals("question after the previous answer ends", evaluate(view, "document.querySelector('textarea').value"))
+            evaluate(view, "document.getElementById('break').remove();true")
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("false", evaluate(view, "window.sentWhileBusy"))
+        }
+    }
+
+    @Test fun doubaoPersistentQueueReportsNotSentWithoutClicking() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                document.body.insertAdjacentHTML('beforeend','<div data-testid="queue-message-item" data-item-id="queue-item-old" data-item-status="Pending">older queued question</div>');
+                true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "must not join the website queue", "persistent-queue") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(55, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("未发送"))
+            assertEquals("0", evaluate(view, "sendCount"))
         }
     }
 
@@ -798,7 +958,7 @@ class ArenaParallelWebViewInstrumentedTest {
     @Test fun freshPageWaitsForLateEditorHydrationUnderSharedBudget() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)
-            val page = "<script>setTimeout(()=>document.body.innerHTML='<textarea placeholder=Message></textarea>',12000)</script>"
+            val page = "<script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',12000)</script>"
             onMain {
                 val productionClient = view.webViewClient
                 view.webViewClient = object : android.webkit.WebViewClient() {
@@ -828,7 +988,7 @@ class ArenaParallelWebViewInstrumentedTest {
                         view.postDelayed({ productionClient.onPageFinished(view, url) }, 26_000L)
                     }
                     override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse =
-                        android.webkit.WebResourceResponse("text/html", "UTF-8", "<textarea placeholder='Message'></textarea>".byteInputStream())
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", "<div class='tiptap ProseMirror' contenteditable='true'></div>".byteInputStream())
                 }
             }
             val done = CountDownLatch(1)
@@ -989,7 +1149,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val fresh = AtomicBoolean(true)
             onMain { pool.openFreshConversation(ArenaService.KIMI) { fresh.set(it); done.countDown() } }
-            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(done.await(52, TimeUnit.SECONDS))
             assertFalse("A root URL whose history hydrates later is not a fresh chat", fresh.get())
             val cancelled = CountDownLatch(1)
             val calls = AtomicInteger()

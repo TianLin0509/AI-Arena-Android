@@ -244,7 +244,16 @@ internal object ArenaWebResponseScript {
                   // 正式回答还没开始（还在思考）时，用最后一个 markdown 块当进度文本
                   const anyBlocks = assistant ? Array.from(assistant.querySelectorAll('.markdown-container')) : [];
                   text = finalText || (anyBlocks.length ? arenaToMarkdown(anyBlocks[anyBlocks.length - 1]) : '');
-                  streaming = !!assistant && !barVisible(assistant.querySelector('.segment-assistant-actions'));
+                  // Kimi highlights code asynchronously: the actions bar can show while a code block has
+                  // only its "Python / Copy" header (2026-09-23: ~3 s idle, longer when busy). Keep waiting
+                  // for the PRE, bounded so an unusual code widget cannot hold the round forever.
+                  const pendingCode = finalBlocks.some(function(item) {
+                    return Array.from(item.querySelectorAll('.segment-code')).some(function(code) { return !code.querySelector('pre'); });
+                  });
+                  if (pendingCode && !state.kimiCodePendingSince) state.kimiCodePendingSince = Date.now();
+                  if (!pendingCode) state.kimiCodePendingSince = 0;
+                  const codeRendering = pendingCode && Date.now() - state.kimiCodePendingSince < 20000;
+                  streaming = !!assistant && (!barVisible(assistant.querySelector('.segment-assistant-actions')) || codeRendering);
                 }
             """.trimIndent()
             ArenaService.QWEN -> """
