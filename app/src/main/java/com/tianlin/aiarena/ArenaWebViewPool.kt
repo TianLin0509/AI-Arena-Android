@@ -803,6 +803,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             handler.removeCallbacks(timeout)
             if (raw == "true") {
                 finishSuccessfulSend(webView, service, requestId, callback)
+            } else if (decodeJsValue(raw) == "scope_changed") {
+                finishSend(service, SendOutcome(false, requestId, ArenaWebMessageIdentity.scopeChangedDetail), callback)
             } else if (service == ArenaService.KIMI) {
                 // A receipt can arrive between these evaluations. Check it again atomically
                 // with the dialog classification so a stale dialog cannot override delivery.
@@ -821,7 +823,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     else finishSend(service, SendOutcome(false, requestId, "未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
                 }
             } else {
-                finishSend(service, SendOutcome(false, requestId, "发送后未检测到新消息"), callback)
+                if (token?.strictReceipt == true && attempt < 15) handler.postDelayed({
+                    if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
+                }, 500L)
+                else finishSend(service, SendOutcome(false, requestId, "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
             }
         }
     }
@@ -1578,6 +1583,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${ArenaWebMessageIdentity.helper(service)}
               $selectorHelper
               ${sendControlHelperScript()}
+              if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)};
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
               if (window.__aiArenaNativeSendRequests?.[requestId]) return 'native_managed';
@@ -1645,6 +1651,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${ArenaWebMessageIdentity.helper(service)}
                 const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
                 if (cancelled()) return 'cancelled';
+                if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)};
                 $selectorHelper
                 ${sendControlHelperScript()}
                 $qwenFetchHook
@@ -1783,6 +1790,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 };
                 const attemptSend = function() {
                   if (cancelled()) return;
+                  if (!arenaRequestScopeValid()) return;
                   if (window.__aiArenaNativeSendRequests?.[requestId]) return;
                   if ($conversationAdvanced) return;
                   if (state.submittedAt || (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId])) return;

@@ -2,12 +2,14 @@ package com.tianlin.aiarena
 
 /** Provider message identity shared by submission acknowledgement and answer extraction. */
 internal object ArenaWebMessageIdentity {
-    fun supported(service: ArenaService) = service == ArenaService.DOUBAO || service == ArenaService.KIMI
+    const val scopeChangedDetail = "DeepSeek 页面或会话已变化，本轮自动处理已停止，请打开原网页核对；不会自动重复发送"
+    fun supported(service: ArenaService) = service == ArenaService.DEEPSEEK || service == ArenaService.DOUBAO || service == ArenaService.KIMI
 
     // Doubao replaced v_list_row with message-box-target-id wrappers in September 2026.
     const val doubaoRows = "Array.from(document.querySelectorAll('[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row]')).filter(row => !row.parentElement?.closest('[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row]'))"
 
     fun users(service: ArenaService): String = when (service) {
+        ArenaService.DEEPSEEK -> "Array.from(document.querySelector('.ds-virtual-list-visible-items')?.children || []).filter(row => { const body = row.querySelector('.ds-message .ds-collapsible-text'); return !!body && !body.closest('.ds-markdown, .ds-think-content'); })"
         ArenaService.DOUBAO -> "$doubaoRows.filter(row => !!row.querySelector('[data-send-message-boundary], [class*=bg-g-send]'))"
         ArenaService.KIMI -> "Array.from(document.querySelectorAll('.chat-content-item-user:not(.awaiting-failure)'))"
         else -> "[]"
@@ -16,15 +18,36 @@ internal object ArenaWebMessageIdentity {
     fun helper(service: ArenaService): String = """
         const arenaNormalize = value => String(value || '').replace(/\s+/g, ' ').trim();
         const arenaUserText = row => {
-          const body = row.querySelector('[class*=bg-g-send], .user-content__text, .segment-content') || row;
+          const body = row.querySelector('${if (service == ArenaService.DEEPSEEK) ".ds-message .ds-collapsible-text" else "[class*=bg-g-send], .user-content__text, .segment-content"}') || row;
           const copy = body.cloneNode(true);
           copy.querySelectorAll('button, [role=button], [class*=actions], [class*=action-bar], img').forEach(n => n.remove());
           copy.querySelectorAll('br').forEach(n => n.replaceWith(document.createTextNode('\n')));
           copy.querySelectorAll('p, div, li, pre, blockquote').forEach(n => n.appendChild(document.createTextNode('\n')));
           return arenaNormalize(copy.textContent);
         };
-        const arenaUserId = row => row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || row.id || '';
+        const arenaUserId = row => ${if (service == ArenaService.DEEPSEEK) "row.getAttribute('data-virtual-list-item-key') || ''" else "row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || row.id || ''"};
+        const arenaRequestScopeValid = () => {
+          ${if (service == ArenaService.DEEPSEEK) """
+          if (state.expectedPrompt && state.legacyAttachment !== true) {
+            const initial = new URL(state.initialUrl);
+            const currentUrl = location.origin + location.pathname;
+            const initialUrl = initial.origin + initial.pathname;
+            const sessionPath = /^\/a\/chat\/s\/[^/]+\/?${'$'}/;
+            const validDocument = state.documentToken && state.documentToken === window.__aiArenaDeepSeekDocument;
+            const validUrl = state.boundConversationUrl ? state.boundConversationUrl === currentUrl :
+              (currentUrl === initialUrl || (initial.pathname === '/' && !!state.submittedAt && location.origin === initial.origin && sessionPath.test(location.pathname)));
+            if (state.scopeFailure || !validDocument || !validUrl) {
+              state.scopeFailure = true;
+              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              return false;
+            }
+          }
+          """.trimIndent() else ""}
+          return true;
+        };
         const arenaFindRequestUser = () => {
+          if (!arenaRequestScopeValid()) return null;
+          ${if (service == ArenaService.DEEPSEEK) "if (state.expectedPrompt && state.legacyAttachment !== true && !/^\\/a\\/chat\\/s\\/[^/]+\\/?${'$'}/.test(location.pathname)) return null;" else ""}
           const users = ${users(service)};
           if (!state.expectedPrompt) return users.find(row => row.getAttribute('data-ai-arena-request') === requestId) || users.slice(Number(state.userBaseline || 0)).pop() || null;
           if (!state.submittedAt && !(window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) && !state.boundUserId && !state.bound) return null;
@@ -58,6 +81,7 @@ internal object ArenaWebMessageIdentity {
           window.__aiArenaBoundUsers[requestId] = user;
           const id = arenaUserId(user);
           if (id) state.boundUserId = id;
+          ${if (service == ArenaService.DEEPSEEK) "if (state.expectedPrompt) state.boundConversationUrl = location.origin + location.pathname;" else ""}
           window.__aiArenaRequests = window.__aiArenaRequests || {};
           window.__aiArenaRequests[requestId] = state;
           try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}

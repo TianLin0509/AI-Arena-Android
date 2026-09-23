@@ -28,6 +28,11 @@ internal object ArenaWebCursorScript {
                 initialUrl: location.href,
                 expectedPrompt: ${ArenaJs.quote(prompt)}.replace(/\s+/g, ' ').trim()
               };
+              ${if (service == ArenaService.DEEPSEEK) """
+              // DeepSeek virtual keys are local to a document, unlike a server UUID.
+              window.__aiArenaDeepSeekDocument = window.__aiArenaDeepSeekDocument || Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+              state.documentToken = window.__aiArenaDeepSeekDocument;
+              """.trimIndent() else ""}
               ${ArenaWebMessageIdentity.helper(service)}
               const beforeUsers = ${ArenaWebMessageIdentity.users(service)};
               state.beforeUserIds = beforeUsers.map(arenaUserId).filter(Boolean);
@@ -48,6 +53,7 @@ internal object ArenaWebCursorScript {
               ${stateBootstrap(requestId)}
               ${ArenaWebMessageIdentity.helper(service)}
               if ($requireIdentity && !state.expectedPrompt) return false;
+              if (!arenaRequestScopeValid()) return 'scope_changed';
               const user = $latestUser;
               if (!user || ($requireIdentity && !arenaUserId(user))) return false;
               arenaBindRequestUser(user);
@@ -67,7 +73,7 @@ internal object ArenaWebCursorScript {
     """.trimIndent()
 
     fun conversationAdvancedExpression(service: ArenaService): String = when (service) {
-        ArenaService.DEEPSEEK -> "($userCountDeepSeek) > Number(state.userBaseline || 0)"
+        ArenaService.DEEPSEEK -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDeepSeek) > Number(state.userBaseline || 0))"
         ArenaService.DOUBAO -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDoubao) > Number(state.userBaseline || 0))"
         ArenaService.KIMI -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountKimi) > Number(state.userBaseline || 0))"
         ArenaService.QWEN -> "($userCountQwen) > Number(state.userBaseline || 0)"

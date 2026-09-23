@@ -113,12 +113,13 @@ internal object ArenaWebResponseScript {
             ArenaService.DEEPSEEK -> """
                 const root = document.querySelector('.ds-virtual-list-visible-items');
                 const items = root ? Array.from(root.children) : [];
-                const tagged = Array.from(document.querySelectorAll('[data-ai-arena-request]')).find(function(row) {
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : Array.from(document.querySelectorAll('[data-ai-arena-request]')).find(function(row) {
                   return row.getAttribute('data-ai-arena-request') === requestId;
                 });
-                const user = tagged || items.filter(function(row) {
+                if (tagged && state.expectedPrompt) arenaBindRequestUser(tagged);
+                const user = tagged || (!state.expectedPrompt ? items.filter(function(row) {
                   return !row.querySelector('.ds-markdown') && clean(row.innerText || row.textContent || '').length > 0;
-                }).pop();
+                }).pop() : null);
                 // Observed 2026-09-23: server refusal is a sibling of the user's
                 // message inside that tagged turn, with a warning retry control.
                 // Do not interpret quoted text, older turns or hidden notices.
@@ -144,9 +145,13 @@ internal object ArenaWebResponseScript {
                 let answerRow = null;
                 if (user && items.includes(user)) {
                   const index = items.indexOf(user);
-                  answerRow = items.slice(index + 1).find(function(row) { return !!row.querySelector('.ds-markdown'); }) || null;
+                  const users = ${ArenaWebMessageIdentity.users(service)};
+                  for (const row of items.slice(index + 1)) {
+                    if (users.includes(row)) break;
+                    if (row.querySelector('.ds-markdown')) { answerRow = row; break; }
+                  }
                 }
-                if (!answerRow) {
+                if (!answerRow && !state.expectedPrompt) {
                   const picked = pickSelector(['.ds-markdown', '[class*=assistant-message]', '[class*=bot-message]', '.markdown-body', '.prose']);
                   const scoped = scopeAfterTag(picked.nodes, tagged || null, Number(state.assistantBaseline || 0));
                   const lastNode = scoped.nodes.filter(function(row) {
@@ -394,6 +399,7 @@ internal object ArenaWebResponseScript {
                   ${ArenaWebModeScript.helpers}
                   ${ArenaWebModeScript.body(service)}
                 } catch (_) {}
+                if (!arenaRequestScopeValid()) throw new Error(${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)});
                 if ($requireIdentity && !state.expectedPrompt && state.legacyAttachment !== true) throw new Error("本轮消息定位信息已丢失，请打开原网页核对；不会自动重复发送");
                 if ($requireIdentity && ${ArenaWebMessageIdentity.supported(service)} && state.expectedPrompt && !state.boundUserId) throw new Error("本轮消息尚未取得官网编号，请打开原网页核对；不会自动重复发送");
                 $serviceBody

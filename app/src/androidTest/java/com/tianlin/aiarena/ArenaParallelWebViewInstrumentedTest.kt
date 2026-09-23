@@ -191,6 +191,103 @@ class ArenaParallelWebViewInstrumentedTest {
 
     @Test fun kimiMultilinePlainTextPastePreservesParagraphsAndSubmitsOnce() = verifyKimiMultilinePaste(0)
 
+    @Test fun deepSeekVirtualizedReceiptDoesNotRequireCountGrowthOrClearedInput() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.history.pushState({},'', '/a/chat/s/fixture');
+                const history=document.createElement('div');history.className='ds-virtual-list-visible-items';document.body.appendChild(history);
+                const user=(key,text)=>'<div data-virtual-list-item-key="'+key+'"><div class="ds-message"><div class="ds-collapsible-text">'+text+'</div></div></div>';
+                history.innerHTML=user('1','old one')+user('3','old two');
+                window.send=()=>{
+                  sendCount++;sentText=document.querySelector('textarea').value;
+                  history.innerHTML=user('3','old two')+user('-2',sentText);
+                  delete window.__aiArenaSendClicks;
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "current question", "virtualized-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("-2", evaluate(view, "window.__aiArenaRequests['virtualized-deepseek'].boundUserId"))
+            assertEquals("current question", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun busyDeepSeekRendererKeepsOneReceiptBeyondShortCallbackDeadline() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;history.appendChild(user);document.body.appendChild(history);
+                  const until=Date.now()+15000;while(Date.now()<until){}
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "slow receipt", "slow-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(35, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("-2", evaluate(view, "window.__aiArenaRequests['slow-deepseek'].boundUserId"))
+        }
+    }
+
+    @Test fun deepSeekHomepageWaitsForSessionBeforeReceiptAndDoesNotClickTwice() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.wasUnboundOnHome=false;
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;
+                  const root=document.createElement('div');root.className='ds-virtual-list-visible-items';
+                  root.innerHTML='<div data-virtual-list-item-key="-2"><div class="ds-message"><div class="ds-collapsible-text"></div></div></div>';
+                  root.querySelector('.ds-collapsible-text').textContent=sentText;document.body.appendChild(root);
+                  setTimeout(()=>{
+                    wasUnboundOnHome=!window.__aiArenaRequests['home-deepseek'].bound && location.pathname==='/';
+                    history.pushState({},'', '/a/chat/s/new-fixture');
+                    root.insertAdjacentHTML('beforeend','<div><div class="ds-markdown ds-assistant-message-main-content">HOME ANSWER</div></div>');
+                  },3300);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "first question", "home-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("true", evaluate(view, "wasUnboundOnHome"))
+            assertEquals("1", evaluate(view, "sendCount"))
+            val response = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DEEPSEEK, "home-deepseek", requireIdentity = true)))
+            assertEquals("HOME ANSWER", response.getString("finalText"))
+        }
+    }
+
+    @Test fun changedDeepSeekConversationBeforeScheduledSubmitNeverClicks() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                history.pushState({},'', '/a/chat/s/first');
+                window.send=()=>{sendCount++;};
+                document.querySelector('textarea').addEventListener('input',()=>{
+                  history.pushState({},'', '/a/chat/s/other');
+                },{once:true});true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "same question", "changed-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertFalse(outcome.get().toString(), outcome.get().success)
+            assertEquals("0", evaluate(view, "sendCount"))
+            assertEquals(ArenaWebMessageIdentity.scopeChangedDetail, outcome.get().detail)
+            assertEquals("same question", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun kimiFailedOptimisticRowAndLateReceiptDoNotRepeatInputOrSubmit() = verifyKimiMultilinePaste(0, failedOptimistic = true)
+
     @Test fun slowKimiPasteKeepsOneSubmissionAfterFocusCallbackDeadline() = verifyKimiMultilinePaste(15_000)
 
     @Test fun cancelledSlowKimiPasteCannotSendLaterOrBlockAnotherProvider() = verifyKimiMultilinePaste(15_000, cancel = true)
@@ -344,7 +441,7 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
-    private fun verifyKimiMultilinePaste(busyMillis: Int, cancel: Boolean = false, existingDraft: Boolean = false, singleLine: Boolean = false) {
+    private fun verifyKimiMultilinePaste(busyMillis: Int, cancel: Boolean = false, existingDraft: Boolean = false, singleLine: Boolean = false, failedOptimistic: Boolean = false) {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.KIMI)
             evaluate(view, """
@@ -352,6 +449,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 editor.contentEditable='true';editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
                 editor.style='white-space:pre-wrap;min-height:80px';old.replaceWith(editor);
                 window.pastes=0;window.pastedText='';
+                window.enterEvents=0;editor.addEventListener('keydown',e=>{if(e.key==='Enter')enterEvents++;});editor.addEventListener('keyup',e=>{if(e.key==='Enter')enterEvents++;});
                 editor.textContent=$existingDraft ? 'OLD DRAFT MUST BE REPLACED' : '';
                 let editorSelection='';
                 // Model Lexical's committed selection independently of the DOM selection.
@@ -371,14 +469,22 @@ class ArenaParallelWebViewInstrumentedTest {
                 window.send=()=>{
                   sendCount++;sentText=editor.innerText;
                   const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','multiline');
-                  user.textContent=sentText;document.body.appendChild(user);editor.textContent='';
+                  user.textContent=sentText;editor.textContent='';
+                  if ($failedOptimistic) {
+                    const failed=user.cloneNode(true);failed.classList.add('awaiting-failure');failed.setAttribute('data-conversation-turn-id','failed-send-fixture');document.body.appendChild(failed);
+                    setTimeout(()=>document.body.appendChild(user),3000);
+                  } else document.body.appendChild(user);
                 };true;
             """.trimIndent())
             val prompt = if (singleLine) "NEW SINGLE LINE QUESTION" else "第一行 <不是 HTML>\n第二行 & 中文\n\n第四行"
             if (cancel) evaluate(views.getValue(ArenaService.DEEPSEEK), """
                 window.send=()=>{
                   sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
-                  const user=document.createElement('div');user.className='user-message';user.textContent=sentText;document.body.appendChild(user);
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;history.appendChild(user);document.body.appendChild(history);
                 };true;
             """.trimIndent())
             val done = CountDownLatch(1)
@@ -412,6 +518,8 @@ class ArenaParallelWebViewInstrumentedTest {
             assertEquals(prompt, evaluate(view, "sentText"))
             assertEquals("1", evaluate(view, "pastes"))
             assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("0", evaluate(view, "enterEvents"))
+            if (failedOptimistic) assertEquals("multiline", evaluate(view, "window.__aiArenaRequests['multiline-kimi'].boundUserId"))
         }
     }
 
