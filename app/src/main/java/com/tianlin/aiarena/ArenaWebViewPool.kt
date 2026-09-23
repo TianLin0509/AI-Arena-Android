@@ -258,6 +258,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val pendingFreshPages = mutableMapOf<ArenaService, (Boolean) -> Unit>()
     private val navigationGenerations = mutableMapOf<ArenaService, Long>()
     private val navigationTargets = mutableMapOf<ArenaService, String>()
+    /** Last not-ready reason seen by the fresh-page probe; reported when the page never became usable. */
+    private val freshReasons = mutableMapOf<ArenaService, String>()
+
+    override fun freshConversationFailure(service: ArenaService): String? = when (freshReasons[service]) {
+        "draft" -> "${service.displayName} 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试"
+        "history", "not_root" -> "${service.displayName} 打开新对话后仍显示旧对话内容，本轮未发送；请打开原网页确认后重试"
+        "queued" -> "${service.displayName} 新对话里有排队中的消息，本轮未发送；请打开原网页处理后重试"
+        "no_editor" -> "${service.displayName} 新对话的输入框迟迟没有加载完成，本轮未发送；请稍后重试"
+        "navigation" -> "${service.displayName} 新对话网页没有打开，本轮未发送；请确认网络后重试"
+        else -> null
+    }
 
     override fun conversationUrl(service: ArenaService): String =
         webViews[service]?.url.orEmpty().takeIf { it.startsWith("https://") }.orEmpty()
@@ -269,6 +280,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // A restored root URL is not evidence of an empty conversation. Start a navigation
             // owned by this request, then require an empty, hydrated editor on the root page.
             pendingFreshPages.remove(service)?.invoke(false)
+            freshReasons.remove(service)
             val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
             val deadline = hardDeadline
             var settled = false
@@ -290,6 +302,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             navigate(service, webView, service.url, timeoutMillis = 60_000L, freshOwner = complete) { ok ->
                 if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service navigated ok=$ok hardLeft=${hardDeadline - SystemClock.elapsedRealtime()} url=${webView.url}")
                 if (!settled) {
+                    if (!ok) freshReasons[service] = "navigation"
                     if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
                     else {
                         // The editor may mount 40+ s after load while other pages occupy the shared renderer
@@ -404,9 +417,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
               // History or a website send queue on the root page is never ready. Keep polling:
               // a single hydration sample must not fail the round; the deadline still decides.
-              if (!input || draft || !empty || queued || root !== expected || document.readyState !== 'complete') {
-                window.__aiArenaFreshPage = null; return false;
-              }
+              const blocked = root !== expected ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft ? 'draft' :
+                (!input || document.readyState !== 'complete') ? 'no_editor' : '';
+              if (blocked) { window.__aiArenaFreshPage = null; return blocked; }
               const previous = window.__aiArenaFreshPage;
               if (!previous || previous.input !== input) {
                 window.__aiArenaFreshPage = {input, since: Date.now()}; return false;
@@ -417,6 +430,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         webView.evaluateJavascript(probe) { raw ->
             if (BuildConfig.DEBUG) webView.evaluateJavascript("window.__aiArenaFreshDiag") { diag ->
                 android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - SystemClock.elapsedRealtime()} raw=$raw diag=${decodeJsValue(diag)}")
+            }
+            if (navigationGenerations[service] == generation) {
+                val reason = decodeJsValue(raw)
+                if (reason in FRESH_REASONS) freshReasons[service] = reason else freshReasons.remove(service)
             }
             if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
                 SystemClock.elapsedRealtime() >= deadline) callback(false)
@@ -2268,6 +2285,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
         private const val READING_LIVE_MS = 5_000L
+        private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
         private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
         private const val DOUBAO_BUSY_DETAIL = "豆包网页仍在处理上一条消息（显示停止按钮或有排队消息），本轮问题未发送；请打开原网页核对后重试"
         private const val AUTOMATION_READY_ATTEMPTS = 15

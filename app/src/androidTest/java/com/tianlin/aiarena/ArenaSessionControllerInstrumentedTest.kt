@@ -408,6 +408,7 @@ class ArenaSessionControllerInstrumentedTest {
         try {
             onMain {
                 controller.startInitial("fresh failure", ArenaService.defaultMembers)
+                gateway.freshFailures[ArenaService.DOUBAO] = "豆包 新对话输入框里有未发出的草稿，本轮未发送"
                 gateway.completeFresh(ArenaService.DOUBAO, false)
                 gateway.completeFresh(ArenaService.KIMI, true)
                 gateway.completeSend(ArenaService.KIMI)
@@ -417,6 +418,9 @@ class ArenaSessionControllerInstrumentedTest {
                 assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
                 assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
                 assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                // The page's observed reason replaces the generic text so the user knows what to fix.
+                assertEquals("豆包 新对话输入框里有未发出的草稿，本轮未发送", controller.runs.getValue(ArenaService.DOUBAO).detail)
+                assertEquals("新对话未能就绪，未发送；请打开原网页确认后重试", controller.runs.getValue(ArenaService.DEEPSEEK).detail)
                 assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.KIMI).phase)
                 gateway.completeFresh(ArenaService.DEEPSEEK, true)
                 gateway.completeFresh(ArenaService.DOUBAO, true)
@@ -1391,6 +1395,8 @@ class ArenaSessionControllerInstrumentedTest {
         }
 
         fun completeFresh(service: ArenaService, ok: Boolean) = freshCallbacks.getValue(service)(ok)
+        val freshFailures = mutableMapOf<ArenaService, String>()
+        override fun freshConversationFailure(service: ArenaService): String? = freshFailures[service]
         fun completeSend(service: ArenaService, ok: Boolean = true) {
             val (id, callback) = pendingSends.getValue(service)
             callback(SendOutcome(ok, id, if (ok) "acknowledged" else "upload rejected"))

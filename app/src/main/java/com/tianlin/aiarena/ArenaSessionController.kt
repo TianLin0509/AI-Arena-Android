@@ -726,7 +726,7 @@ class ArenaSessionController(
                     handler.removeCallbacks(sendTimeout)
                     finishRecovery(execution, runs.getValue(service).copy(
                         phase = ParticipantPhase.ERROR,
-                        detail = "重发前新对话未能就绪，未发送；请打开原网页确认",
+                        detail = pool.freshConversationFailure(service)?.let { "重发前：$it" } ?: "重发前新对话未能就绪，未发送；请打开原网页确认",
                     ))
                 }
             }
@@ -928,7 +928,7 @@ class ArenaSessionController(
             runs[service] = ParticipantRun(
                 phase = ParticipantPhase.ERROR,
                 requestId = requestId,
-                detail = "新对话未能就绪，未发送；请打开原网页确认后重试",
+                detail = pool.freshConversationFailure(service) ?: "新对话未能就绪，未发送；请打开原网页确认后重试",
             )
             onSendFinished(false)
             schedulePersist()

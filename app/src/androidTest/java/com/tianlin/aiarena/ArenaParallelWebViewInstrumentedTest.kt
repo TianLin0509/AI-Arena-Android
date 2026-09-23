@@ -652,6 +652,9 @@ class ArenaParallelWebViewInstrumentedTest {
             onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
             assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse("Restored history cannot become a new conversation: $service $history", ready.get())
+            var reason: String? = null
+            onMain { reason = pool.freshConversationFailure(service) }
+            assertTrue(reason.toString(), reason.orEmpty().contains("旧对话"))
             assertTrue(evaluate(view, "document.body.innerText").contains("old"))
         }
     }
@@ -666,6 +669,9 @@ class ArenaParallelWebViewInstrumentedTest {
             assertTrue(done.await(92, TimeUnit.SECONDS))
             assertFalse("A root URL with an unsent draft is not fresh", ready.get())
             assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
+            var reason: String? = null
+            onMain { reason = pool.freshConversationFailure(ArenaService.DOUBAO) }
+            assertTrue(reason.toString(), reason.orEmpty().contains("草稿"))
         }
     }
 
