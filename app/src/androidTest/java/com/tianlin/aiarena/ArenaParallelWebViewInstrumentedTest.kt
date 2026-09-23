@@ -43,6 +43,42 @@ class ArenaParallelWebViewInstrumentedTest {
     private val members = ArenaService.defaultMembers
     private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
 
+    @Test fun doubaoFollowupUsesV2OnlyRawMessageWithoutResendingOrReadingFirstAnswer() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                window.sentQuestions=[];
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  sentQuestions.push(raw);document.querySelector('textarea').value='';
+                  setTimeout(()=>{
+                    const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                    row.innerHTML='<div data-send-message-boundary data-message-id="followup-'+number+'"><div class="bg-g-send"><p>Keep <code>x</code> exactly.</p><pre><code>    return '+number+'</code></pre><span>展开全部</span></div></div>';
+                    document.body.appendChild(row);
+                    const message=fixtureDoubaoMessage(row,raw);
+                    message.content_blocks_v2=[{block_type:10000,is_finish:false,content:{text_block:{text:raw}}}];
+                    if(number>1)message.content_blocks=undefined;
+                    document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-reply-message><div class="md-box-root">Answer '+number+'</div></div><div class="message-action-bar" style="height:30px">Copy</div></div>');
+                  },1800);
+                };true;
+            """.trimIndent())
+            (1..2).forEach { number ->
+                val prompt = "Keep `x` exactly.\n```python\n    return $number\n```"
+                val request = "raw-followup-$number"
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPrompt(ArenaService.DOUBAO, prompt, request) { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(22, TimeUnit.SECONDS))
+                assertTrue(outcome.get().toString(), outcome.get().success)
+                assertEquals(number.toString(), evaluate(view, "sendCount"))
+                assertEquals(prompt, evaluate(view, "sentQuestions[${number - 1}]"))
+                assertEquals("followup-$number", evaluate(view, "window.__aiArenaRequests['$request'].boundUserId"))
+                val answer = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, request, requireIdentity = true)))
+                assertEquals("Answer $number", answer.getString("text"))
+            }
+        }
+    }
+
     @Test fun doubaoRenderedMarkdownPromptConfirmsOneSubmissionUsingOriginalMessage() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)

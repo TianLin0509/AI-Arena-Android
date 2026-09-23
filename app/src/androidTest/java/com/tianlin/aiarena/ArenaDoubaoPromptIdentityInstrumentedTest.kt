@@ -18,6 +18,90 @@ class ArenaDoubaoPromptIdentityInstrumentedTest {
     private val prompt = "Use **bold** and `x`.\n```python\n    return 7\n```"
     private val rendered = "<p>Use <strong>bold</strong> and <code>x</code>.</p><pre><code>    return 7</code></pre><span>展开全部</span>"
 
+    @Test fun v2OnlyFollowupKeepsRawMarkdownEvenWithUnfinishedBlockFlag() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt, keepV1 = false)
+        assertEquals("true", bind(view))
+        assertEquals("This round answer", JSONObject(js(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, request, requireIdentity = true))).getString("text"))
+    }
+
+    @Test fun equivalentV1AndV2OriginalTextsCanConfirmTheSameMessage() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt, keepV1 = true)
+        assertEquals("true", bind(view))
+    }
+
+    @Test fun conflictingV1AndV2OriginalTextsCannotSelectTheConvenientSchema() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, "different original text", keepV1 = true)
+        assertEquals("false", bind(view))
+    }
+
+    @Test fun malformedPresentV1CannotFallBackToValidV2() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt, keepV1 = true)
+        listOf("null", "[]", "[{block_type:99999,content_obj:{text:'ignored'}}]").forEach { bad ->
+            js(view, "fixtureMessage.content_blocks=$bad")
+            assertEquals(bad, "false", bind(view))
+        }
+    }
+
+    @Test fun malformedPresentV2CannotFallBackToValidV1() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        val text = JSONObject.quote(prompt)
+        listOf("null", "[]", "[{block_type:99999,content:{text_block:{text:$text}}}]",
+            "[{block_type:10000,content:{text_block:{text:7}}}]",
+            "[{block_type:10000,is_deleted:true,content:{text_block:{text:$text}}}]",
+            "[{block_type:10000,is_deleted:'false',content:{text_block:{text:$text}}}]",
+            "[{block_type:10000,is_finish:null,content:{text_block:{text:$text}}}]",
+            "[{block_type:10000,content:{text_block:{text:$text}}},{block_type:10000,content:{text_block:{text:''}}}]").forEach { bad ->
+            js(view, "fixtureMessage.content_blocks_v2=$bad")
+            assertEquals(bad, "false", bind(view))
+        }
+    }
+
+    @Test fun v2RawCodeIndentationCannotBeCollapsedIntoAMatch() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt.replace("    return", "        return"), keepV1 = false)
+        assertEquals("false", bind(view))
+    }
+
+    @Test fun v2OriginalTextStillRequiresTheSameOfficialMessageId() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt, keepV1 = false)
+        js(view, "fixtureMessage.message_id='other-message'")
+        assertEquals("false", bind(view))
+    }
+
+    @Test fun conflictingOwnedV2SnapshotsCannotBorrowAnotherOriginalText() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        useV2(view, prompt, keepV1 = false)
+        js(view, "fixtureBoundary.memoizedProps={value:{message:{message_id:'user-current',content_blocks_v2:[{block_type:10000,content:{text_block:{text:'other question'}}}]}}}")
+        assertEquals("false", bind(view))
+    }
+
+    @Test fun lateV2MetadataCanConfirmWithoutReplacingTheOriginalRow() = page { view ->
+        prepare(view, prompt)
+        mount(view, prompt, rendered)
+        js(view, "fixtureMessage.content_blocks=undefined")
+        assertEquals("false", bind(view))
+        useV2(view, prompt, keepV1 = false)
+        assertEquals("true", bind(view))
+    }
+
+    private fun useV2(view: WebView, text: String, keepV1: Boolean) {
+        js(view, "fixtureMessage.content_blocks_v2=[{block_type:10000,is_finish:false,content:{text_block:{text:${JSONObject.quote(text)}}}}];" +
+            (if (keepV1) "" else "fixtureMessage.content_blocks=undefined;") + "true")
+    }
+
     @Test fun renderedMarkdownReceiptUsesOriginalMessageTextAndStableId() = page { view ->
         prepare(view, prompt)
         mount(view, prompt, rendered)

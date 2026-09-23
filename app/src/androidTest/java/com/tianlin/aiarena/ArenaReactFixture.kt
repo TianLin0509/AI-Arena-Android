@@ -16,9 +16,11 @@ internal object ArenaReactFixture {
           const boundary=row.querySelector('[data-send-message-boundary]');
           const root={tag:3,stateNode:{},child:null};root.stateNode.current=root;
           const host=fixtureFiber(row,{},root);
-          const owner=fixtureNode({message:{message_id:boundary.getAttribute('data-message-id'),
-            content_blocks:[{block_type:10000,is_deleted:false,content_obj:{text}}]}},host);
+          const message={message_id:boundary.getAttribute('data-message-id'),
+            content_blocks:[{block_type:10000,is_deleted:false,content_obj:{text}}]};
+          const owner=fixtureNode({message},host);
           fixtureFiber(boundary,{},owner);
+          return message;
         };
     """.trimIndent()
 }

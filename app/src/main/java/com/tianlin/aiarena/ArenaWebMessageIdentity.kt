@@ -136,15 +136,26 @@ internal object ArenaWebMessageIdentity {
           if (!messages.length) return save({present:true,valid:false});
           let text = null;
           for (const message of messages) {
-            // Observed Doubao text-message schema; do not substitute TTS, a rendered
-            // snippet, unknown blocks, or a parent conversation's other message.
-            const blocks = message.content_blocks;
-            if (message.message_id !== id || !Array.isArray(blocks) || blocks.length !== 1 ||
-                blocks.some(block => !block || block.block_type !== 10000 || block.is_deleted === true ||
-                  !block.content_obj || typeof block.content_obj.text !== 'string')) return save({present:true,valid:false});
-            const candidate = blocks[0].content_obj.text;
-            if (text !== null && text !== candidate) return save({present:true,valid:false});
-            text = candidate;
+            // Loaded messages expose a v1 projection as well as v2. A live follow-up
+            // can expose only v2, even after its official ID and answer have arrived.
+            // Every present schema must be valid and agree; never hide a malformed
+            // or conflicting source behind the other schema, TTS or rendered text.
+            if (message.message_id !== id) return save({present:true,valid:false});
+            let sources = 0;
+            for (const field of ['content_blocks', 'content_blocks_v2']) {
+              const blocks = message[field];
+              if (blocks === undefined) continue;
+              if (!Array.isArray(blocks) || blocks.length !== 1) return save({present:true,valid:false});
+              const block = blocks[0];
+              if (!block || block.block_type !== 10000 || block.is_deleted === true ||
+                  ['is_deleted', 'is_finish'].some(flag => block[flag] !== undefined && typeof block[flag] !== 'boolean')) return save({present:true,valid:false});
+              const original = field === 'content_blocks' ? block.content_obj : block.content && block.content.text_block;
+              if (!original || typeof original.text !== 'string') return save({present:true,valid:false});
+              if (text !== null && text !== original.text) return save({present:true,valid:false});
+              text = original.text;
+              sources++;
+            }
+            if (!sources) return save({present:true,valid:false});
           }
           return save({present:true,valid:true,text});
         };
