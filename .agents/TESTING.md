@@ -82,6 +82,7 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 - WebView 设为 `GONE` 时 `visibilityState` 仍是 `visible`，但每帧都有画面变化的页面只剩约 8 帧/秒（`VISIBLE` 约 35 帧/秒，与透明度、叠放、是否被 Compose 遮挡无关，模拟器实测）。所有网页共用一个渲染主线程，另一页的长任务会让三页同时卡顿，这一点不因可见性改变。
 - 豆包新对话先挂 `textarea[data-testid=chat_input_input]` 过渡框，再换成 tiptap；主线程空闲约 4 秒，被占满时约 16 秒。过渡框永远不算就绪，也不写入正文。
 - 豆包显示 `chat_input_local_break_button` 或存在队列项时不点击发送。
+- 豆包页面 `visibilityState` 为 hidden（App 在后台）或恢复可见不足 1.5 秒时不点击发送：真实账号上发送后约 3 秒按 HOME，点击落在后台期间，问题进入网页队列且 `sendMessageStatusMap` 卡在 `Sending`。验证须让 HOME 覆盖点击时刻（发送后 1~4.5 秒）。
 - 修改可见性、就绪判定或豆包发送时，除合成用例外，须在保留登录的隔离账号设备上跑“新对话 + 发送后不同时机切后台”的连续轮次，并用 CDP 只读记录豆包 `sendMessageStatusMap`、停止按钮与队列。
 
 ## 发布

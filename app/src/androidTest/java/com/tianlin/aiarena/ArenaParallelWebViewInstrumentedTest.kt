@@ -907,6 +907,35 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun doubaoHiddenPageIsNotClickedUntilVisibleAgain() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // 2026-09-23: a click while the App was in background queued the question behind a stuck Sending status.
+            evaluate(view, """
+                window.fakeVisibility='hidden';
+                Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});
+                document.dispatchEvent(new Event('visibilitychange'));
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  window.sentWhileHidden=document.visibilityState!=='visible';document.querySelector('textarea').value='';
+                  const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                  row.innerHTML='<div data-send-message-boundary data-message-id="visible-'+number+'"><div class="bg-g-send">'+raw+'</div></div>';
+                  document.body.appendChild(row);fixtureDoubaoMessage(row,raw);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "question sent only after returning", "hidden-then-visible") { outcome.set(it); done.countDown() } }
+            assertFalse(done.await(8, TimeUnit.SECONDS))
+            assertEquals("No click while the page is hidden", "0", evaluate(view, "sendCount"))
+            evaluate(view, "window.fakeVisibility='visible';document.dispatchEvent(new Event('visibilitychange'));window.visibleAt=Date.now();true")
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("false", evaluate(view, "window.sentWhileHidden"))
+        }
+    }
+
     @Test fun doubaoPersistentQueueReportsNotSentWithoutClicking() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)

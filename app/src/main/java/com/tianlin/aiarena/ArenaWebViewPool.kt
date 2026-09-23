@@ -1130,6 +1130,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
           const native=window.__aiArenaNativeSend;
           if(!native||native.id!==${ArenaJs.quote(requestId)}||window.__aiArenaCancelledRequests?.[native.id])return JSON.stringify({error:'豆包发送请求已取消'});
           if(window.__aiArenaSendClicks?.[native.id])return JSON.stringify({error:'豆包已点击发送，未重复提交'});
+          if(${doubaoHiddenExpression(ArenaService.DOUBAO)})return JSON.stringify({ready:false});
           if(${doubaoBusyExpression(ArenaService.DOUBAO)})return JSON.stringify({ready:false,busy:true});
           const shown=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>2&&r.height>2&&s.display!=='none'&&s.visibility!=='hidden'};
           const buttons=Array.from(document.querySelectorAll('button#flow-end-msg-send')).filter(shown);
@@ -1170,8 +1171,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 when (decodeJsValue(clickRaw)) {
                     // Waiting for idle keeps the question in the input and relies on the request watchdog.
                     "busy" -> token?.timeoutDetail = DOUBAO_BUSY_DETAIL
+                    "hidden" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL) token?.timeoutDetail = DOUBAO_HIDDEN_DETAIL
                     // Once submitted, a slow website receipt is observed until the watchdog; never click again.
-                    "clicked", "awaiting_confirmation" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL)
+                    "clicked", "awaiting_confirmation" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL || token.timeoutDetail == DOUBAO_HIDDEN_DETAIL)
                         token?.timeoutDetail = DOUBAO_UNCONFIRMED_DETAIL
                 }
                 handler.postDelayed({
@@ -1718,6 +1720,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
               if (state.expectedPrompt && arenaNormalize(inputText) !== state.expectedPrompt) return 'prompt_changed';
+              if (${doubaoHiddenExpression(service)}) return 'hidden';
               if (${doubaoBusyExpression(service)}) return 'busy';
               const send = arenaFirstMatch($sendSelectors);
               if (!arenaSendEnabled(send)) return 'not_ready';
@@ -1923,7 +1926,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (state.submittedAt || (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId])) return;
                   if (!input.isConnected || !currentInputText().trim()) return;
                   if (state.expectedPrompt && arenaNormalize(currentInputText()) !== state.expectedPrompt) return;
-                  if (${doubaoBusyExpression(service)}) return;
+                  if (${doubaoHiddenExpression(service)} || ${doubaoBusyExpression(service)}) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
                   if (send) {
@@ -2270,6 +2273,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "const shown = !!b && (r => r.width > 0 && r.height > 0)(b.getBoundingClientRect()) && getComputedStyle(b).display !== 'none' && getComputedStyle(b).visibility !== 'hidden'; " +
                 "return shown || !!document.querySelector('[data-testid=queue-message-item], [data-item-id][data-item-status=Pending], [data-item-id][data-item-status=Sending]'); })()"
 
+        /**
+         * Doubao's page is hidden (App in background) or became visible under 1.5 s ago (JS expression).
+         * 2026-09-23 real account: a send click 1.7 s after HOME put the question into Doubao's queue
+         * behind a status stuck at Sending; on becoming visible Doubao also reconnects and refreshes
+         * the conversation. Clicks wait for a settled visible page instead.
+         */
+        internal fun doubaoHiddenExpression(service: ArenaService): String =
+            if (service != ArenaService.DOUBAO) "false"
+            else "(() => { if (!window.__aiArenaVisibilityWatch) { window.__aiArenaVisibilityWatch = true; " +
+                "window.__aiArenaVisibleSince = document.visibilityState === 'visible' ? 1 : 0; " +
+                "document.addEventListener('visibilitychange', () => { window.__aiArenaVisibleSince = document.visibilityState === 'visible' ? Date.now() : 0; }); } " +
+                "return document.visibilityState !== 'visible' || !window.__aiArenaVisibleSince || Date.now() - window.__aiArenaVisibleSince < 1500; })()"
+
         /** 注入到页面的按优先级查找辅助函数。 */
         internal fun selectorHelperScript(): String = """
             const arenaFirstMatch = function(selectors) {
@@ -2287,6 +2303,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val READING_LIVE_MS = 5_000L
         private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
         private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
+        private const val DOUBAO_HIDDEN_DETAIL = "AI 圆桌在后台时不向豆包点击发送，本轮问题未发送；请回到 App 后重试"
         private const val DOUBAO_BUSY_DETAIL = "豆包网页仍在处理上一条消息（显示停止按钮或有排队消息），本轮问题未发送；请打开原网页核对后重试"
         private const val AUTOMATION_READY_ATTEMPTS = 15
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
