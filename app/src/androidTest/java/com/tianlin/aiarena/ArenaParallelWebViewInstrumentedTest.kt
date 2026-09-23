@@ -457,7 +457,8 @@ class ArenaParallelWebViewInstrumentedTest {
                 assertTrue(settled.await(8, TimeUnit.SECONDS))
                 assertNull(outcome.get())
             } else {
-                assertTrue(done.await(30, TimeUnit.SECONDS))
+                // A clicked Doubao request keeps observing a slow receipt until the 45 s request watchdog.
+                assertTrue(done.await(55, TimeUnit.SECONDS))
                 assertEquals(outcome.get().toString(), assignId, outcome.get().success)
                 assertEquals("false", evaluate(view, "earlyBound"))
                 if (assignId) assertEquals("stable-id", evaluate(view, "window.__aiArenaRequests['temporary-id'].boundUserId"))
@@ -830,7 +831,7 @@ class ArenaParallelWebViewInstrumentedTest {
     @Test fun freshPreparingPageStaysLaidOutUntilSettled() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)
-            interceptFreshPage(view, "<textarea></textarea><script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',3000)</script>")
+            interceptFreshPage(view, "<textarea data-testid=chat_input_input></textarea><script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',3000)</script>")
             onMain { pool.setProtectedServices(emptySet()) }
             waitUntil("idle page is not drawn") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
             val done = CountDownLatch(1)

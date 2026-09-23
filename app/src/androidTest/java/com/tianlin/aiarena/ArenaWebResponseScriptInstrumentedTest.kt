@@ -66,11 +66,11 @@ class ArenaWebResponseScriptInstrumentedTest {
             <div class="chat-content-item-assistant">
               <div class="segment-content"><div class="markdown-container"><div class="markdown"><div class="segment-code">
                 <div class="sticky-release"><div class="sticky-release-rail"><div class="sticky-release-header"><header class="segment-code-header"><span class="segment-code-lang">Python</span><span><div class="icon-button">Copy</div></span></header></div></div></div>
-                $body
+                CODE_BODY
               </div></div></div></div>
               <div class="segment-assistant-actions" style="height:32px"><button>复制</button></div>
             </div>
-        """.trimIndent() }
+        """.trimIndent().replace("CODE_BODY", body) }
         val pending = evaluate(ArenaService.KIMI, "kimi_code_pending", code(""))
         assertTrue("A code block without its body is not a finished answer", pending.getBoolean("streaming"))
         val done = evaluate(ArenaService.KIMI, "kimi_code_done",

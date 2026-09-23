@@ -2269,7 +2269,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val DOUBAO_SEND_ATTEMPTS = 7
         private const val READING_LIVE_MS = 5_000L
         private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
-        private const val DOUBAO_BUSY_DETAIL = "豆包网页上一条回答仍在进行或有待发送队列，本轮问题未发送；请打开原网页核对后重试"
+        private const val DOUBAO_BUSY_DETAIL = "豆包网页仍在处理上一条消息（显示停止按钮或有排队消息），本轮问题未发送；请打开原网页核对后重试"
         private const val AUTOMATION_READY_ATTEMPTS = 15
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L
