@@ -87,7 +87,7 @@ Author 在隔离合成网页设备上通过主机闸门（8 项工作流、131 �
 
 ## 发布
 
-当前产品版本 `0.15.1`、versionCode `25`，采用简洁顶部 Tab 回答界面。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
+当前产品版本 `0.15.2`、versionCode `26`，采用简洁顶部 Tab 回答界面。发布任务才更新版本；不采用每次合并自动 bump，以免普通流程变更触发用户升级。
 
 保持 `com.tianlin.aiarena` 和原 release 密钥。`keystore.properties`、密钥和密码留在仓库外/忽略文件；无签名配置的 release 构建是未签名包。Debug APK 和 CI 未签名 APK 不能替换用户已安装的签名 release。
 
