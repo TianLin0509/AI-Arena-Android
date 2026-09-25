@@ -147,11 +147,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     /**
-     * Keep every page taking part in the current round laid out; only a short input/touch action
-     * borrows the front surface. A GONE WebView still reports `visibilityState=visible`, but a page
-     * that changes every frame only gets ~8 animation frames/s instead of ~35 when VISIBLE, whatever
-     * the alpha or stacking (measured 2026-09-23, emulator). Doubao mounts its editor and advances its
-     * send status on frames, so round members stay VISIBLE (alpha 0.01) until the round ends. A parked
+     * Keep pages that need animation frames laid out; only a short input/touch action borrows the
+     * front surface. A GONE WebView still reports `visibilityState=visible`, but a page that changes
+     * every frame only gets ~8 animation frames/s instead of ~35 when VISIBLE, whatever the alpha or
+     * stacking (measured 2026-09-23, emulator). Every page preparing a new conversation stays drawn.
+     * For the rest of a round only Doubao does: it mounts its editor and advances its send status on
+     * frames, while DeepSeek and Kimi worked when GONE. Drawing all three for a whole round made the
+     * render thread wait on the GPU until an input ANR (2026-09-25, R8 build on the emulator). A parked
      * page is never front. Pages still share one renderer thread, so this removes only the GONE penalty.
      */
     private fun refreshVisibility() {
@@ -160,8 +162,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             ?: automations.entries.firstOrNull { !it.value.parked }?.key ?: pendingFreshPages.keys.firstOrNull()
         val live = ArenaService.entries.filter { candidate ->
             candidate == front || candidate == uiSelectedService || candidate in automations ||
-                candidate == backgroundProbeService || candidate in pendingFreshPages || candidate in protectedServices ||
-                (readingUntil[candidate] ?: 0L) > SystemClock.elapsedRealtime()
+                candidate == backgroundProbeService || candidate in pendingFreshPages ||
+                (candidate in FRAME_DRIVEN_SERVICES && (candidate in protectedServices || (readingUntil[candidate] ?: 0L) > SystemClock.elapsedRealtime()))
         }.toSet()
         val hidden = focusAction != null || uiSelectedService == null
         blockUserTouches = hidden
@@ -2326,6 +2328,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
         private const val READING_LIVE_MS = 5_000L
+        /** Sites whose round work advances on animation frames; only these stay drawn for a whole round. */
+        private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO)
         private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
         private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
         private const val DOUBAO_HIDDEN_DETAIL = "AI 圆桌在后台时不向豆包点击发送，本轮问题未发送；请回到 App 后重试"

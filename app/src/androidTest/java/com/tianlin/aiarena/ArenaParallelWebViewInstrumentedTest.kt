@@ -865,8 +865,11 @@ class ArenaParallelWebViewInstrumentedTest {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)
             evaluate(view, "window.userTaps=0;document.addEventListener('pointerdown',()=>userTaps++,true);true")
-            onMain { pool.setProtectedServices(setOf(ArenaService.DOUBAO)) }
+            onMain { pool.setProtectedServices(setOf(ArenaService.DOUBAO, ArenaService.KIMI)) }
             waitUntil("round member drawn") { var shown = false; onMain { shown = view.visibility == View.VISIBLE && pool.container.visibility == View.VISIBLE }; shown }
+            // Only frame-driven Doubao stays drawn for a whole round; drawing every member caused a render-thread ANR.
+            val kimi = views.getValue(ArenaService.KIMI)
+            waitUntil("non frame-driven member is not drawn") { var gone = false; onMain { gone = kimi.visibility == View.GONE }; gone }
             // A tap that reaches the hidden container (e.g. through a blank Compose area) is swallowed.
             onMain {
                 val now = SystemClock.uptimeMillis()
