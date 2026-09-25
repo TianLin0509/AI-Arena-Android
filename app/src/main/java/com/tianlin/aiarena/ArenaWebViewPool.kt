@@ -574,7 +574,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             callback(ResponseSnapshot(false, "", false, "网页尚未加载"))
             return
         }
-        keepDrawnWhileReading(service)
+        if (service in FRAME_DRIVEN_SERVICES) keepDrawnWhileReading(service)
         webView.evaluateJavascript(ArenaWebResponseScript.build(service, requestId, requireIdentity = ArenaWebMessageIdentity.supported(service))) { raw ->
             try {
                 val payload = JSONObject(decodeJsValue(raw))
@@ -686,7 +686,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         null -> onTimeout()
                     }
                 }
-                page.evaluateJavascript("!!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[${ArenaJs.quote(token.requestId)}])") { raw -> report(raw == "true") }
+                // One script cancels first, then reads: every page click path checks the cancel flag
+                // before clicking, so a later click is blocked and an earlier one is seen.
+                val id = ArenaJs.quote(token.requestId)
+                page.evaluateJavascript("(()=>{window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[$id]=true;" +
+                    "return !!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[$id]);})()") { raw -> report(raw == "true") }
                 handler.postDelayed({ report(null) }, 2_000L)
                 return@Runnable
             }
