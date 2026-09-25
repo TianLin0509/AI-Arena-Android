@@ -113,7 +113,9 @@ class ArenaParallelWebViewInstrumentedTest {
 
     @Test fun kimiReceiptBetweenProbesOutranksVisibleBusyDialog() = verifyKimiBusyDialog(false, lateReceipt = true)
 
-    private fun verifyKimiBusyDialog(hidden: Boolean, lateReceipt: Boolean = false) {
+    @Test fun kimiCreditsUsedUpDialogIsExplicitFailureWithoutResubmission() = verifyKimiBusyDialog(false, quota = true)
+
+    private fun verifyKimiBusyDialog(hidden: Boolean, lateReceipt: Boolean = false, quota: Boolean = false) {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.KIMI)
             evaluate(view, """
@@ -121,7 +123,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   sendCount++;
                   const modal=document.createElement('div');modal.className='modal-mask';
                   modal.style='width:300px;min-height:100px;'+($hidden?'display:none':'');
-                  modal.innerHTML='<div data-testid="confirm-dialog"><div class="body">Too many people are chatting with Kimi; a subscription will grant you priority access.</div><button data-testid="confirm-dialog-cancel">Got it</button><button data-testid="confirm-dialog-confirm">Upgrade</button></div>';
+                  modal.innerHTML='<div data-testid="confirm-dialog"><div class="body">'+($quota?'Tips Credits used up.':'Too many people are chatting with Kimi; a subscription will grant you priority access.')+'</div><button data-testid="confirm-dialog-cancel">Got it</button><button data-testid="confirm-dialog-confirm">Upgrade</button></div>';
                   document.body.appendChild(modal);
                   const quote=document.createElement('p');quote.textContent='Too many people are chatting with Kimi';document.body.appendChild(quote);
                   const accept=()=>{
@@ -147,10 +149,10 @@ class ArenaParallelWebViewInstrumentedTest {
             onMain { pool.sendPrompt(ArenaService.KIMI, "busy question", "busy-kimi") { outcome.set(it); done.countDown() } }
             assertTrue(done.await(20, TimeUnit.SECONDS))
             assertEquals(outcome.get().toString(), hidden || lateReceipt, outcome.get().success)
-            if (!hidden && !lateReceipt) assertEquals(ArenaKimiRejection.busyDetail, outcome.get().detail)
+            if (!hidden && !lateReceipt) assertEquals(if (quota) ArenaKimiRejection.quotaDetail else ArenaKimiRejection.busyDetail, outcome.get().detail)
             if (lateReceipt) assertEquals("true", evaluate(view, "window.lateReceiptInserted"))
             assertEquals("1", evaluate(view, "sendCount"))
-            assertEquals(if (hidden) "" else "busy", evaluate(view, ArenaKimiRejection.expression))
+            assertEquals(if (hidden) "" else if (quota) "quota" else "busy", evaluate(view, ArenaKimiRejection.expression))
         }
     }
 

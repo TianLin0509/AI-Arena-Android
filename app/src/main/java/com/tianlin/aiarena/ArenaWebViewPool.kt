@@ -413,6 +413,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
               const expected = ${ArenaJs.quote(service.url.trimEnd('/'))};
               const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
+              ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
               const queued = ${service == ArenaService.DOUBAO} && !!document.querySelector('[data-item-status=Pending], [data-item-status=Sending]');
               ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
               // History or a website send queue on the root page is never ready. Keep polling:
@@ -667,8 +668,28 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         automations[service] = token
         val watchdog = Runnable {
             if (!isCurrent(service, token)) return@Runnable
+            val detail = token.timeoutDetail
+            val page = webViews[service]
+            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL)) {
+                // The page may have clicked just before this deadline while its callback is still queued.
+                // Never tell the user "not sent" then: a retry would ask the question twice.
+                var reported = false
+                fun report(clicked: Boolean?) {
+                    if (reported || !isCurrent(service, token)) return
+                    reported = true
+                    finishAutomation(service)
+                    when (clicked) {
+                        true -> onInterrupted(DOUBAO_UNCONFIRMED_DETAIL)
+                        false -> onInterrupted(detail)
+                        null -> onTimeout()
+                    }
+                }
+                page.evaluateJavascript("!!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[${ArenaJs.quote(token.requestId)}])") { raw -> report(raw == "true") }
+                handler.postDelayed({ report(null) }, 2_000L)
+                return@Runnable
+            }
             finishAutomation(service)
-            token.timeoutDetail?.let(onInterrupted) ?: onTimeout()
+            detail?.let(onInterrupted) ?: onTimeout()
         }
         token.watchdog = watchdog
         handler.postDelayed(watchdog, timeoutMillis)
@@ -691,6 +712,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             (function() {
               ${selectorHelperScript()}
               const input = arenaFirstMatch($selectors);
+              ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
               if (!${token.strictReceipt}) return !!input;
               const key = ${ArenaJs.quote(token.requestId)};
               const text = input ? (input.value || input.innerText || input.textContent || '') : '';
@@ -929,8 +951,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     if (rejection == "accepted") finishSuccessfulSend(webView, service, requestId, callback)
                     else if (rejection == "input_error") finishSend(service, SendOutcome(false, requestId,
                         "网页输入失败，请检查原网页；未发送问题"), callback)
-                    else if (rejection == "busy" || rejection == "membership") finishSend(service, SendOutcome(false, requestId,
-                        if (rejection == "busy") ArenaKimiRejection.busyDetail else ArenaKimiRejection.membershipDetail), callback)
+                    else if (ArenaKimiRejection.detail(rejection) != null) finishSend(service, SendOutcome(false, requestId,
+                        ArenaKimiRejection.detail(rejection)!!), callback)
                     else if (attempt < 15) handler.postDelayed({
                         if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
                     }, 500L)
@@ -2282,7 +2304,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         internal fun doubaoHiddenExpression(service: ArenaService): String =
             if (service != ArenaService.DOUBAO) "false"
             else "(() => { if (!window.__aiArenaVisibilityWatch) { window.__aiArenaVisibilityWatch = true; " +
-                "window.__aiArenaVisibleSince = document.visibilityState === 'visible' ? 1 : 0; " +
+                // Seed from the browser's visibility history when available; otherwise assume long visible.
+                "const history = (performance.getEntriesByType && performance.getEntriesByType('visibility-state')) || []; " +
+                "const last = history[history.length - 1]; " +
+                "window.__aiArenaVisibleSince = document.visibilityState !== 'visible' ? 0 : last && last.name === 'visible' && last.startTime > 0 ? performance.timeOrigin + last.startTime : 1; " +
                 "document.addEventListener('visibilitychange', () => { window.__aiArenaVisibleSince = document.visibilityState === 'visible' ? Date.now() : 0; }); } " +
                 "return document.visibilityState !== 'visible' || !window.__aiArenaVisibleSince || Date.now() - window.__aiArenaVisibleSince < 1500; })()"
 

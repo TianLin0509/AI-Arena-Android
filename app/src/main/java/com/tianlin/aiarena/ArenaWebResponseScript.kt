@@ -213,7 +213,8 @@ internal object ArenaWebResponseScript {
                 // A confirmed current question outranks unrelated or stale upgrade dialogs.
                 const rejection = ${ArenaKimiRejection.expression};
                 if (!user && rejection) {
-                  throw new Error(rejection === 'busy' ? ${ArenaJs.quote(ArenaKimiRejection.busyDetail)} : ${ArenaJs.quote(ArenaKimiRejection.membershipDetail)});
+                  throw new Error(rejection === 'busy' ? ${ArenaJs.quote(ArenaKimiRejection.busyDetail)} :
+                    rejection === 'quota' ? ${ArenaJs.quote(ArenaKimiRejection.quotaDetail)} : ${ArenaJs.quote(ArenaKimiRejection.membershipDetail)});
                 }
                 if (user) {
                   arenaBindRequestUser(user);
