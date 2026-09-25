@@ -359,7 +359,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** 站点根地址（含尾斜杠差异）就算"新对话"页。 */
     private fun isRootUrl(service: ArenaService, url: String): Boolean {
         fun norm(value: String) = value.substringBefore('?').substringBefore('#').trimEnd('/')
-        return norm(url) == norm(service.url)
+        return freshRootUrls(service).any { norm(url) == norm(it) }
+    }
+
+    private fun freshRootUrls(service: ArenaService): List<String> = when (service) {
+        // Read from the logged-in mobile sites on 2026-09-25. These are home routes,
+        // not arbitrary same-origin paths: history navigation still requires exact URLs.
+        ArenaService.YUANBAO -> listOf(service.url, "https://yuanbao.tencent.com/chat/naQivTmsDa")
+        ArenaService.ZHIPU -> listOf(service.url, "https://chatglm.cn/miniapp/home")
+        else -> listOf(service.url)
     }
 
     private fun settlePendingLoad(service: ArenaService, ok: Boolean) {
@@ -367,7 +375,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val generation = navigationGenerations[service]
         val target = navigationTargets[service]
         fun normalized(url: String?) = url.orEmpty().substringBefore('?').substringBefore('#').trimEnd('/')
-        if (ok && normalized(webViews[service]?.url) != normalized(target)) return
+        if (ok && normalized(webViews[service]?.url) != normalized(target) &&
+            !(target != null && isRootUrl(service, target) && isRootUrl(service, webViews[service]?.url.orEmpty()))) return
         // 单页应用在 onPageFinished 之后还要跑一会儿脚本才会把输入框画出来；留一点余量
         handler.postDelayed({
             if (pendingLoads[service] === pending && navigationGenerations[service] == generation) {
@@ -392,7 +401,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             ArenaService.DEEPSEEK -> ".ds-virtual-list-visible-items .ds-message"
             ArenaService.DOUBAO -> "[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row], [data-reply-message]"
             ArenaService.KIMI -> ".chat-content-item-user, .chat-content-item-assistant"
-            else -> "[data-ai-arena-request]"
+            else -> ArenaWebCursorScript.responseSelectors(service).joinToString(",")
         }
         val probe = """
             (() => {
@@ -411,16 +420,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 return true;
               });
               const input = usable.length === 1 ? usable[0] : null;
-              const draft = input && String(/^(TEXTAREA|INPUT)$/.test(input.tagName) ? input.value : input.innerText).trim();
+              $editorDraftHelper
+              const draft = arenaEditorDraft(input);
               const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
-              const expected = ${ArenaJs.quote(service.url.trimEnd('/'))};
+              const expected = ${ArenaJs.quoteArray(freshRootUrls(service).map { it.trimEnd('/') })};
               const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
               ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
               const queued = ${service == ArenaService.DOUBAO} && !!document.querySelector('[data-item-status=Pending], [data-item-status=Sending]');
               ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
               // History or a website send queue on the root page is never ready. Keep polling:
               // a single hydration sample must not fail the round; the deadline still decides.
-              const blocked = root !== expected ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft ? 'draft' :
+              const blocked = !expected.includes(root) ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft ? 'draft' :
                 (!input || document.readyState !== 'complete') ? 'no_editor' : '';
               if (blocked) { window.__aiArenaFreshPage = null; return blocked; }
               const previous = window.__aiArenaFreshPage;
@@ -946,7 +956,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             if (raw == "true") {
                 finishSuccessfulSend(webView, service, requestId, callback)
             } else if (decodeJsValue(raw) == "scope_changed") {
-                finishSend(service, SendOutcome(false, requestId, ArenaWebMessageIdentity.scopeChangedDetail), callback)
+                finishSend(service, SendOutcome(false, requestId, ArenaWebMessageIdentity.scopeChangedDetail(service)), callback)
+            } else if (service == ArenaService.ZHIPU && decodeJsValue(raw).startsWith("zhipu_error:")) {
+                val reason = when (decodeJsValue(raw).removePrefix("zhipu_error:")) {
+                    "send_disabled", "no_send_button" -> "发送按钮尚不可用"
+                    "page_changed" -> "页面已切换"
+                    "input_changed", "no_input", "no_input_listener" -> "输入框尚未就绪或内容发生变化"
+                    else -> "网页没有确认发送"
+                }
+                finishSend(service, SendOutcome(false, requestId, "智谱$reason，请打开原网页核对；不会自动重复发送"), callback)
             } else if (service == ArenaService.KIMI) {
                 // A receipt can arrive between these evaluations. Check it again atomically
                 // with the dialog classification so a stale dialog cannot override delivery.
@@ -1704,7 +1722,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun verifySendScript(service: ArenaService, requestId: String): String {
         if (automations[service]?.strictReceipt == true) {
-            return ArenaWebCursorScript.bind(service, requestId, requireIdentity = true)
+            val bind = ArenaWebCursorScript.bind(service, requestId, requireIdentity = true)
+            if (service == ArenaService.ZHIPU) return """
+                (() => {
+                  const receipt = ${bind.removeSuffix(";")};
+                  if (receipt === true || receipt === 'scope_changed') return receipt;
+                  const failure = window.__aiArenaZhipuDispatchResults?.[${ArenaJs.quote(requestId)}] || '';
+                  return failure.startsWith('error:') ? 'zhipu_error:' + failure.slice(6) : false;
+                })();
+            """.trimIndent()
+            return bind
         }
         val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val selectorHelper = selectorHelperScript()
@@ -1739,7 +1766,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${ArenaWebMessageIdentity.helper(service)}
               $selectorHelper
               ${sendControlHelperScript()}
-              if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)};
+              if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail(service))};
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
               if (window.__aiArenaNativeSendRequests?.[requestId]) return 'native_managed';
@@ -1809,7 +1836,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${ArenaWebMessageIdentity.helper(service)}
                 const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
                 if (cancelled()) return 'cancelled';
-                if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)};
+                if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail(service))};
                 $selectorHelper
                 ${sendControlHelperScript()}
                 $qwenFetchHook
@@ -1976,20 +2003,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
     }
 
-    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
-    private fun sendControlHelperScript(): String = """
-        const arenaSendEnabled = function(send) {
-          if (!send) return false;
-          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
-          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
-          for(let node=send;node&&node!==document.body;node=node.parentElement){
-            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
-            // CSS-module disabled states such as Yuanbao's SendButton_disabled__hash.
-            if(Array.from(node.classList).some(name=>/(^|_)disabled(_|${'$'})/i.test(name)))return false;
-          }
-          return true;
-        };
-    """.trimIndent()
 
     /**
      * 输入框候选，**按优先级从精确到兜底排列**。
@@ -2019,7 +2032,33 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         promptInputSelectors(service).joinToString(", ")
 
     companion object {
-        private val ZHIPU_DOCUMENT_START_CAPTURE = """
+        internal val editorDraftHelper = """
+            const arenaEditorDraft = input => {
+              if (!input) return '';
+              if (/^(TEXTAREA|INPUT)$/.test(input.tagName)) return String(input.value || '').trim();
+              const copy = input.cloneNode(true);
+              // Slate's empty editor contains a real DOM placeholder (Qwen, 2026-09-25).
+              // Ignore only framework-marked placeholders, never delete the live draft.
+              copy.querySelectorAll('[data-slate-placeholder=true], [data-slate-zero-width]').forEach(node => node.remove());
+              return String(copy.textContent || '').trim();
+            };
+        """.trimIndent()
+    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
+        private fun sendControlHelperScript(): String = """
+        const arenaSendEnabled = function(send) {
+          if (!send) return false;
+          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
+          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
+          for(let node=send;node&&node!==document.body;node=node.parentElement){
+            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
+            // CSS-module disabled states such as Yuanbao's SendButton_disabled__hash.
+            if(Array.from(node.classList).some(name=>/(^|_)disabled(_|${'$'})/i.test(name)))return false;
+          }
+          return true;
+        };
+    """.trimIndent()
+
+        internal val ZHIPU_DOCUMENT_START_CAPTURE = """
             (function() {
               try {
                 const eventTargetPrototype = window.EventTarget && window.EventTarget.prototype;
@@ -2042,8 +2081,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     !payload || payload.channel !== '__ai_arena_zhipu_send_v1') return;
                   const requestId = String(payload.requestId || '');
                   const text = String(payload.text || '');
+                  if (!requestId || !text || window.__aiArenaCancelledRequests?.[requestId] ||
+                      window.__aiArenaSendClicks?.[requestId]) return;
                   window.__aiArenaZhipuDispatchResults = window.__aiArenaZhipuDispatchResults || {};
+                  if (window.__aiArenaZhipuDispatchResults[requestId]) return;
+                  window.__aiArenaZhipuDispatchResults[requestId] = 'preparing';
                   try {
+                    const pageUrl = location.href;
+                    const owner = window.__aiArenaRequests?.[requestId];
+                    if (owner && owner.initialUrl !== pageUrl) throw new Error('page_changed');
                     const input = document.querySelector("[contenteditable='true'],[role='textbox'],textarea");
                     if (!input) throw new Error('no_input');
                     const inputPrototype = input.tagName === 'TEXTAREA'
@@ -2075,26 +2121,39 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                       if (typeof listener === 'function') listener.call(input, inputEvent);
                       else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(inputEvent);
                     }
-                    const send = document.querySelector('.button-right-inner');
-                    if (!send) throw new Error('no_send_button');
-                    const rect = send.getBoundingClientRect();
-                    const eventOptions = {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window,
-                      button: 0,
-                      buttons: 1,
-                      clientX: rect.left + rect.width / 2,
-                      clientY: rect.top + rect.height / 2
+                    ${sendControlHelperScript()}
+                    const deadline = Date.now() + 4000;
+                    const attempt = function() {
+                      try {
+                        if (window.__aiArenaCancelledRequests?.[requestId] || window.__aiArenaSendClicks?.[requestId]) return;
+                        if (location.href !== pageUrl || (owner && window.__aiArenaRequests?.[requestId] !== owner)) throw new Error('page_changed');
+                        if (Date.now() >= deadline) throw new Error('send_disabled');
+                        if (!input.isConnected) throw new Error('input_changed');
+                        const currentText = String(input.value || input.innerText || input.textContent || '').replace(/\s+/g,' ').trim();
+                        if (currentText !== text.replace(/\s+/g,' ').trim()) throw new Error('input_changed');
+                        const send = document.querySelector('.button-right-inner');
+                        if (!arenaSendEnabled(send)) {
+                          if (Date.now() >= deadline) throw new Error('send_disabled');
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
+                        const rect = send.getBoundingClientRect();
+                        const eventOptions = { bubbles:true, cancelable:true, view:window, button:0, buttons:1,
+                          clientX:rect.left + rect.width / 2, clientY:rect.top + rect.height / 2 };
+                        window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
+                        window.__aiArenaSendClicks[requestId] = Date.now();
+                        if (owner) {
+                          owner.submittedAt = window.__aiArenaSendClicks[requestId];
+                          try { sessionStorage.setItem('__ai_arena_cursor_' + requestId, JSON.stringify(owner)); } catch (_) {}
+                        }
+                        send.dispatchEvent(new MouseEvent('mousedown', eventOptions));
+                        send.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, eventOptions, {buttons:0})));
+                        window.__aiArenaZhipuDispatchResults[requestId] = 'dispatched';
+                      } catch (error) {
+                        window.__aiArenaZhipuDispatchResults[requestId] = 'error:' + String(error && error.message || error);
+                      }
                     };
-                    window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
-                    window.__aiArenaSendClicks[requestId] = Date.now();
-                    send.dispatchEvent(new MouseEvent('mousedown', eventOptions));
-                    send.dispatchEvent(new MouseEvent(
-                      'mouseup',
-                      Object.assign({}, eventOptions, { buttons: 0 })
-                    ));
-                    window.__aiArenaZhipuDispatchResults[requestId] = 'dispatched';
+                    setTimeout(attempt, 0);
                   } catch (error) {
                     window.__aiArenaZhipuDispatchResults[requestId] =
                       'error:' + String(error && error.message || error);

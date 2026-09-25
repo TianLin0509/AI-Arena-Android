@@ -7,18 +7,24 @@ internal object ArenaWebResponseScript {
      * 原来只用「选择器命中数量」当基线（`candidates.slice(baseline)`），在做了虚拟列表
      * 的站点上不可靠：旧消息被回收后命中数会变少，`slice` 直接返回空数组，于是永远
      * 读不到答案，只能等 5 分钟超时。有标记锚点时按文档顺序取"排在标记之后"的节点，
-     * 拿不到标记再退回原来的计数基线。
+     * 新请求必须匹配原问题，答案范围在下一条用户消息处截止；历史附件才使用计数兜底。
      */
     private val scopeHelper = """
         const scopeAfterTag = function(candidates, tagged, baseline) {
           if (tagged) {
+            const nextUser = arenaResponseUsers.find(function(row) {
+              return row !== tagged && !!(tagged.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
+            });
             const after = candidates.filter(function(row) {
               try {
-                return !!(tagged.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING);
+                return !tagged.contains(row) &&
+                  !!(tagged.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+                  (!nextUser || (!row.contains(nextUser) && !!(row.compareDocumentPosition(nextUser) & Node.DOCUMENT_POSITION_FOLLOWING)));
               } catch (_) { return false; }
             });
-            if (after.length) return { nodes: after, anchored: true };
+            return { nodes: after, anchored: true };
           }
+          if (state.expectedPrompt) return { nodes: [], anchored: false };
           const fallback = baseline < candidates.length ? candidates.slice(baseline) : [];
           return { nodes: fallback, anchored: false };
         };
@@ -269,23 +275,25 @@ internal object ArenaWebResponseScript {
                     networkRecord = JSON.parse(sessionStorage.getItem('__ai_arena_qwen_response_' + requestId) || 'null');
                   } catch (_) { networkRecord = null; }
                 }
-                const networkAnswer = networkRecord ? clean(networkRecord.answer) : '';
+                // The legacy TextDecoder hook cannot prove which fetch produced a chunk.
+                // Text-only requests use the DOM bounded by their acknowledged question.
+                const networkAnswer = networkRecord && !state.expectedPrompt ? clean(networkRecord.answer) : '';
                 if (networkAnswer.length > 0) {
                   text = networkAnswer;
                   streaming = !networkRecord.done;
                 }
                 const picked = pickSelector(['[class*=qk-markdown]', '.qk-md-paragraph', '[class*=assistant] [class*=content]', '[class*=answer-content]']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 if (!text) text = collectText(scoped, ['.qk-md-paragraph'], picked.selector, scoped.anchored);
-                const qwLast = picked.nodes.length ? picked.nodes[picked.nodes.length - 1] : null;
+                const qwLast = scoped.nodes.length ? scoped.nodes[scoped.nodes.length - 1] : null;
                 const qwRow = qwLast ? (qwLast.closest('[class*=message-card-wrap], [class*=answer], [class*=assistant]') || qwLast.parentElement) : null;
                 thinkingUsed = thinkingIn(qwRow, '[class*=think], [class*=thought], [class*=reason]');
                 // SSE 已经建了 record 但还没解析出内容时，networkRecord 存在而 answer 为空。
                 // 此时 streaming 必须回落到 DOM 探测，否则会被当成"已经稳定"提前判完成，
                 // 把千问思考过程中的半截答案当作最终答案存下来。
                 if (networkAnswer.length === 0) {
-                  streaming = !!document.querySelector('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating]');
+                  streaming = Array.from(document.querySelectorAll('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating]')).some(isVisible);
                   weakDoneSignal = true;
                 }
                 if (securityChallenge && !text) {
@@ -296,7 +304,7 @@ internal object ArenaWebResponseScript {
                 // 2026-09 的元宝页面：一条回答 = .agent-chat__list__item--ai 里的 .agent-chat__conv--ai__speech_show。
                 // 原来按内部 hyc-content-md 小块拼接，加粗片段各自成段（真机实测 235 字被拆成 7 段）；改为整块转换。
                 const picked = pickSelector(['.agent-chat__conv--ai__speech_show', '[class*=hyc-content-md]', '[class*=hyc-common-markdown]', '[class*=assistant] [class*=content]']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
                 // 深度搜索 / 思考过程 / 来源列表不算正式回答：在副本上摘掉再转 Markdown，页面本身不动
@@ -304,7 +312,12 @@ internal object ArenaWebResponseScript {
                 const stripAux = function(node) {
                   try {
                     const clone = node.cloneNode(true);
-                    Array.from(clone.querySelectorAll(auxYuanbao)).forEach(function(el) { if (el.parentNode) el.parentNode.removeChild(el); });
+                    Array.from(clone.querySelectorAll(auxYuanbao)).forEach(function(el) {
+                      // Yuanbao v2 puts BOTH the final markdown and thinking inside this shell.
+                      // Keep the shell; its __think children and search/source panels still go.
+                      if (el.classList.contains('hyc-component-deep-search-agent')) return;
+                      if (el.parentNode) el.parentNode.removeChild(el);
+                    });
                     return clone;
                   } catch (_) { return node; }
                 };
@@ -312,18 +325,17 @@ internal object ArenaWebResponseScript {
                   try { return node.matches('.agent-chat__conv--ai__speech_show'); } catch (_) { return false; }
                 });
                 if (speechNodes.length) {
-                  const speech = speechNodes[speechNodes.length - 1];
                   // 开头那行"已处理 / 已完成 / 已搜索…"是状态标签，不是回答
                   const dropStatus = function(value) {
                     return clean(String(value || '').replace(/^(已处理|已完成|已搜索[^\n]*|已思考[^\n]*|已联网搜索[^\n]*)\s*\n+/, ''));
                   };
-                  finalText = dropStatus(arenaToMarkdown(stripAux(speech)));
-                  text = finalText || dropStatus(arenaToMarkdown(speech)) || text;
+                  finalText = clean(topLevelOnly(speechNodes).map(function(speech) { return dropStatus(arenaToMarkdown(stripAux(speech))); }).filter(Boolean).join('\n\n'));
+                  text = finalText;
                 }
                 // 结束信号（采样验证）：生成期间输入区有 "Stop Answering" 控件、该条回答的 toolbar 隐藏；结束后反过来
-                const aiItems = Array.from(document.querySelectorAll('.agent-chat__list__item--ai'));
+                const aiItems = scoped.nodes.map(node => node.closest('.agent-chat__list__item--ai')).filter(Boolean);
                 const lastItem = aiItems.length ? aiItems[aiItems.length - 1] : null;
-                thinkingUsed = thinkingIn(lastItem, '[class*=think], [class*=thought], [class*=reason], [class*=deep-search]');
+                thinkingUsed = thinkingIn(lastItem, '[class*=think], [class*=thought], [class*=reason]');
                 const stopVisible = Array.from(document.querySelectorAll('[aria-label="Stop Answering"], [aria-label*="停止"], button[class*=stop]')).some(isVisible);
                 const toolbarVisible = !!lastItem && isVisible(lastItem.querySelector('.agent-chat__conv--ai__toolbar'));
                 streaming = stopVisible || (!!lastItem && !toolbarVisible);
@@ -331,11 +343,19 @@ internal object ArenaWebResponseScript {
             ArenaService.ZHIPU -> """
                 // 2026-09 的智谱页面：一条回答 = .answer 里的 .answer-content（前面的"AI生成"标签不在其中）
                 const picked = pickSelector(['.answer .answer-content', '[class*=assistant] [class*=markdown]', '[class*=assistant] [class*=content]', '[data-role=assistant]', '[class*=answer] [class*=markdown]', '[class*=markdown-body]']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
+                // Mobile GLM nests its hidden reasoning in answer-content alongside the final answer.
+                // Work on a copy so collapsed reasoning cannot leak into the saved response.
+                finalText = clean(topLevelOnly(scoped.nodes).map(function(node) {
+                  const copy = node.cloneNode(true);
+                  copy.querySelectorAll('.thinking, .thinking-area, .advance-thinking-content').forEach(el => el.remove());
+                  return arenaToMarkdown(copy);
+                }).filter(Boolean).join('\n\n'));
+                text = finalText;
                 // 结束信号：回答下面的 .interact 操作区显示出来；生成期间若有停止按钮也算还在生成
-                const answers = Array.from(document.querySelectorAll('.answer'));
+                const answers = scoped.nodes.map(node => node.closest('.answer')).filter(Boolean);
                 const lastAnswer = answers.length ? answers[answers.length - 1] : null;
                 thinkingUsed = thinkingIn(lastAnswer ? (lastAnswer.closest('.conversation') || lastAnswer.parentElement || lastAnswer) : null, '[class*=think], [class*=thought], [class*=reason]');
                 const stopVisible = Array.from(document.querySelectorAll('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating], [class*=typing]')).some(isVisible);
@@ -347,10 +367,10 @@ internal object ArenaWebResponseScript {
             ArenaService.CLAUDE -> """
                 // Claude 网页：回答正文 .font-claude-response；生成期间外层 data-is-streaming="true"
                 const picked = pickSelector(['.font-claude-response', '.font-claude-message', '[data-is-streaming] .standard-markdown']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
-                const clBlocks = Array.from(document.querySelectorAll('[data-is-streaming]'));
+                const clBlocks = scoped.nodes.map(node => node.closest('[data-is-streaming]')).filter(Boolean);
                 const clLast = clBlocks.length ? clBlocks[clBlocks.length - 1] : null;
                 thinkingUsed = thinkingIn(clLast, '[class*=think], [class*=thought], [class*=reason]');
                 const stopVisible = Array.from(document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
@@ -359,10 +379,10 @@ internal object ArenaWebResponseScript {
             ArenaService.CHATGPT -> """
                 // ChatGPT 网页：消息带 data-message-author-role，正文在 .markdown；结束后出现复制按钮
                 const picked = pickSelector(['[data-message-author-role=assistant] .markdown', '[data-message-author-role=assistant]']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
-                const gptTurns = Array.from(document.querySelectorAll('[data-message-author-role=assistant]'));
+                const gptTurns = scoped.nodes.map(node => node.closest('[data-message-author-role=assistant]')).filter(Boolean);
                 const gptLast = gptTurns.length ? gptTurns[gptTurns.length - 1] : null;
                 const gptRoot = gptLast ? (gptLast.closest('article, [data-testid^=conversation-turn]') || gptLast.parentElement) : null;
                 thinkingUsed = thinkingIn(gptRoot, '[class*=think], [class*=thought], [class*=reason]');
@@ -373,10 +393,10 @@ internal object ArenaWebResponseScript {
             ArenaService.GEMINI -> """
                 // Gemini 网页：用户 user-query，回答 model-response message-content；结束后出现 message-actions
                 const picked = pickSelector(['model-response message-content .markdown', 'model-response message-content']);
-                const tagged = document.querySelector('[data-ai-arena-request="' + requestId + '"]');
+                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 text = collectText(scoped, [], picked.selector, scoped.anchored);
-                const gmResponses = Array.from(document.querySelectorAll('model-response'));
+                const gmResponses = scoped.nodes.map(node => node.closest('model-response')).filter(Boolean);
                 const gmLast = gmResponses.length ? gmResponses[gmResponses.length - 1] : null;
                 thinkingUsed = thinkingIn(gmLast, 'model-thoughts, [class*=thought]');
                 const stopVisible = Array.from(document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
@@ -390,6 +410,7 @@ internal object ArenaWebResponseScript {
             (function() {
               $stateBootstrap
               ${ArenaWebMessageIdentity.helper(service)}
+              const arenaResponseUsers = ${ArenaWebMessageIdentity.users(service)};
               const clean = function(value) { return String(value || '').trim(); };
               ${ArenaMarkdownScript.helper}
               $scopeHelper
@@ -409,9 +430,9 @@ internal object ArenaWebResponseScript {
                   ${ArenaWebModeScript.helpers}
                   ${ArenaWebModeScript.body(service)}
                 } catch (_) {}
-                if (!arenaRequestScopeValid()) throw new Error(${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail)});
+                if (!arenaRequestScopeValid()) throw new Error(${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail(service))});
                 if ($requireIdentity && !state.expectedPrompt && state.legacyAttachment !== true) throw new Error("本轮消息定位信息已丢失，请打开原网页核对；不会自动重复发送");
-                if ($requireIdentity && ${ArenaWebMessageIdentity.supported(service)} && state.expectedPrompt && !state.boundUserId) throw new Error("本轮消息尚未取得官网编号，请打开原网页核对；不会自动重复发送");
+                if ($requireIdentity && ${ArenaWebMessageIdentity.requiresServerId(service)} && state.expectedPrompt && !state.boundUserId) throw new Error("本轮消息尚未取得官网编号，请打开原网页核对；不会自动重复发送");
                 $serviceBody
                 const originalLength = text.length;
                 let truncated = originalLength > ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS};

@@ -11,6 +11,7 @@ internal object ArenaWebCursorScript {
             (function() {
               window.__aiArenaRequests = window.__aiArenaRequests || {};
               const requestId = ${ArenaJs.quote(requestId)};
+              const cursorKey = ${ArenaJs.quote(STORAGE_PREFIX)} + requestId;
               const selectors = [$selectors];
               let assistantBaseline = 0;
               for (const selector of selectors) {
@@ -29,6 +30,10 @@ internal object ArenaWebCursorScript {
                 expectedPrompt: ${ArenaJs.quote(prompt)}.replace(/\s+/g, ' ').trim(),
                 expectedRawPrompt: ${ArenaJs.quote(prompt)}.replace(/\r\n/g, '\n').trim()
               };
+              ${if (!ArenaWebMessageIdentity.requiresServerId(service)) """
+              window.__aiArenaProviderDocument = window.__aiArenaProviderDocument || Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+              state.documentToken = window.__aiArenaProviderDocument;
+              """.trimIndent() else ""}
               ${if (service == ArenaService.DEEPSEEK) """
               // DeepSeek virtual keys are local to a document, unlike a server UUID.
               window.__aiArenaDeepSeekDocument = window.__aiArenaDeepSeekDocument || Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
@@ -41,6 +46,7 @@ internal object ArenaWebCursorScript {
               state.beforeQueueIds = Array.from(document.querySelectorAll('[data-item-id][data-item-status]')).map(row => row.getAttribute('data-item-id'));
               beforeUsers.forEach(row => row.setAttribute('data-ai-arena-before', requestId));
               window.__aiArenaRequests[requestId] = state;
+              ${if (!ArenaWebMessageIdentity.requiresServerId(service)) "arenaInstallNavigationGuard();" else ""}
               try { sessionStorage.setItem(${ArenaJs.quote(STORAGE_PREFIX)} + requestId, JSON.stringify(state)); } catch (_) {}
               return JSON.stringify(state);
             })();
@@ -56,7 +62,7 @@ internal object ArenaWebCursorScript {
               if ($requireIdentity && !state.expectedPrompt) return false;
               if (!arenaRequestScopeValid()) return 'scope_changed';
               const user = $latestUser;
-              if (!user || ($requireIdentity && !arenaUserId(user))) return false;
+              if (!user || ($requireIdentity && ${ArenaWebMessageIdentity.requiresServerId(service)} && !arenaUserId(user))) return false;
               arenaBindRequestUser(user);
               return true;
             })();
@@ -77,12 +83,7 @@ internal object ArenaWebCursorScript {
         ArenaService.DEEPSEEK -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDeepSeek) > Number(state.userBaseline || 0))"
         ArenaService.DOUBAO -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDoubao) > Number(state.userBaseline || 0))"
         ArenaService.KIMI -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountKimi) > Number(state.userBaseline || 0))"
-        ArenaService.QWEN -> "($userCountQwen) > Number(state.userBaseline || 0)"
-        ArenaService.YUANBAO -> "($userCountYuanbao) > Number(state.userBaseline || 0)"
-        ArenaService.ZHIPU -> "($userCountZhipu) > Number(state.userBaseline || 0)"
-        ArenaService.CLAUDE -> "($userCountClaude) > Number(state.userBaseline || 0)"
-        ArenaService.CHATGPT -> "($userCountChatGpt) > Number(state.userBaseline || 0)"
-        ArenaService.GEMINI -> "($userCountGemini) > Number(state.userBaseline || 0)"
+        else -> "(state.expectedPrompt ? !!arenaFindRequestUser() : (${userCountExpression(service)}) > Number(state.userBaseline || 0))"
     }
 
     fun responseSelectors(service: ArenaService): List<String> = when (service) {
@@ -109,11 +110,13 @@ internal object ArenaWebCursorScript {
             "[class*='answer-content']",
         )
         ArenaService.YUANBAO -> listOf(
+            ".agent-chat__conv--ai__speech_show",
             "[class*='hyc-content-md']",
             "[class*='hyc-common-markdown']",
             "[class*='assistant'] [class*='content']",
         )
         ArenaService.ZHIPU -> listOf(
+            ".answer .answer-content",
             "[class*='assistant'] [class*='markdown']",
             "[class*='assistant'] [class*='content']",
             "[data-role='assistant']",

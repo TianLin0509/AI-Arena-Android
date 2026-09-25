@@ -3,7 +3,10 @@ package com.tianlin.aiarena
 /** Provider message identity shared by submission acknowledgement and answer extraction. */
 internal object ArenaWebMessageIdentity {
     const val scopeChangedDetail = "DeepSeek 页面或会话已变化，本轮自动处理已停止，请打开原网页核对；不会自动重复发送"
-    fun supported(service: ArenaService) = service == ArenaService.DEEPSEEK || service == ArenaService.DOUBAO || service == ArenaService.KIMI
+    fun scopeChangedDetail(service: ArenaService) = if (service == ArenaService.DEEPSEEK) scopeChangedDetail
+        else "${service.displayName} 页面或会话已变化，本轮自动处理已停止，请打开原网页核对；不会自动重复发送"
+    fun supported(service: ArenaService) = service in ArenaService.entries
+    fun requiresServerId(service: ArenaService) = service == ArenaService.DEEPSEEK || service == ArenaService.DOUBAO || service == ArenaService.KIMI
 
     // Doubao replaced v_list_row with message-box-target-id wrappers in September 2026.
     const val doubaoRows = "Array.from(document.querySelectorAll('[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row]')).filter(row => !row.parentElement?.closest('[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row]'))"
@@ -12,7 +15,12 @@ internal object ArenaWebMessageIdentity {
         ArenaService.DEEPSEEK -> "Array.from(document.querySelector('.ds-virtual-list-visible-items')?.children || []).filter(row => { const body = row.querySelector('.ds-message .ds-collapsible-text'); return !!body && !body.closest('.ds-markdown, .ds-think-content'); })"
         ArenaService.DOUBAO -> "$doubaoRows.filter(row => !!row.querySelector('[data-send-message-boundary], [class*=bg-g-send]'))"
         ArenaService.KIMI -> "Array.from(document.querySelectorAll('.chat-content-item-user:not(.awaiting-failure)'))"
-        else -> "[]"
+        ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question'))"
+        ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human'))"
+        ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).filter(row => !row.parentElement?.closest('.conversation.question, [data-role=user], [class*=user-message]'))"
+        ArenaService.CLAUDE -> "Array.from(document.querySelectorAll('[data-testid=user-message]'))"
+        ArenaService.CHATGPT -> "Array.from(document.querySelectorAll('[data-message-author-role=user]'))"
+        ArenaService.GEMINI -> "Array.from(document.querySelectorAll('user-query'))"
     }
 
     fun helper(service: ArenaService): String = """
@@ -20,14 +28,14 @@ internal object ArenaWebMessageIdentity {
         ${if (service == ArenaService.DOUBAO) doubaoRawTextHelper else ""}
         const arenaUserText = row => {
           ${if (service == ArenaService.DOUBAO) "const raw = arenaDoubaoRawText(row); if (raw.present) return raw.valid ? arenaNormalize(raw.text) : '';" else ""}
-          const body = row.querySelector('${if (service == ArenaService.DEEPSEEK) ".ds-message .ds-collapsible-text" else "[class*=bg-g-send], .user-content__text, .segment-content"}') || row;
+          const body = row.querySelector('${userBodySelector(service)}') || row;
           const copy = body.cloneNode(true);
           copy.querySelectorAll('button, [role=button], [class*=actions], [class*=action-bar], img').forEach(n => n.remove());
           copy.querySelectorAll('br').forEach(n => n.replaceWith(document.createTextNode('\n')));
           copy.querySelectorAll('p, div, li, pre, blockquote').forEach(n => n.appendChild(document.createTextNode('\n')));
           return arenaNormalize(copy.textContent);
         };
-        const arenaUserId = row => ${if (service == ArenaService.DEEPSEEK) "row.getAttribute('data-virtual-list-item-key') || ''" else "row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || row.id || ''"};
+        const arenaUserId = row => ${if (service == ArenaService.DEEPSEEK) "row.getAttribute('data-virtual-list-item-key') || ''" else "${if (service == ArenaService.YUANBAO) "row.getAttribute('data-conv-id') || " else ""}row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || ${if (requiresServerId(service)) "row.id || " else ""}''"};
         const arenaMatchesRequestUser = row => {
           ${if (service == ArenaService.DOUBAO) """
           const raw = arenaDoubaoRawText(row);
@@ -37,6 +45,21 @@ internal object ArenaWebMessageIdentity {
           return arenaUserText(row) === state.expectedPrompt;
         };
         const arenaRequestScopeValid = () => {
+          ${if (!requiresServerId(service)) """
+          if (state.expectedPrompt && state.legacyAttachment !== true) {
+            const initial = new URL(state.initialUrl);
+            const initialUrl = initial.origin + initial.pathname + initial.search + initial.hash;
+            const currentUrl = location.origin + location.pathname + location.search + location.hash;
+            const allowed = state.boundConversationUrl ? state.boundConversationUrl === currentUrl :
+              currentUrl === initialUrl;
+            if (state.scopeFailure || state.documentToken !== window.__aiArenaProviderDocument ||
+                !allowed) {
+              state.scopeFailure = true;
+              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              return false;
+            }
+          }
+          """.trimIndent() else ""}
           ${if (service == ArenaService.DEEPSEEK) """
           if (state.expectedPrompt && state.legacyAttachment !== true) {
             const initial = new URL(state.initialUrl);
@@ -92,6 +115,7 @@ internal object ArenaWebMessageIdentity {
           const id = arenaUserId(user);
           if (id) state.boundUserId = id;
           ${if (service == ArenaService.DEEPSEEK) "if (state.expectedPrompt) state.boundConversationUrl = location.origin + location.pathname;" else ""}
+          ${if (!requiresServerId(service)) "if (state.expectedPrompt) state.boundConversationUrl = location.origin + location.pathname + location.search + location.hash;" else ""}
           window.__aiArenaRequests = window.__aiArenaRequests || {};
           window.__aiArenaRequests[requestId] = state;
           try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
@@ -102,7 +126,60 @@ internal object ArenaWebMessageIdentity {
           window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
           window.__aiArenaSendClicks[requestId] = state.submittedAt;
         };
+        ${if (!requiresServerId(service)) """
+        // A route shape alone cannot distinguish a new chat from an old same-text chat.
+        // Pin the submitted user node BEFORE a first-chat SPA navigation takes place.
+        const arenaInstallNavigationGuard = () => {
+          if (!window.__aiArenaNavigationGuard) {
+            const guard = {before:null};
+            window.__aiArenaNavigationGuard = guard;
+            ['pushState','replaceState'].forEach(name => {
+              const original = history[name];
+              history[name] = function() {
+                let commit = null;
+                try { commit = guard.before && guard.before(arguments[2]); } catch (_) {}
+                const result = original.apply(this, arguments);
+                if (commit) { try { commit(); } catch (_) {} }
+                return result;
+              };
+            });
+          }
+          window.__aiArenaNavigationGuard.before = value => {
+            if (!value || !state.expectedPrompt || !state.submittedAt || state.transitioned || state.scopeFailure ||
+                window.__aiArenaCancelledRequests?.[requestId]) return null;
+            const initial = new URL(state.initialUrl), target = new URL(value, location.href);
+            if (location.href !== initial.href || target.origin !== initial.origin || target.href === initial.href) return null;
+            if (!(${freshRouteExpression(service).replace("location.", "target.")})) return null;
+            const user = arenaFindRequestUser();
+            if (!user) return null;
+            arenaBindRequestUser(user);
+            return () => {
+              state.transitioned = true;
+              state.boundConversationUrl = target.origin + target.pathname + target.search + target.hash;
+              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+            };
+          };
+        };
+        """.trimIndent() else ""}
     """.trimIndent()
+
+    private fun userBodySelector(service: ArenaService): String = when (service) {
+        ArenaService.DEEPSEEK -> ".ds-message .ds-collapsible-text"
+        ArenaService.QWEN -> ".question-text-card"
+        ArenaService.YUANBAO -> ".agent-chat__bubble--human .hyc-content-text, .hyc-content-text"
+        ArenaService.ZHIPU -> ".question-text-container .dots"
+        ArenaService.GEMINI -> ".query-text"
+        else -> "[class*=bg-g-send], .user-content__text, .segment-content"
+    }
+
+    private fun freshRouteExpression(service: ArenaService): String = when (service) {
+        ArenaService.QWEN -> "initial.pathname === '/' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        ArenaService.YUANBAO -> "initial.pathname === '/chat/naQivTmsDa' && /^\\/chat\\/naQivTmsDa\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        ArenaService.CLAUDE -> "initial.pathname === '/new' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        ArenaService.CHATGPT -> "initial.pathname === '/' && /^\\/c\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        ArenaService.GEMINI -> "/^\\/app\\/?${'$'}/.test(initial.pathname) && /^\\/app\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        else -> "false"
+    }
 
     private val doubaoRawTextHelper: String get() = """
         ${ArenaAttachmentScript.reactHelpers}

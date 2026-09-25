@@ -89,12 +89,14 @@ internal object ArenaMarkdownScript {
         // belonging to the nearest widget; lookalike classes elsewhere stay intact.
         const arenaCodeChrome = function(el) {
           if (!el.matches || !el.closest || el.closest('pre') || el.querySelector('pre')) return false;
-          const widgets = '.md-code-block,.segment-code,.code-area';
+          const widgets = '.md-code-block,.segment-code,.code-area,.qw-md-code,.artifacts-container';
           const owner = el.closest(widgets);
           if (!owner || !Array.from(owner.querySelectorAll('pre')).some(function(pre) { return pre.closest(widgets) === owner; })) return false;
           return (owner.matches('.md-code-block') && el.matches('.md-code-block-banner-wrap')) ||
             (owner.matches('.segment-code') && el.matches('.segment-code-header')) ||
-            (owner.matches('.code-area') && el.matches('[data-copy-ignore="true"]'));
+            (owner.matches('.code-area') && el.matches('[data-copy-ignore="true"]')) ||
+            (owner.matches('.qw-md-code') && el.matches('.sticky')) ||
+            (owner.matches('.artifacts-container') && el.matches('.artifacts-outer'));
         };
 
         /** 行内内容 → Markdown。遇到块级标签直接跳过，交给 arenaSerialize 处理。 */
@@ -237,12 +239,21 @@ internal object ArenaMarkdownScript {
 
           if (tag === 'PRE') {
             const holder = node.querySelector ? (node.querySelector('code') || node) : node;
-            const classes = arenaClassOf(holder) + ' ' + arenaClassOf(node);
+            const classes = arenaClassOf(holder) + ' ' + arenaClassOf(node) + ' ' + arenaClassOf(node.parentElement);
             const matched = classes.match(/language-([A-Za-z0-9+#._-]+)/);
+            let language = matched ? matched[1] : '';
+            if (!language) {
+              const widget = node.closest('.md-code-block,.segment-code,.qw-md-code,.artifacts-container');
+              const label = widget && (widget.matches('.md-code-block') ? widget.querySelector('.md-code-block-banner-wrap span') :
+                widget.matches('.segment-code') ? widget.querySelector('.segment-code-lang') :
+                widget.matches('.qw-md-code') ? widget.querySelector('.sticky span') : widget.querySelector('.artifacts-outer .language'));
+              const name = label ? String(label.textContent || '').trim() : '';
+              if (/^[A-Za-z0-9+#._-]{1,32}(?![\s\S])/.test(name)) language = name;
+            }
             const body = String(holder.textContent || holder.innerText || '').replace(/\r\n?/g, '\n').replace(/\n+(?![\s\S])/, '');
             if (!body) return '';
             const fence = arenaBacktickFence(body, 3);
-            return fence + (matched ? matched[1] : '') + '\n' + body + '\n' + fence + '\n\n';
+            return fence + language + '\n' + body + '\n' + fence + '\n\n';
           }
 
           if (tag === 'BLOCKQUOTE') {
