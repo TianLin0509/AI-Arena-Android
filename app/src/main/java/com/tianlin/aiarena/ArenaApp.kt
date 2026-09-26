@@ -522,9 +522,6 @@ private fun DiscussionHome(
     val captainPreferences = remember(context) { ArenaCaptainPreferences(context) }
     var roundGuidance by guidanceDraft
     val scope = rememberCoroutineScope()
-    val usableServices = selectedServices.filter {
-        pool.statuses[it]?.state?.isUsable() == true
-    }
     val loginNeededServices = selectedServices.filter {
         when (pool.statuses[it]?.state ?: ConnectionState.NOT_LOADED) {
             ConnectionState.NOT_LOADED,
@@ -673,6 +670,9 @@ private fun DiscussionHome(
                 SimpleAskHome(
                     question = question, onQuestionChange = { question = it },
                     selectedServices = selectedServices, usableCount = usableCount,
+                    pendingConnectionCount = selectedServices.count {
+                        (pool.statuses[it]?.state ?: ConnectionState.NOT_LOADED) in setOf(ConnectionState.NOT_LOADED, ConnectionState.LOADING)
+                    },
                     onMembers = { onMembersReturnPageChange(RoundtablePage.HOME); onPageChange(RoundtablePage.MEMBERS) },
                     onConnections = onManageConnections, onOpenService = onOpenService, onNavigate = onPageChange,
                     lengthAdvisory = QuestionLengthPolicy.advisory(question, selectedServices), offline = offline,
@@ -680,7 +680,7 @@ private fun DiscussionHome(
                     onNeedQuestion = { scope.launch { snackbarHostState.showSnackbar("先写下问题") } },
                     onTooLong = { scope.launch { snackbarHostState.showSnackbar("问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字了") } },
                     onStart = {
-                        if (!sessionController.startInitial(question, usableServices, AnswerMode.PARALLEL)) {
+                        if (!sessionController.startInitial(question, selectedServices, AnswerMode.PARALLEL)) {
                             scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
                         }
                     },

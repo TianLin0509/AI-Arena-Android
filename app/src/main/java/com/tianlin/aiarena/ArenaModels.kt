@@ -392,6 +392,9 @@ interface ArenaGateway {
      */
     fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) = callback(true)
 
+    /** 最近一次 [openFreshConversation] 失败时，网页上看到的具体原因（给用户看）；未知时为 null。 */
+    fun freshConversationFailure(service: ArenaService): String? = null
+
     /** 打开某条历史对话的站点地址（各站把每条对话映射成不同 URL），加载完成后回调。 */
     fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) = callback(true)
 
@@ -408,7 +411,8 @@ data class ControllerTiming(
     /** 控制器端到端兜底，须比网页池内部超时宽；测试可缩短以验证失联回调。 */
     val sendTimeoutMillis: Long = 60_000L,
     val attachmentSendTimeoutMillis: Long = 200_000L,
-    val freshConversationTimeoutMillis: Long = 25_000L,
+    /** Covers the pool's bounded 85s fresh-page preparation plus callback margin. */
+    val freshConversationTimeoutMillis: Long = 90_000L,
 )
 
 object ArenaLimits {

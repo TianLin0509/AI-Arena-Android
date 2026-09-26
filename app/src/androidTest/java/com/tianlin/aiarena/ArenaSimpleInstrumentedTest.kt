@@ -24,6 +24,89 @@ import java.io.File
 class ArenaSimpleInstrumentedTest {
     @get:Rule val compose = createComposeRule()
 
+    @Test fun iterationBubbleCopyAndShareKeepCurrentQuestionAfterRestore() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val repository = FixtureRepository()
+        val pending = mutableListOf<Pair<String, (SendOutcome) -> Unit>>()
+        val answer = "本轮独立问题的回答正文"
+        val nextQuestion = "这次改问：如何安排一次短途旅行？"
+        var copied = ""; var shared = ""
+        val gateway = object : ArenaGateway {
+            override fun sendPrompt(service: ArenaService, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
+                pending += requestId to callback
+            }
+            override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) =
+                callback(ResponseSnapshot(found = true, text = answer, streaming = false))
+        }
+        var controller by mutableStateOf<ArenaSessionController?>(null)
+        inst.runOnMainSync {
+            controller = ArenaSessionController(gateway, ControllerTiming(pollIntervalMillis = 15, requiredStablePolls = 1), repository)
+        }
+        val original = controller!!.originalQuestion
+        compose.setContent { ArenaTheme {
+            var draft by remember { mutableStateOf("") }
+            SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller!!,
+                draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() },
+                { _, text -> copied = text; true }, { _, text -> shared = text; true }, false,
+                ArenaCaptainPreferences(LocalContext.current))
+        } }
+        try {
+            compose.onNodeWithTag("simple-composer").performTextInput(nextQuestion)
+            compose.onNodeWithTag("simple-send").performClick()
+            compose.onNodeWithTag("current-question").assertTextEquals(nextQuestion)
+            compose.runOnIdle {
+                assertTrue(controller!!.isBusy)
+                assertEquals(1, controller!!.history.size)
+                pending.toList().forEach { (id, callback) -> callback(SendOutcome(true, id, "fixture receipt")) }
+            }
+            compose.waitUntil(5_000) { controller!!.completedCount == 3 }
+            compose.onNodeWithTag("current-question").assertTextEquals(nextQuestion)
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasContentDescription("复制 DeepSeek 的回答"))
+            compose.onNodeWithContentDescription("复制 DeepSeek 的回答").performClick()
+            compose.onNodeWithText("分享", substring = false).performClick()
+            compose.runOnIdle {
+                listOf(copied, shared).forEach { text ->
+                    assertTrue(text, text.contains(nextQuestion) && text.contains(answer))
+                    assertFalse(text, text.contains(original))
+                }
+                controller!!.destroy()
+                controller = ArenaSessionController(FixtureGateway(), sessionRepository = repository)
+            }
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasTestTag("current-question"))
+            compose.onNodeWithTag("current-question").assertTextEquals(nextQuestion)
+            compose.onNodeWithText(answer, substring = false).assertExists()
+            compose.onNodeWithTag("answer-tab-summary").performClick()
+            compose.onNodeWithTag("current-question").assertTextEquals("讨论主题：$original")
+        } finally { inst.runOnMainSync { controller?.destroy() } }
+    }
+
+    @Test fun websiteRejectionIsVisibleWithoutOpeningErrorDetailsAndNeverAutoResends() {
+        val cases = listOf(
+            ArenaKimiRejection.busyDetail to "官网当前繁忙",
+            "本轮消息进入了豆包网页待发送队列，尚未确认送达；请打开原网页核对，勿重复发送" to "待发送队列",
+            "本轮消息定位信息已丢失，请打开原网页核对；不会自动重复发送" to "无法确认",
+        )
+        var detail by mutableStateOf(cases.first().first)
+        var opens = 0
+        var sends = 0
+        compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            SimpleAnswer(ArenaService.KIMI,
+                ParticipantRun(phase = ParticipantPhase.ERROR, requestId = "current-request", detail = "连续读取失败：$detail"),
+                ServiceStatus(), { opens++ }, null, null, false, {}, { sends++ }, {})
+        } } }
+        cases.forEach { (reason, visibleReason) ->
+            compose.runOnIdle { detail = reason }
+            compose.onNodeWithText(visibleReason, substring = true).performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("可能已经回答", substring = true).assertDoesNotExist()
+            compose.onNodeWithText("打开网页", substring = false).performScrollTo().performClick()
+            compose.onNodeWithText("重发本轮问题").performScrollTo().performClick()
+            compose.onNodeWithText("是否已收到或仍在排队", substring = true).assertIsDisplayed()
+            compose.runOnIdle { assertEquals(0, sends) }
+            compose.onNodeWithText("取消", substring = false).performClick()
+        }
+        compose.runOnIdle { assertEquals(3, opens); assertEquals(0, sends) }
+    }
+
     @Test fun tabSwitchesOneReadableAnswerAndAvatarDoesNotCollapseText() {
         var selected by mutableStateOf(ArenaService.DEEPSEEK.name)
         val opened = mutableListOf<ArenaService>()

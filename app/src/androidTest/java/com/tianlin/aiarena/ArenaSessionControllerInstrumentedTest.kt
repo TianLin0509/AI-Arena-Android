@@ -27,6 +27,47 @@ class ArenaSessionControllerInstrumentedTest {
         requiredStablePolls = 1,
     )
 
+    @Test fun iterationQuestionTracksSendingCompletionAndRestoredHistory() {
+        val repository = FakeSessionRepository()
+        val controller = onMain { ArenaSessionController(FakeGateway(), fastTiming, repository) }
+        onMain { assertTrue(controller.startInitial("first question", ArenaService.defaultMembers)) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            assertTrue(controller.startIteration(guidance = "current independent question"))
+            assertEquals("current independent question", controller.currentQuestion)
+            assertEquals(1, controller.history.size)
+        }
+        awaitHistorySize(controller, 2)
+        onMain {
+            assertEquals("current independent question", controller.currentQuestion)
+            assertEquals("first question", controller.originalQuestion)
+            controller.destroy()
+            repository.save(repository.loadActive()!!.copy(lastRoundPrompts = emptyMap()))
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("current independent question", restored.currentQuestion)
+            assertEquals("first question", restored.originalQuestion)
+            restored.destroy()
+        }
+    }
+
+    @Test fun unfinishedRestoredIterationNeverUsesPreviousRoundQuestion() {
+        val repository = FakeSessionRepository()
+        val snapshot = recoverySnapshot("unfinished current question").let {
+            it.copy(roundNumber = 2, currentRoundKind = RoundKind.ITERATION,
+                history = listOf(RoundRecord(1, RoundKind.INITIAL, AnswerMode.PARALLEL, "older guidance", it.runs, 1, 2)))
+        }
+        repository.save(snapshot); repository.setActiveSession(snapshot.id)
+        onMain {
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("unfinished current question", restored.currentQuestion)
+            restored.destroy()
+            repository.save(snapshot.copy(lastRoundPrompts = emptyMap()))
+            val legacy = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertEquals("本轮问题未保存", legacy.currentQuestion)
+            legacy.destroy()
+        }
+    }
+
     @Test
     fun newSessionResetPreservesCompletedHistoryButClearsColdStartSelection() {
         val repository = FakeSessionRepository()
@@ -367,6 +408,7 @@ class ArenaSessionControllerInstrumentedTest {
         try {
             onMain {
                 controller.startInitial("fresh failure", ArenaService.defaultMembers)
+                gateway.freshFailures[ArenaService.DOUBAO] = "豆包 新对话输入框里有未发出的草稿，本轮未发送"
                 gateway.completeFresh(ArenaService.DOUBAO, false)
                 gateway.completeFresh(ArenaService.KIMI, true)
                 gateway.completeSend(ArenaService.KIMI)
@@ -376,12 +418,40 @@ class ArenaSessionControllerInstrumentedTest {
                 assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
                 assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
                 assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                // The page's observed reason replaces the generic text so the user knows what to fix.
+                assertEquals("豆包 新对话输入框里有未发出的草稿，本轮未发送", controller.runs.getValue(ArenaService.DOUBAO).detail)
+                assertEquals("新对话未能就绪，未发送；请打开原网页确认后重试", controller.runs.getValue(ArenaService.DEEPSEEK).detail)
                 assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.KIMI).phase)
                 gateway.completeFresh(ArenaService.DEEPSEEK, true)
                 gateway.completeFresh(ArenaService.DOUBAO, true)
                 assertEquals(listOf(ArenaService.KIMI), gateway.sentServices)
                 assertEquals(1, controller.history.size)
             }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun initialRetryKeepsFreshAndSendBudgetsSeparate() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(
+            freshConversationTimeoutMillis = 2_000, sendTimeoutMillis = 600, responseTimeoutMillis = 5_000)) }
+        try {
+            onMain {
+                controller.startInitial("separate retry budgets", ArenaService.defaultMembers)
+                gateway.completeFresh(ArenaService.DEEPSEEK, false)
+                gateway.completeSend(ArenaService.DOUBAO); gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            onMain { assertTrue(controller.retrySend(ArenaService.DEEPSEEK)) }
+            Thread.sleep(750)
+            onMain {
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertFalse(gateway.sentServices.contains(ArenaService.DEEPSEEK))
+                gateway.completeFresh(ArenaService.DEEPSEEK, true)
+            }
+            Thread.sleep(250)
+            onMain { gateway.completeSend(ArenaService.DEEPSEEK) }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
         } finally { onMain { controller.destroy() } }
     }
 
@@ -1325,6 +1395,8 @@ class ArenaSessionControllerInstrumentedTest {
         }
 
         fun completeFresh(service: ArenaService, ok: Boolean) = freshCallbacks.getValue(service)(ok)
+        val freshFailures = mutableMapOf<ArenaService, String>()
+        override fun freshConversationFailure(service: ArenaService): String? = freshFailures[service]
         fun completeSend(service: ArenaService, ok: Boolean = true) {
             val (id, callback) = pendingSends.getValue(service)
             callback(SendOutcome(ok, id, if (ok) "acknowledged" else "upload rejected"))

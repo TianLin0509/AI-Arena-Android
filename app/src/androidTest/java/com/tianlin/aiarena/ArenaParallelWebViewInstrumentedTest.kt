@@ -43,6 +43,1248 @@ class ArenaParallelWebViewInstrumentedTest {
     private val members = ArenaService.defaultMembers
     private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
 
+    @Test fun doubaoFollowupUsesV2OnlyRawMessageWithoutResendingOrReadingFirstAnswer() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                window.sentQuestions=[];
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  sentQuestions.push(raw);document.querySelector('textarea').value='';
+                  setTimeout(()=>{
+                    const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                    row.innerHTML='<div data-send-message-boundary data-message-id="followup-'+number+'"><div class="bg-g-send"><p>Keep <code>x</code> exactly.</p><pre><code>    return '+number+'</code></pre><span>展开全部</span></div></div>';
+                    document.body.appendChild(row);
+                    const message=fixtureDoubaoMessage(row,raw);
+                    message.content_blocks_v2=[{block_type:10000,is_finish:false,content:{text_block:{text:raw}}}];
+                    if(number>1)message.content_blocks=undefined;
+                    document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-reply-message><div class="md-box-root">Answer '+number+'</div></div><div class="message-action-bar" style="height:30px">Copy</div></div>');
+                  },1800);
+                };true;
+            """.trimIndent())
+            (1..2).forEach { number ->
+                val prompt = "Keep `x` exactly.\n```python\n    return $number\n```"
+                val request = "raw-followup-$number"
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPrompt(ArenaService.DOUBAO, prompt, request) { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(22, TimeUnit.SECONDS))
+                assertTrue(outcome.get().toString(), outcome.get().success)
+                assertEquals(number.toString(), evaluate(view, "sendCount"))
+                assertEquals(prompt, evaluate(view, "sentQuestions[${number - 1}]"))
+                assertEquals("followup-$number", evaluate(view, "window.__aiArenaRequests['$request'].boundUserId"))
+                val answer = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, request, requireIdentity = true)))
+                assertEquals("Answer $number", answer.getString("text"))
+            }
+        }
+    }
+
+    @Test fun doubaoRenderedMarkdownPromptConfirmsOneSubmissionUsingOriginalMessage() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val prompt = "Keep `x` exactly.\n```python\n    return 7\n```"
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;sentText=document.querySelector('textarea').value;
+                  document.querySelector('textarea').value='';
+                  setTimeout(()=>{
+                    const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                    row.innerHTML='<div data-send-message-boundary data-message-id="markdown-question"><div class="bg-g-send"><div class="md-box-root"><p>Keep <code>x</code> exactly.</p><pre><code>    return 7</code></pre></div><span>展开全部</span></div></div>';
+                    document.body.appendChild(row);fixtureDoubaoMessage(row,sentText);
+                    document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-reply-message><div class="md-box-root">Strict raw receipt answer</div></div><div class="message-action-bar" style="height:30px">Copy</div></div>');
+                  },1800);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, prompt, "raw-markdown-pool") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(22, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals(prompt, evaluate(view, "sentText"))
+            val answer = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DOUBAO, "raw-markdown-pool", requireIdentity = true)))
+            assertEquals("Strict raw receipt answer", answer.getString("text"))
+        }
+    }
+
+    @Test fun kimiVisibleBusyDialogIsExplicitFailureWithoutResubmission() = verifyKimiBusyDialog(false)
+
+    @Test fun kimiHiddenBusyDialogAndQuotedBodyDoNotRejectAcceptedQuestion() = verifyKimiBusyDialog(true)
+
+    @Test fun kimiReceiptBetweenProbesOutranksVisibleBusyDialog() = verifyKimiBusyDialog(false, lateReceipt = true)
+
+    @Test fun kimiCreditsUsedUpDialogIsExplicitFailureWithoutResubmission() = verifyKimiBusyDialog(false, quota = true)
+
+    private fun verifyKimiBusyDialog(hidden: Boolean, lateReceipt: Boolean = false, quota: Boolean = false) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;
+                  const modal=document.createElement('div');modal.className='modal-mask';
+                  modal.style='width:300px;min-height:100px;'+($hidden?'display:none':'');
+                  modal.innerHTML='<div data-testid="confirm-dialog"><div class="body">'+($quota?'Tips Credits used up.':'Too many people are chatting with Kimi; a subscription will grant you priority access.')+'</div><button data-testid="confirm-dialog-cancel">Got it</button><button data-testid="confirm-dialog-confirm">Upgrade</button></div>';
+                  document.body.appendChild(modal);
+                  const quote=document.createElement('p');quote.textContent='Too many people are chatting with Kimi';document.body.appendChild(quote);
+                  const accept=()=>{
+                    const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);
+                    user.setAttribute('data-conversation-turn-id','busy-negative');user.textContent=document.querySelector('textarea').value;
+                    document.body.appendChild(user);document.querySelector('textarea').value='';
+                  };
+                  if ($hidden) accept();
+                  if ($lateReceipt) setTimeout(()=>{
+                    const original=document.querySelectorAll.bind(document);let armed=true;
+                    document.querySelectorAll=function(selector){
+                      const result=original(selector);
+                      if(armed&&selector==='.chat-content-item-user:not(.awaiting-failure)'){
+                        armed=false;Promise.resolve().then(()=>{accept();window.lateReceiptInserted=true;});
+                      }
+                      return result;
+                    };
+                  },1800);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "busy question", "busy-kimi") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertEquals(outcome.get().toString(), hidden || lateReceipt, outcome.get().success)
+            if (!hidden && !lateReceipt) assertEquals(if (quota) ArenaKimiRejection.quotaDetail else ArenaKimiRejection.busyDetail, outcome.get().detail)
+            if (lateReceipt) assertEquals("true", evaluate(view, "window.lateReceiptInserted"))
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals(if (hidden) "" else if (quota) "quota" else "busy", evaluate(view, ArenaKimiRejection.expression))
+        }
+    }
+
+    @Test fun doubaoQueuedQuestionCanBecomeAcceptedWithoutAnotherClick() = verifyDoubaoQueue("late")
+
+    @Test fun doubaoPermanentQueueIsNotReportedAsDelivered() = verifyDoubaoQueue("pending")
+
+    @Test fun doubaoOldIdenticalQueueDoesNotBelongToCurrentSubmission() = verifyDoubaoQueue("old")
+
+    private fun verifyDoubaoQueue(mode: String) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                window.alternateClicks=0;
+                const alternate=document.createElement('button');alternate.className='bg-dbx-fill-highlight';
+                alternate.textContent='Queue alternate';alternate.onclick=()=>alternateClicks++;
+                document.getElementById('input-engine-container').prepend(alternate);
+                const queue=()=>{const row=document.createElement('div');row.setAttribute('data-item-id','fixture-queue');
+                  row.setAttribute('data-item-status','Pending');row.innerHTML='<div class="richTextPreview">queued question</div>';
+                  document.body.appendChild(row);return row;};
+                if ('$mode'==='old') queue();
+                window.send=()=>{
+                  sendCount++;document.querySelector('textarea').value='';
+                  if ('$mode'==='old') return;
+                  const pending=queue();
+                  if ('$mode'==='late') setTimeout(()=>{
+                    requestAnimationFrame(()=>{
+                      const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                      row.innerHTML='<div data-send-message-boundary data-message-id="accepted-queue">queued question</div>';
+                      document.body.appendChild(row);fixtureDoubaoMessage(row,'queued question');pending.remove();
+                    });
+                  },18000);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "queued question", "queue-probe") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(55, TimeUnit.SECONDS))
+            assertEquals(outcome.get().toString(), mode == "late", outcome.get().success)
+            // An existing website queue means Doubao is busy: the question must stay unsent, not join it.
+            assertEquals(if (mode == "old") "0" else "1", evaluate(view, "sendCount"))
+            assertEquals("0", evaluate(view, "alternateClicks"))
+            if (mode == "pending") assertTrue(outcome.get().detail.contains("待发送队列"))
+            if (mode == "old") assertFalse(outcome.get().detail.contains("待发送队列"))
+            if (mode == "old") assertTrue(outcome.get().detail.contains("未发送"))
+        }
+    }
+
+    @Test fun freshDoubaoPageWithPendingQueueIsNotEmpty() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            onMain {
+                val client = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, icon: android.graphics.Bitmap?) = client.onPageStarted(view, url, icon)
+                    override fun onPageFinished(view: WebView, url: String?) = client.onPageFinished(view, url)
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest) = android.webkit.WebResourceResponse(
+                        "text/html", "UTF-8", "<textarea></textarea><div data-item-status='Pending'>older queued question</div>".byteInputStream())
+                }
+            }
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(92, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+        }
+    }
+
+    @Test fun coldUnconfirmedReadyPageIsProbedBeforeSending() = listOf(ArenaService.DOUBAO, ArenaService.KIMI).forEach { verifyColdLoginProbe(it, false) }
+
+    @Test fun coldExplicitLoginPageDoesNotReceiveAQuestion() = listOf(ArenaService.DOUBAO, ArenaService.KIMI).forEach { verifyColdLoginProbe(it, true) }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun verifyColdLoginProbe(service: ArenaService, loginVisible: Boolean) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(service)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  const user=document.createElement('div');
+                  if (${service == ArenaService.KIMI}) {
+                    user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','cold');user.textContent=sentText;
+                  } else {
+                    user.setAttribute('data-target-id','message-box-target-id');
+                    const body=document.createElement('div');body.setAttribute('data-send-message-boundary','');body.setAttribute('data-message-id','cold');body.textContent=sentText;user.appendChild(body);
+                  }
+                  document.body.appendChild(user);
+                  if (${service == ArenaService.DOUBAO}) fixtureDoubaoMessage(user,sentText);
+                };
+                if ($loginVisible) {const login=document.createElement('button');login.textContent='Log in';document.body.appendChild(login);}
+                true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain {
+                (field(pool, "confirmedSignedIn") as MutableSet<ArenaService>).remove(service)
+                pool.statuses[service] = ServiceStatus(ConnectionState.LOADING, "cold startup")
+                pool.sendPrompt(service, "cold question", "cold-probe") { outcome.set(it); done.countDown() }
+            }
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertEquals(outcome.get().toString(), !loginVisible, outcome.get().success)
+            assertEquals(if (loginVisible) "0" else "1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun kimiMultilinePlainTextPastePreservesParagraphsAndSubmitsOnce() = verifyKimiMultilinePaste(0)
+
+    @Test fun deepSeekVirtualizedReceiptDoesNotRequireCountGrowthOrClearedInput() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.history.pushState({},'', '/a/chat/s/fixture');
+                const history=document.createElement('div');history.className='ds-virtual-list-visible-items';document.body.appendChild(history);
+                const user=(key,text)=>'<div data-virtual-list-item-key="'+key+'"><div class="ds-message"><div class="ds-collapsible-text">'+text+'</div></div></div>';
+                history.innerHTML=user('1','old one')+user('3','old two');
+                window.send=()=>{
+                  sendCount++;sentText=document.querySelector('textarea').value;
+                  history.innerHTML=user('3','old two')+user('-2',sentText);
+                  delete window.__aiArenaSendClicks;
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "current question", "virtualized-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("-2", evaluate(view, "window.__aiArenaRequests['virtualized-deepseek'].boundUserId"))
+            assertEquals("current question", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun busyDeepSeekRendererKeepsOneReceiptBeyondShortCallbackDeadline() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;history.appendChild(user);document.body.appendChild(history);
+                  const until=Date.now()+15000;while(Date.now()<until){}
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "slow receipt", "slow-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(35, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("-2", evaluate(view, "window.__aiArenaRequests['slow-deepseek'].boundUserId"))
+        }
+    }
+
+    @Test fun deepSeekHomepageWaitsForSessionBeforeReceiptAndDoesNotClickTwice() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                window.wasUnboundOnHome=false;
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;
+                  const root=document.createElement('div');root.className='ds-virtual-list-visible-items';
+                  root.innerHTML='<div data-virtual-list-item-key="-2"><div class="ds-message"><div class="ds-collapsible-text"></div></div></div>';
+                  root.querySelector('.ds-collapsible-text').textContent=sentText;document.body.appendChild(root);
+                  setTimeout(()=>{
+                    wasUnboundOnHome=!window.__aiArenaRequests['home-deepseek'].bound && location.pathname==='/';
+                    history.pushState({},'', '/a/chat/s/new-fixture');
+                    root.insertAdjacentHTML('beforeend','<div><div class="ds-markdown ds-assistant-message-main-content">HOME ANSWER</div></div>');
+                  },3300);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "first question", "home-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("true", evaluate(view, "wasUnboundOnHome"))
+            assertEquals("1", evaluate(view, "sendCount"))
+            val response = JSONObject(evaluate(view, ArenaWebResponseScript.build(ArenaService.DEEPSEEK, "home-deepseek", requireIdentity = true)))
+            assertEquals("HOME ANSWER", response.getString("finalText"))
+        }
+    }
+
+    @Test fun changedDeepSeekConversationBeforeScheduledSubmitNeverClicks() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(view, """
+                history.pushState({},'', '/a/chat/s/first');
+                window.send=()=>{sendCount++;};
+                document.querySelector('textarea').addEventListener('input',()=>{
+                  history.pushState({},'', '/a/chat/s/other');
+                },{once:true});true;
+            """.trimIndent())
+            val done = CountDownLatch(1); val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DEEPSEEK, "same question", "changed-deepseek") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertFalse(outcome.get().toString(), outcome.get().success)
+            assertEquals("0", evaluate(view, "sendCount"))
+            assertEquals(ArenaWebMessageIdentity.scopeChangedDetail, outcome.get().detail)
+            assertEquals("same question", evaluate(view, "document.querySelector('textarea').value"))
+        }
+    }
+
+    @Test fun kimiFailedOptimisticRowAndLateReceiptDoNotRepeatInputOrSubmit() = verifyKimiMultilinePaste(0, failedOptimistic = true)
+
+    @Test fun slowKimiPasteKeepsOneSubmissionAfterFocusCallbackDeadline() = verifyKimiMultilinePaste(15_000)
+
+    @Test fun cancelledSlowKimiPasteCannotSendLaterOrBlockAnotherProvider() = verifyKimiMultilinePaste(15_000, cancel = true)
+
+    @Test fun missingKimiSendCallbackReleasesFocusAndLateScriptCannotSend() {
+        withPool(emptyMap()) { pool, views, _ ->
+            lateinit var heldView: HeldSendWebView
+            val loaded = CountDownLatch(1)
+            onMain {
+                val original = views.getValue(ArenaService.KIMI)
+                heldView = HeldSendWebView(original.context)
+                heldView.settings.javaScriptEnabled = true
+                heldView.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) { loaded.countDown() }
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest) =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", fixture(ArenaService.KIMI, 0L, false).byteInputStream())
+                }
+                @Suppress("UNCHECKED_CAST")
+                val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+                map[ArenaService.KIMI] = heldView
+                pool.container.removeView(original)
+                original.stopLoading(); original.destroy()
+                pool.container.addView(heldView, FrameLayout.LayoutParams(-1, -1))
+                heldView.loadUrl(ArenaService.KIMI.url)
+            }
+            assertTrue(loaded.await(10, TimeUnit.SECONDS))
+            val other = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(other, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;
+                  history.appendChild(user);document.body.appendChild(history);
+                };true;
+            """.trimIndent())
+            val slowCalls = AtomicInteger()
+            val slowOutcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(ArenaService.KIMI, "held input", "lease-held") {
+                    slowOutcome.set(it); slowCalls.incrementAndGet()
+                }
+            }
+            assertTrue("Slow provider must actually own the input lease", heldView.entered.await(10, TimeUnit.SECONDS))
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(ArenaService.DEEPSEEK, "independent question", "lease-other") {
+                    outcome.set(it); done.countDown()
+                }
+            }
+            assertTrue("One unresponsive input must not consume another provider's whole 45-second budget", done.await(32, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals(1, slowCalls.get())
+            assertFalse(slowOutcome.get().success)
+            assertTrue(slowOutcome.get().detail.contains("输入操作响应超时"))
+            assertEquals("1", evaluate(other, "sendCount"))
+            onMain { heldView.deliverLate() }
+            val settled = CountDownLatch(1)
+            onMain { heldView.postDelayed({ settled.countDown() }, 2_500L) }
+            assertTrue(settled.await(6, TimeUnit.SECONDS))
+            assertEquals("0", evaluate(heldView, "sendCount"))
+            assertEquals("", evaluate(heldView, "document.querySelector('textarea').value"))
+            assertEquals(1, slowCalls.get())
+            assertEquals("1", evaluate(other, "sendCount"))
+        }
+    }
+
+    private class HeldSendWebView(context: android.content.Context) : WebView(context) {
+        val entered = CountDownLatch(1)
+        private var heldScript: String? = null
+        private var heldCallback: android.webkit.ValueCallback<String>? = null
+        override fun evaluateJavascript(script: String, callback: android.webkit.ValueCallback<String>?) {
+            if (script.contains("const text = \"held input\";") && script.contains("lease-held")) {
+                heldScript = script; heldCallback = callback; entered.countDown()
+            } else super.evaluateJavascript(script, callback)
+        }
+        fun deliverLate() {
+            super.evaluateJavascript(checkNotNull(heldScript), heldCallback)
+        }
+    }
+
+    @Test fun kimiSingleLineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true, singleLine = true)
+
+    @Test fun kimiMultilineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true)
+
+    @Test fun deferredKimiPasteCannotOverwriteAfterItsPreconditionsChange() {
+        val interruptions = listOf(
+            "window.__aiArenaCancelledRequests={'deferred-guard':true}",
+            "editor.blur()",
+            "editor.replaceWith(editor.cloneNode(true))",
+            "editor.textContent='USER EDIT'",
+            "window.getSelection().collapse(editor,0)",
+        )
+        interruptions.forEach { interrupt ->
+            withPool(emptyMap()) { pool, views, _ ->
+                val view = views.getValue(ArenaService.KIMI)
+                evaluate(view, """
+                    const editor=document.createElement('div');editor.contentEditable='true';
+                    editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
+                    editor.textContent='OLD DRAFT';editor.style='min-height:80px';
+                    document.querySelector('textarea').replaceWith(editor);
+                    window.pastes=0;window.interrupted=false;
+                    editor.addEventListener('paste',e=>{pastes++;e.preventDefault();});
+                    document.addEventListener('selectionchange',()=>{
+                      if(!interrupted && String(window.getSelection())==='OLD DRAFT') {
+                        interrupted=true;$interrupt;
+                      }
+                    });true;
+                """.trimIndent())
+                val settled = CountDownLatch(1)
+                onMain {
+                    pool.sendPrompt(ArenaService.KIMI, "NEW QUESTION", "deferred-guard") {}
+                }
+                waitUntil("selection interception actually occurred") { evaluate(view, "interrupted") == "true" }
+                onMain { view.postDelayed({ settled.countDown() }, 250L) }
+                assertTrue(settled.await(8, TimeUnit.SECONDS))
+                assertEquals(interrupt, "true", evaluate(view, "interrupted"))
+                assertEquals(interrupt, "0", evaluate(view, "pastes"))
+                assertEquals(interrupt, "0", evaluate(view, "sendCount"))
+                assertEquals(if (interrupt.contains("USER EDIT")) "USER EDIT" else "OLD DRAFT",
+                    evaluate(view, "document.querySelector('.chat-input-editor').textContent"))
+                onMain { pool.cancelAutomation(ArenaService.KIMI) }
+            }
+        }
+    }
+
+    @Test fun temporaryProviderRowsWaitForStableIdsWithoutResending() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { service ->
+            listOf(false, true).forEach { remount ->
+                verifyTemporaryProviderRow(service, remount, true, false)
+            }
+        }
+    }
+
+    @Test fun permanentlyUnnumberedProviderRowsNeverConfirmDelivery() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { verifyTemporaryProviderRow(it, false, false, false) }
+    }
+
+    @Test fun cancelledTemporaryProviderRowsCannotConfirmLateDelivery() {
+        listOf(ArenaService.KIMI, ArenaService.DOUBAO).forEach { verifyTemporaryProviderRow(it, true, true, true) }
+    }
+
+    private fun verifyTemporaryProviderRow(service: ArenaService, remount: Boolean, assignId: Boolean, cancel: Boolean) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(service)
+            evaluate(view, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  let row=document.createElement('div');
+                  if (${service == ArenaService.KIMI}) row.className='chat-content-item-user';
+                  else row.setAttribute('data-target-id','message-box-target-id');
+                  const body=document.createElement('div');body.textContent=sentText;
+                  if (${service == ArenaService.DOUBAO}) body.setAttribute('data-send-message-boundary','');
+                  row.appendChild(body);document.body.appendChild(row);
+                  window.earlyBound=false;
+                  setTimeout(()=>{earlyBound=!!window.__aiArenaRequests?.['temporary-id']?.bound;},3000);
+                  if ($assignId) setTimeout(()=>{
+                    if ($remount) {const replacement=row.cloneNode(true);row.replaceWith(replacement);row=replacement;}
+                    if (${service == ArenaService.KIMI}) row.setAttribute('data-conversation-turn-id','stable-id');
+                    else {row.firstElementChild.setAttribute('data-message-id','stable-id');fixtureDoubaoMessage(row,sentText);}
+                  },4000);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(service, "temporary row question", "temporary-id") { outcome.set(it);done.countDown() }
+            }
+            // Wait for the actual send, then cancel before its website ID becomes available.
+            if (cancel) {
+                val sentDeadline = System.currentTimeMillis() + 12_000
+                while (evaluate(view, "sendCount") == "0" && System.currentTimeMillis() < sentDeadline) Thread.sleep(100)
+                assertEquals("1", evaluate(view, "sendCount"))
+                onMain { pool.cancelAutomation(service) }
+                val settled = CountDownLatch(1)
+                onMain { view.postDelayed({ settled.countDown() }, 5_000L) }
+                assertTrue(settled.await(8, TimeUnit.SECONDS))
+                assertNull(outcome.get())
+            } else {
+                // A clicked Doubao request keeps observing a slow receipt until the 45 s request watchdog.
+                assertTrue(done.await(55, TimeUnit.SECONDS))
+                assertEquals(outcome.get().toString(), assignId, outcome.get().success)
+                assertEquals("false", evaluate(view, "earlyBound"))
+                if (assignId) assertEquals("stable-id", evaluate(view, "window.__aiArenaRequests['temporary-id'].boundUserId"))
+            }
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun cancelledPendingKimiInputDoesNotPollOrCompleteDuringItsReplacement() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const editor=document.createElement('div');editor.contentEditable='true';
+                editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
+                editor.textContent='OLD DRAFT';editor.style='min-height:80px';document.querySelector('textarea').replaceWith(editor);
+                window.pastes=0;window.oldProbeReads=0;
+                editor.addEventListener('paste',e=>{
+                  e.preventDefault();pastes++;
+                  if(pastes===1) {
+                    const old=window.__aiArenaRequests['pending-a'];
+                    Object.defineProperty(old,'inputFailure',{get(){oldProbeReads++;return undefined;}});
+                  } else editor.textContent=e.clipboardData.getData('text/plain');
+                });
+                window.send=()=>{
+                  sendCount++;sentText=editor.innerText;editor.textContent='';
+                  const user=document.createElement('div');user.className='chat-content-item-user';
+                  user.setAttribute('data-conversation-turn-id','replacement-id');user.textContent=sentText;document.body.appendChild(user);
+                };true;
+            """.trimIndent())
+            val oldOutcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "QUESTION A", "pending-a") { oldOutcome.set(it) } }
+            val deadline = System.currentTimeMillis() + 12_000
+            while (evaluate(view, "pastes") == "0" && System.currentTimeMillis() < deadline) Thread.sleep(100)
+            assertEquals("1", evaluate(view, "pastes"))
+            val before = evaluate(view, "oldProbeReads").toInt()
+            val done = CountDownLatch(1)
+            val next = AtomicReference<SendOutcome>()
+            onMain {
+                pool.cancelAutomation(ArenaService.KIMI)
+                pool.sendPrompt(ArenaService.KIMI, "QUESTION B", "pending-b") { next.set(it);done.countDown() }
+            }
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(next.get().toString(), next.get().success)
+            assertNull(oldOutcome.get())
+            assertTrue("Only an already queued old probe may finish", evaluate(view, "oldProbeReads").toInt() <= before + 1)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("QUESTION B", evaluate(view, "sentText"))
+        }
+    }
+
+    private fun verifyKimiMultilinePaste(busyMillis: Int, cancel: Boolean = false, existingDraft: Boolean = false, singleLine: Boolean = false, failedOptimistic: Boolean = false) {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const old=document.querySelector('textarea'),editor=document.createElement('div');
+                editor.contentEditable='true';editor.className='chat-input-editor';editor.setAttribute('data-lexical-editor','true');
+                editor.style='white-space:pre-wrap;min-height:80px';old.replaceWith(editor);
+                window.pastes=0;window.pastedText='';
+                window.enterEvents=0;editor.addEventListener('keydown',e=>{if(e.key==='Enter')enterEvents++;});editor.addEventListener('keyup',e=>{if(e.key==='Enter')enterEvents++;});
+                editor.textContent=$existingDraft ? 'OLD DRAFT MUST BE REPLACED' : '';
+                let editorSelection='';
+                // Model Lexical's committed selection independently of the DOM selection.
+                document.addEventListener('selectionchange',()=>{
+                  const selected=String(window.getSelection());
+                  setTimeout(()=>{editorSelection=selected;},40);
+                });
+                if ($existingDraft) editor.addEventListener('beforeinput',e=>{
+                  if(e.inputType==='insertText') e.preventDefault();
+                });
+                editor.addEventListener('paste',e=>{
+                  e.preventDefault();pastes++;pastedText=e.clipboardData.getData('text/plain');
+                  const until=Date.now()+$busyMillis;while(Date.now()<until){}
+                  const replaced=(!$existingDraft || editorSelection===editor.textContent) ? pastedText : editor.textContent+pastedText;
+                  setTimeout(()=>{editor.textContent=replaced;},150);
+                });
+                window.send=()=>{
+                  sendCount++;sentText=editor.innerText;
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','multiline');
+                  user.textContent=sentText;editor.textContent='';
+                  if ($failedOptimistic) {
+                    const failed=user.cloneNode(true);failed.classList.add('awaiting-failure');failed.setAttribute('data-conversation-turn-id','failed-send-fixture');document.body.appendChild(failed);
+                    setTimeout(()=>document.body.appendChild(user),3000);
+                  } else document.body.appendChild(user);
+                };true;
+            """.trimIndent())
+            val prompt = if (singleLine) "NEW SINGLE LINE QUESTION" else "第一行 <不是 HTML>\n第二行 & 中文\n\n第四行"
+            if (cancel) evaluate(views.getValue(ArenaService.DEEPSEEK), """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;history.appendChild(user);document.body.appendChild(history);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, prompt, "multiline-kimi") { outcome.set(it); done.countDown() } }
+            if (cancel) {
+                val otherDone = CountDownLatch(1)
+                val settled = CountDownLatch(1)
+                val otherOutcome = AtomicReference<SendOutcome>()
+                onMain {
+                    view.postDelayed({
+                        pool.cancelAutomation(ArenaService.KIMI)
+                        pool.sendPrompt(ArenaService.DEEPSEEK, "after cancelled paste", "after-paste") {
+                            otherOutcome.set(it); otherDone.countDown()
+                        }
+                    }, 7_000L)
+                    view.postDelayed({ settled.countDown() }, 25_000L)
+                }
+                assertTrue(otherDone.await(35, TimeUnit.SECONDS))
+                assertTrue(otherOutcome.get().toString(), otherOutcome.get().success)
+                assertTrue(settled.await(30, TimeUnit.SECONDS))
+                assertNull("Cancelled task must not report a late result", outcome.get())
+                assertEquals("Paste must have started before cancellation", "1", evaluate(view, "pastes"))
+                assertEquals("0", evaluate(view, "sendCount"))
+                assertEquals("1", evaluate(views.getValue(ArenaService.DEEPSEEK), "sendCount"))
+                return@withPool
+            }
+            assertTrue(done.await(38, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals(prompt, evaluate(view, "pastedText"))
+            assertEquals(prompt, evaluate(view, "sentText"))
+            assertEquals("1", evaluate(view, "pastes"))
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("0", evaluate(view, "enterEvents"))
+            if (failedOptimistic) assertEquals("multiline", evaluate(view, "window.__aiArenaRequests['multiline-kimi'].boundUserId"))
+        }
+    }
+
+    @Test fun freshSlowLoadRetainsASeparateHydratedEditorBudget() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val loaded = CountDownLatch(1)
+            val page = """
+                <textarea id="ssr" readonly></textarea><img src="/fresh-slow-resource">
+                <script>addEventListener('load',()=>setTimeout(()=>{
+                  document.querySelector('#ssr').outerHTML='<div class="tiptap ProseMirror" contenteditable="true"></div>';
+                  window.editorReplaced=true;
+                },1200));</script>
+            """.trimIndent()
+            onMain {
+                val production = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(v: WebView, url: String?, icon: android.graphics.Bitmap?) = production.onPageStarted(v, url, icon)
+                    override fun onPageFinished(v: WebView, url: String?) { loaded.countDown(); production.onPageFinished(v, url) }
+                    override fun shouldInterceptRequest(v: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse {
+                        if (request.url.path == "/fresh-slow-resource") {
+                            Thread.sleep(54_000L)
+                            return android.webkit.WebResourceResponse("image/png", "UTF-8", byteArrayOf().inputStream())
+                        }
+                        return android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+                    }
+                }
+            }
+            val dispatched = CountDownLatch(1)
+            val calls = AtomicInteger()
+            val gateway = object : ArenaGateway by pool {
+                override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+                    attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+                    if (service == ArenaService.DOUBAO) { calls.incrementAndGet(); dispatched.countDown() }
+                    callback(SendOutcome(false, requestId, "fixture stops at dispatch"))
+                }
+            }
+            lateinit var controller: ArenaSessionController
+            onMain { controller = ArenaSessionController(gateway); assertTrue(controller.startInitial("fresh slow load", members)) }
+            try {
+                assertFalse("A not-yet-loaded page cannot send", dispatched.await(3, TimeUnit.SECONDS))
+                assertTrue("Real subresource load must finish", loaded.await(60, TimeUnit.SECONDS))
+                assertTrue("Editor hydration gets its own budget after the 54 second load", dispatched.await(22, TimeUnit.SECONDS))
+                assertEquals("true", evaluate(view, "window.editorReplaced === true"))
+                assertEquals(1, calls.get())
+            } finally { onMain { controller.destroy() } }
+        }
+    }
+
+    @Test fun freshPageRejectsAssistantOnlyHistoryAndFailedUserPlaceholders() {
+        val pages = listOf(
+            ArenaService.KIMI to "<div class='chat-content-item-user awaiting-failure'>failed old prompt</div>",
+            ArenaService.KIMI to "<div class='chat-content-item-assistant'>old answer</div>",
+            ArenaService.DOUBAO to "<div data-target-id='message-box-target-id'><div data-reply-message>old answer</div></div>",
+            ArenaService.DEEPSEEK to "<div class='ds-virtual-list-visible-items'><div><div class='ds-message'><div class='ds-markdown ds-assistant-message-main-content'>old answer</div></div></div></div>",
+        )
+        for ((service, history) in pages) withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(service)
+            interceptFreshPage(view, "<textarea></textarea>$history")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(92, TimeUnit.SECONDS))
+            assertFalse("Restored history cannot become a new conversation: $service $history", ready.get())
+            var reason: String? = null
+            onMain { reason = pool.freshConversationFailure(service) }
+            assertTrue(reason.toString(), reason.orEmpty().contains("旧对话"))
+            assertTrue(evaluate(view, "document.body.innerText").contains("old"))
+        }
+    }
+
+    @Test fun freshEditorRejectsRestoredDraftWithoutChangingIt() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, "<textarea>unsent existing draft</textarea>")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(92, TimeUnit.SECONDS))
+            assertFalse("A root URL with an unsent draft is not fresh", ready.get())
+            assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
+            var reason: String? = null
+            onMain { reason = pool.freshConversationFailure(ArenaService.DOUBAO) }
+            assertTrue(reason.toString(), reason.orEmpty().contains("草稿"))
+        }
+    }
+
+    @Test fun freshEditorWaitsForVisibleEnabledUniqueCurrentInput() {
+        for (body in listOf("<textarea disabled></textarea>", "<textarea readonly></textarea>",
+            "<div style='opacity:0'><textarea></textarea></div>", "<textarea></textarea><textarea></textarea>")) {
+            withPool(emptyMap()) { pool, views, _ ->
+                val view = views.getValue(ArenaService.DOUBAO)
+                interceptFreshPage(view, body)
+                val done = CountDownLatch(1)
+                val ready = AtomicBoolean(false)
+                onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+                assertFalse("Invalid input must not become ready: $body", done.await(4, TimeUnit.SECONDS))
+                evaluate(view, "document.body.innerHTML='<div id=live class=\"tiptap ProseMirror\" contenteditable=true></div>'; true")
+                assertTrue(done.await(6, TimeUnit.SECONDS))
+                assertTrue(ready.get())
+                assertEquals("live", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+            }
+        }
+    }
+
+    @Test fun freshEditorCancellationSettlesWhileJavascriptCallbackIsMissing() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val calls = AtomicInteger()
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            onMain { pool.cancelAutomation(ArenaService.DOUBAO) }
+            assertTrue("Cancellation must not depend on a JavaScript callback", done.await(1, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+            onMain { view.held?.onReceiveValue("true") }
+            Thread.sleep(500)
+            assertEquals(1, calls.get())
+        }
+    }
+
+    @Test fun freshEditorLateTrueCannotBeatAnExpiredDeadline() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val method = ArenaWebViewPool::class.java.declaredMethods.single { it.name == "waitForFreshPage" }.apply { isAccessible = true }
+            onMain {
+                val generation = (field(pool, "navigationGenerations") as Map<*, *>)[ArenaService.DOUBAO]
+                method.invoke(pool, ArenaService.DOUBAO, view, generation, SystemClock.elapsedRealtime() + 300L,
+                    { value: Boolean -> ready.set(value); done.countDown() })
+            }
+            assertTrue(view.probed.await(2, TimeUnit.SECONDS))
+            Thread.sleep(500)
+            onMain { view.held?.onReceiveValue("true") }
+            assertTrue(done.await(1, TimeUnit.SECONDS))
+            assertFalse("An expired probe cannot grant permission to send", ready.get())
+        }
+    }
+
+    @Test fun freshEditorReplacedWebViewCannotAcceptLateTrue() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val original = views.getValue(ArenaService.DOUBAO)
+            val view = installHeldFreshView(pool, original)
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            onMain {
+                @Suppress("UNCHECKED_CAST")
+                val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+                map[ArenaService.DOUBAO] = views.getValue(ArenaService.KIMI)
+                view.held?.onReceiveValue("true")
+                map[ArenaService.DOUBAO] = view
+            }
+            assertTrue(done.await(1, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+        }
+    }
+
+    @Test fun freshEditorNativeWatchdogSettlesWithoutJavascriptReply() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = installHeldFreshView(pool, views.getValue(ArenaService.DOUBAO))
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(true)
+            val calls = AtomicInteger()
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); calls.incrementAndGet(); done.countDown() } }
+            assertTrue(view.probed.await(8, TimeUnit.SECONDS))
+            assertFalse(done.await(2, TimeUnit.SECONDS))
+            assertTrue("The independent editor budget must expire without any JS callback", done.await(90, TimeUnit.SECONDS))
+            assertFalse(ready.get())
+            onMain { view.held?.onReceiveValue("true") }
+            Thread.sleep(500)
+            assertEquals(1, calls.get())
+        }
+    }
+
+    @Test fun freshDoubaoWaitsForTiptapEditorInsteadOfInterimTextarea() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // Real 2026-09-23 sequence: a hydrated interim TEXTAREA stays for seconds, then tiptap replaces it.
+            interceptFreshPage(view, """
+                <textarea class="textarea-YelHeN" data-testid="chat_input_input" placeholder="发消息..."></textarea>
+                <script>setTimeout(()=>{document.querySelector('textarea').outerHTML='<div id="rich" class="tiptap ProseMirror" contenteditable="true"></div>';window.swappedAt=Date.now();},5000);</script>
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertFalse("The interim textarea is replaced later and must not become ready", done.await(4, TimeUnit.SECONDS))
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            assertEquals("rich", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+        }
+    }
+
+    @Test fun freshDoubaoLongInterimEditorIsNeverTypedInto() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // Under a busy shared renderer thread the interim editor stayed ~16 s before tiptap mounted.
+            interceptFreshPage(view, "<textarea data-testid=chat_input_input placeholder=发消息...></textarea>")
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertFalse("A stable interim editor is still not ready", done.await(18, TimeUnit.SECONDS))
+            evaluate(view, "document.querySelector('textarea').outerHTML='<div id=\"rich\" class=\"tiptap ProseMirror\" contenteditable=\"true\"></div>';true")
+            assertTrue(done.await(8, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            assertEquals("rich", evaluate(view, "window.__aiArenaFreshPage.input.id"))
+        }
+    }
+
+    @Test fun doubaoFollowupWaitsForTiptapWhenOnlyTheInterimEditorExists() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                const old=document.querySelector('textarea');old.setAttribute('data-testid','chat_input_input');
+                window.send=()=>{window.sendCount++;};
+                setTimeout(()=>{window.richAt=Date.now();const rich=document.createElement('div');rich.className='tiptap ProseMirror';rich.contentEditable='true';rich.id='rich';old.replaceWith(rich);},6000);
+                true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "must not enter the interim box", "interim-followup") { done.countDown() } }
+            Thread.sleep(5_000)
+            assertEquals("The interim editor must stay untouched", "", evaluate(view, "document.querySelector('textarea')?.value ?? 'gone'"))
+            assertTrue(done.await(45, TimeUnit.SECONDS))
+            assertEquals("true", evaluate(view, "!!window.richAt"))
+        }
+    }
+
+    @Test fun freshPageTransientHistoryDuringHydrationDoesNotFailTheRound() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, """
+                <div class="tiptap ProseMirror" contenteditable="true"></div>
+                <div id="transient" data-target-id="message-box-target-id"><div data-reply-message>skeleton</div></div>
+                <script>setTimeout(()=>document.getElementById('transient').remove(),2500);</script>
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            assertTrue(done.await(12, TimeUnit.SECONDS))
+            assertTrue("A single hydration sample with history must not decide the round", ready.get())
+        }
+    }
+
+    @Test fun freshPreparingPageStaysLaidOutUntilSettled() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, "<textarea data-testid=chat_input_input></textarea><script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',3000)</script>")
+            onMain { pool.setProtectedServices(emptySet()) }
+            waitUntil("idle page is not drawn") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+            val done = CountDownLatch(1)
+            val ready = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+            // Drawn but not interactive for the whole preparation: a GONE WebView gets ~1 frame per second.
+            repeat(25) {
+                onMain {
+                    assertEquals(View.VISIBLE, view.visibility)
+                    assertEquals(View.VISIBLE, pool.container.visibility)
+                    assertFalse(pool.container.isClickable)
+                    assertFalse(view.isFocusable)
+                }
+                Thread.sleep(100)
+            }
+            assertTrue(done.await(15, TimeUnit.SECONDS))
+            assertTrue(ready.get())
+            waitUntil("settled page returns to GONE") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+        }
+    }
+
+    @Test fun roundMembersStayDrawnAndHiddenPagesDoNotTakeUserTaps() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, "window.userTaps=0;document.addEventListener('pointerdown',()=>userTaps++,true);true")
+            onMain { pool.setProtectedServices(setOf(ArenaService.DOUBAO, ArenaService.KIMI)) }
+            waitUntil("round member drawn") { var shown = false; onMain { shown = view.visibility == View.VISIBLE && pool.container.visibility == View.VISIBLE }; shown }
+            // Only frame-driven Doubao stays drawn for a whole round; drawing every member caused a render-thread ANR.
+            val kimi = views.getValue(ArenaService.KIMI)
+            waitUntil("non frame-driven member is not drawn") { var gone = false; onMain { gone = kimi.visibility == View.GONE }; gone }
+            // A tap that reaches the hidden container (e.g. through a blank Compose area) is swallowed.
+            onMain {
+                val now = SystemClock.uptimeMillis()
+                listOf(android.view.MotionEvent.ACTION_DOWN, android.view.MotionEvent.ACTION_UP).forEach { action ->
+                    val event = android.view.MotionEvent.obtain(now, now, action, 50f, 50f, 0)
+                    pool.container.dispatchTouchEvent(event); event.recycle()
+                }
+            }
+            Thread.sleep(500)
+            assertEquals("0", evaluate(view, "userTaps"))
+            onMain { pool.setProtectedServices(emptySet()) }
+            waitUntil("finished round member is not drawn") { var gone = false; onMain { gone = view.visibility == View.GONE }; gone }
+        }
+    }
+
+    @Test fun doubaoBusyPageIsNotClickedUntilIdleThenSendsOnce() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                document.getElementById('input-engine-container').insertAdjacentHTML('beforeend','<button id="break" data-testid="chat_input_local_break_button" style="width:36px;height:36px">Stop</button>');
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  window.sentWhileBusy=!!document.getElementById('break');document.querySelector('textarea').value='';
+                  const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                  row.innerHTML='<div data-send-message-boundary data-message-id="idle-'+number+'"><div class="bg-g-send">'+raw+'</div></div>';
+                  document.body.appendChild(row);fixtureDoubaoMessage(row,raw);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "question after the previous answer ends", "busy-then-idle") { outcome.set(it); done.countDown() } }
+            assertFalse(done.await(8, TimeUnit.SECONDS))
+            assertEquals("A busy Doubao page would queue the question", "0", evaluate(view, "sendCount"))
+            assertEquals("question after the previous answer ends", evaluate(view, "document.querySelector('textarea').value"))
+            evaluate(view, "document.getElementById('break').remove();true")
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("false", evaluate(view, "window.sentWhileBusy"))
+        }
+    }
+
+    @Test fun doubaoHiddenPageIsNotClickedUntilVisibleAgain() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            // 2026-09-23: a click while the App was in background queued the question behind a stuck Sending status.
+            evaluate(view, """
+                window.fakeVisibility='hidden';
+                Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});
+                document.dispatchEvent(new Event('visibilitychange'));
+                window.send=()=>{
+                  const number=++sendCount,raw=document.querySelector('textarea').value;
+                  window.sentWhileHidden=document.visibilityState!=='visible';document.querySelector('textarea').value='';
+                  const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                  row.innerHTML='<div data-send-message-boundary data-message-id="visible-'+number+'"><div class="bg-g-send">'+raw+'</div></div>';
+                  document.body.appendChild(row);fixtureDoubaoMessage(row,raw);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "question sent only after returning", "hidden-then-visible") { outcome.set(it); done.countDown() } }
+            assertFalse(done.await(8, TimeUnit.SECONDS))
+            assertEquals("No click while the page is hidden", "0", evaluate(view, "sendCount"))
+            evaluate(view, "window.fakeVisibility='visible';document.dispatchEvent(new Event('visibilitychange'));window.visibleAt=Date.now();true")
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            assertEquals("false", evaluate(view, "window.sentWhileHidden"))
+        }
+    }
+
+    @Test fun doubaoPersistentQueueReportsNotSentWithoutClicking() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                document.body.insertAdjacentHTML('beforeend','<div data-testid="queue-message-item" data-item-id="queue-item-old" data-item-status="Pending">older queued question</div>');
+                true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "must not join the website queue", "persistent-queue") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(55, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("未发送"))
+            assertEquals("0", evaluate(view, "sendCount"))
+        }
+    }
+
+    private fun interceptFreshPage(view: WebView, page: String) {
+        onMain {
+            val production = view.webViewClient
+            view.webViewClient = object : android.webkit.WebViewClient() {
+                override fun onPageStarted(v: WebView, url: String?, icon: android.graphics.Bitmap?) = production.onPageStarted(v, url, icon)
+                override fun onPageFinished(v: WebView, url: String?) = production.onPageFinished(v, url)
+                override fun shouldInterceptRequest(v: WebView, request: android.webkit.WebResourceRequest) =
+                    android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+            }
+        }
+    }
+
+    private class HeldFreshWebView(context: android.content.Context) : WebView(context) {
+        val probed = CountDownLatch(1)
+        var held: android.webkit.ValueCallback<String>? = null
+        override fun evaluateJavascript(script: String, callback: android.webkit.ValueCallback<String>?) {
+            if (script.contains("__aiArenaFreshPage")) { held = callback; probed.countDown() }
+            else super.evaluateJavascript(script, callback)
+        }
+    }
+
+    private fun installHeldFreshView(pool: ArenaWebViewPool, original: WebView): HeldFreshWebView {
+        lateinit var replacement: HeldFreshWebView
+        onMain {
+            replacement = HeldFreshWebView(original.context)
+            replacement.settings.javaScriptEnabled = true
+            replacement.webViewClient = original.webViewClient
+            @Suppress("UNCHECKED_CAST")
+            val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+            map[ArenaService.DOUBAO] = replacement
+            pool.container.removeView(original)
+            original.stopLoading(); original.destroy()
+            pool.container.addView(replacement, FrameLayout.LayoutParams(-1, -1))
+        }
+        interceptFreshPage(replacement, "<textarea></textarea>")
+        return replacement
+    }
+
+    @Test fun freshPageWaitsForLateEditorHydrationUnderSharedBudget() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val page = "<script>setTimeout(()=>document.body.innerHTML='<div class=\"tiptap ProseMirror\" contenteditable=true></div>',12000)</script>"
+            onMain {
+                val productionClient = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, icon: android.graphics.Bitmap?) = productionClient.onPageStarted(view, url, icon)
+                    override fun onPageFinished(view: WebView, url: String?) = productionClient.onPageFinished(view, url)
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+                }
+            }
+            val done = CountDownLatch(1)
+            val fresh = AtomicBoolean(false)
+            onMain { pool.openFreshConversation(ArenaService.DOUBAO) { fresh.set(it); done.countDown() } }
+            assertFalse(done.await(2, TimeUnit.SECONDS))
+            assertTrue(done.await(22, TimeUnit.SECONDS))
+            assertTrue("An editor hydrated after the old eight second probe window is usable", fresh.get())
+        }
+    }
+
+    @Test fun freshPageCanCompleteLoadingAfterTwentySecondsWithoutSendingEarly() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            onMain {
+                val productionClient = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, icon: android.graphics.Bitmap?) = productionClient.onPageStarted(view, url, icon)
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        view.postDelayed({ productionClient.onPageFinished(view, url) }, 26_000L)
+                    }
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", "<div class='tiptap ProseMirror' contenteditable='true'></div>".byteInputStream())
+                }
+            }
+            val done = CountDownLatch(1)
+            val gateway = object : ArenaGateway by pool {
+                override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+                    attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+                    if (service == ArenaService.DOUBAO) done.countDown()
+                    callback(SendOutcome(false, requestId, "fixture stops at dispatch"))
+                }
+            }
+            lateinit var controller: ArenaSessionController
+            onMain { controller = ArenaSessionController(gateway); assertTrue(controller.startInitial("slow fresh", listOf(ArenaService.DEEPSEEK, ArenaService.DOUBAO))) }
+            try {
+                assertFalse("Must await the owned navigation", done.await(2, TimeUnit.SECONDS))
+                assertTrue("Controller must retain a valid fresh page after 25 seconds", done.await(38, TimeUnit.SECONDS))
+            } finally { onMain { controller.destroy() } }
+        }
+    }
+
+    @Test fun busyKimiRendererCanConfirmOneSubmissionAfterShortCallbackDeadline() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                window.send=()=>{
+                  window.sendCount++;const text=document.querySelector('textarea').value;document.querySelector('textarea').value='';
+                  const until=Date.now()+15000;while(Date.now()<until){}
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);
+                  user.setAttribute('data-conversation-turn-id','busy-accepted');user.textContent=text;document.body.appendChild(user);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "busy current question", "busy-kimi") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(35, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun lostCursorCannotConfirmOldAnswerOrSubmitAgain() {
+        for (service in listOf(ArenaService.DOUBAO, ArenaService.KIMI)) {
+            withPool(emptyMap()) { pool, views, _ ->
+                val view = views.getValue(service)
+                val oldRows = if (service == ArenaService.KIMI)
+                    "<div class='chat-content-item-user'>old question</div><div class='chat-content-item-assistant'><div class='markdown-container'>old answer</div></div>"
+                else "<div class='v_list_row' data-observe-row><div class='bg-g-send'>old question</div></div><div class='v_list_row' data-observe-row><div class='md-box-root'>old answer</div></div>"
+                evaluate(view, """
+                    window.send=()=>{
+                      window.sendCount++;
+                      delete window.__aiArenaRequests;delete window.__aiArenaSendClicks;
+                      sessionStorage.clear();
+                      document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(oldRows)});
+                    };true;
+                """.trimIndent())
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                onMain { pool.sendPrompt(service, "current question", "lost-cursor") { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(35, TimeUnit.SECONDS))
+                assertFalse(outcome.get().toString(), outcome.get().success)
+                assertEquals("Must not retry a submitted question after losing both cursor stores", "1", evaluate(view, "sendCount"))
+                assertEquals("false", evaluate(view, ArenaWebCursorScript.bind(service, "lost-cursor", requireIdentity = true)))
+                val response = JSONObject(evaluate(view, ArenaWebResponseScript.build(service, "lost-cursor", requireIdentity = true)))
+                assertFalse(response.getBoolean("found"))
+                assertEquals("", response.getString("text"))
+                assertTrue(response.getString("error").contains("定位信息已丢失"))
+            }
+        }
+    }
+
+    @Test fun kimiLateReceiptCannotBindPreviousAnswerOrClickTwice() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                document.body.insertAdjacentHTML('beforeend','<div class="chat-content-item-user" data-conversation-turn-id="old">old question</div><div class="chat-content-item-assistant"><div class="markdown-container">old answer</div></div>');
+                window.send=()=>{
+                  window.sendCount++;const text=document.querySelector('textarea').value;document.querySelector('textarea').value='';
+                  setTimeout(()=>{const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.setAttribute('data-conversation-turn-id','new');user.textContent=text;document.body.appendChild(user);
+                    const answer=document.createElement('div');answer.className='chat-content-item-assistant';answer.innerHTML='<div class="markdown-container">new complete answer</div><div class="segment-assistant-actions" style="height:30px"><button>Copy</button></div>';document.body.appendChild(answer);},4500);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "new question", "late-kimi-receipt") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(18, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sendCount"))
+            val response = AtomicReference<ResponseSnapshot>()
+            val read = CountDownLatch(1)
+            onMain { pool.readResponse(ArenaService.KIMI, "late-kimi-receipt") { response.set(it); read.countDown() } }
+            assertTrue(read.await(5, TimeUnit.SECONDS))
+            assertEquals("new complete answer", response.get().text)
+        }
+    }
+
+    @Test fun kimiEditorReplacementDuringReadinessReceivesOnlyCurrentPrompt() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, """
+                const old=document.querySelector('textarea');old.value='old restored draft';
+                setTimeout(()=>{const replacement=old.cloneNode(true);replacement.value='restored draft';old.replaceWith(replacement);window.editorReplaced=true;},1200);
+                window.send=()=>{window.sendCount++;window.sentText=document.querySelector('textarea').value;
+                  const user=document.createElement('div');user.className='chat-content-item-user';user.setAttribute('data-conversation-turn-id','fixture-user-'+sendCount);user.textContent=window.sentText;document.body.appendChild(user);document.querySelector('textarea').value='';};true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.KIMI, "current replacement question", "replaced-kimi-editor") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(18, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("true", evaluate(view, "window.editorReplaced"))
+            assertEquals("current replacement question", evaluate(view, "window.sentText"))
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun doubaoWholeDocumentNavigationRetainsOneSubmission() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            val page = """
+                <textarea>navigation question</textarea><button id="flow-end-msg-send" onclick="sessionStorage.setItem('duplicateClicks',String(Number(sessionStorage.getItem('duplicateClicks')||0)+1))">Send</button>
+                <script>${ArenaReactFixture.script}setTimeout(()=>{document.body.insertAdjacentHTML('beforeend','<div data-target-id="message-box-target-id"><div data-send-message-boundary data-message-id="new"><span class="bg-g-send">navigation question</span></div></div>');fixtureDoubaoMessage(document.querySelector('[data-target-id=message-box-target-id]'),'navigation question');},5000);</script>
+            """.trimIndent()
+            onMain {
+                val productionClient = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, icon: android.graphics.Bitmap?) = productionClient.onPageStarted(view, url, icon)
+                    override fun onPageFinished(view: WebView, url: String?) = productionClient.onPageFinished(view, url)
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+                }
+            }
+            evaluate(view, "window.send=()=>{sessionStorage.setItem('firstClicks',String(Number(sessionStorage.getItem('firstClicks')||0)+1));location.href='https://www.doubao.com/chat/?receipt=1';};true;")
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPrompt(ArenaService.DOUBAO, "navigation question", "navigation-one-click") { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(23, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "sessionStorage.getItem('firstClicks')"))
+            assertEquals("0", evaluate(view, "sessionStorage.getItem('duplicateClicks')||'0'"))
+        }
+    }
+
+    @Test fun freshConversationRejectsLateRestoredHistoryAndCancelledNavigation() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.KIMI)
+            val page = """
+                <textarea placeholder="Message"></textarea>
+                <script>setTimeout(()=>{document.body.insertAdjacentHTML('beforeend','<div class="chat-content-item-user" data-conversation-turn-id="old">restored old question</div>');},1300);</script>
+            """.trimIndent()
+            onMain {
+                val productionClient = view.webViewClient
+                view.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: WebView, url: String?, icon: android.graphics.Bitmap?) = productionClient.onPageStarted(view, url, icon)
+                    override fun onPageFinished(view: WebView, url: String?) = productionClient.onPageFinished(view, url)
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", page.byteInputStream())
+                }
+            }
+            val done = CountDownLatch(1)
+            val fresh = AtomicBoolean(true)
+            onMain { pool.openFreshConversation(ArenaService.KIMI) { fresh.set(it); done.countDown() } }
+            assertTrue(done.await(92, TimeUnit.SECONDS))
+            assertFalse("A root URL whose history hydrates later is not a fresh chat", fresh.get())
+            val cancelled = CountDownLatch(1)
+            val calls = AtomicInteger()
+            onMain {
+                pool.openFreshConversation(ArenaService.KIMI) { fresh.set(it); calls.incrementAndGet(); cancelled.countDown() }
+                pool.cancelAutomation()
+            }
+            assertTrue(cancelled.await(5, TimeUnit.SECONDS))
+            assertFalse(fresh.get())
+            Thread.sleep(2200)
+            assertEquals("An old completion must not settle navigation twice", 1, calls.get())
+        }
+    }
+
     @Test fun doubaoAttachmentUsesBrowserInputWithPrivateEditorAndPreservesChineseLines() {
         withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
             val view = views.getValue(ArenaService.DOUBAO)
@@ -176,7 +1418,14 @@ class ArenaParallelWebViewInstrumentedTest {
         withPool(emptyMap()) { pool, views, attachment ->
             val doubao = views.getValue(ArenaService.DOUBAO)
             val kimi = views.getValue(ArenaService.KIMI)
-            evaluate(doubao, "window.send=()=>{const input=document.querySelector('textarea');window.sentText=input.value;window.sendCount++;input.value='';};true")
+            evaluate(doubao, """
+                window.send=()=>{
+                  const input=document.querySelector('textarea');window.sentText=input.value;window.sendCount++;input.value='';
+                  const row=document.createElement('div');row.setAttribute('data-target-id','message-box-target-id');
+                  const user=document.createElement('div');user.setAttribute('data-send-message-boundary','');user.setAttribute('data-message-id','plain-accepted');
+                  user.textContent=sentText;row.appendChild(user);document.body.appendChild(row);fixtureDoubaoMessage(row,sentText);
+                };true;
+            """.trimIndent())
             listOf(doubao, kimi).forEach { view -> evaluate(view, "const sendButton=document.querySelector('.send-msg-btn');window.sendTrusted=null;sendButton.addEventListener('click',e=>sendTrusted=e.isTrusted,true);true") }
             val done = CountDownLatch(2)
             val outcomes = mutableListOf<SendOutcome>()

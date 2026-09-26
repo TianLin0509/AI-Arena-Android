@@ -36,7 +36,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ArenaService.entries.forEach { service -> put(service, ServiceStatus()) }
     }
 
-    val container: FrameLayout = FrameLayout(activity).apply {
+    /** True while pages are drawn only for the websites' own frame-driven work; the user cannot see them. */
+    private var blockUserTouches = true
+
+    val container: FrameLayout = object : FrameLayout(activity) {
+        // A see-through page below blank Compose areas must not receive the user's taps.
+        // Automation touches are dispatched to the WebView directly and are unaffected.
+        override fun onInterceptTouchEvent(event: android.view.MotionEvent): Boolean = blockUserTouches
+        @SuppressLint("ClickableViewAccessibility")
+        override fun onTouchEvent(event: android.view.MotionEvent): Boolean = blockUserTouches
+    }.apply {
         setBackgroundColor(Color.WHITE)
         visibility = View.GONE
         isClickable = false
@@ -49,12 +58,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val confirmedSignedIn = mutableSetOf<ArenaService>()
     private val explicitLoginProbeCounts = mutableMapOf<ArenaService, Int>()
     private var uiSelectedService: ArenaService? = null
-    private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit) {
+    private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit, val strictReceipt: Boolean = false) {
+        var deadlineWallMillis: Long = 0L
         var watchdog: Runnable? = null
         var parked = false
         var sending = false
         var cancelNativeTouch: (() -> Unit)? = null
         var nativeUpPending = false
+        var timeoutDetail: String? = null
     }
     private val automations = mutableMapOf<ArenaService, Automation>()
     private val serviceEpochs = mutableMapOf<ArenaService, Long>()
@@ -77,6 +88,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      * 销毁会让已经生成一半的回答直接丢失，而且清掉登录确认后连"重发"都会失败。
      */
     private var protectedServices: Set<ArenaService> = emptySet()
+    /** Pages whose answer is being polled (rounds, single retries, summaries) stay drawn until shortly after. */
+    private val readingUntil = mutableMapOf<ArenaService, Long>()
     @SuppressLint("MissingOnRenderProcessGone")
     private val destroyedWebViewClient = object : WebViewClient() {
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean = true
@@ -134,19 +147,34 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         else handler.post { drainBackgroundProbes() }
     }
 
-    /** Keep each uploading page laid out; only a short input/touch action borrows the front surface. */
+    /**
+     * Keep pages that need animation frames laid out; only a short input/touch action borrows the
+     * front surface. A GONE WebView still reports `visibilityState=visible`, but a page that changes
+     * every frame only gets ~8 animation frames/s instead of ~35 when VISIBLE, whatever the alpha or
+     * stacking (measured 2026-09-23, emulator). Every page preparing a new conversation stays drawn.
+     * For the rest of a round only Doubao does: it mounts its editor and advances its send status on
+     * frames, while DeepSeek and Kimi worked when GONE. Drawing all three for a whole round made the
+     * render thread wait on the GPU until an input ANR (2026-09-25, R8 build on the emulator). A parked
+     * page is never front. Pages still share one renderer thread, so this removes only the GONE penalty.
+     */
     private fun refreshVisibility() {
         if (destroyed) return
-        val front = focusAction?.service ?: uiSelectedService ?: backgroundProbeService ?: automations.keys.firstOrNull()
+        val front = focusAction?.service ?: uiSelectedService ?: backgroundProbeService
+            ?: automations.entries.firstOrNull { !it.value.parked }?.key ?: pendingFreshPages.keys.firstOrNull()
+        val live = ArenaService.entries.filter { candidate ->
+            candidate == front || candidate == uiSelectedService || candidate in automations ||
+                candidate == backgroundProbeService || candidate in pendingFreshPages ||
+                (candidate in FRAME_DRIVEN_SERVICES && (candidate in protectedServices || (readingUntil[candidate] ?: 0L) > SystemClock.elapsedRealtime()))
+        }.toSet()
         val hidden = focusAction != null || uiSelectedService == null
-        container.visibility = if (front == null) View.GONE else View.VISIBLE
+        blockUserTouches = hidden
+        container.visibility = if (live.none { it in webViews }) View.GONE else View.VISIBLE
         container.alpha = if (hidden) 0.01f else 1f
         container.isClickable = front != null && !hidden
         container.isFocusable = front != null && !hidden
         ArenaService.entries.forEach { candidate ->
             val webView = webViews[candidate]
-            val active = candidate == front || candidate == uiSelectedService || candidate in automations || candidate == backgroundProbeService
-            val visible = active && automations[candidate]?.parked != true
+            val visible = candidate in live
             if (webView != null) updateWebViewInteraction(candidate, webView, visible)
             webView?.visibility = if (visible) View.VISIBLE else View.GONE
             webView?.alpha = if (candidate == front) 1f else 0.01f
@@ -215,6 +243,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** 由控制器在开轮/收轮时告知，哪些成员的 WebView 现在不能回收。 */
     override fun setProtectedServices(services: Set<ArenaService>) {
         protectedServices = services
+        refreshVisibility()
     }
 
     // -----------------------------------------------------------------------
@@ -229,6 +258,20 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     /** 等某个 WebView 完成一次由我们发起的加载；onPageFinished 时兑现。 */
     private val pendingLoads = mutableMapOf<ArenaService, (Boolean) -> Unit>()
+    private val pendingFreshPages = mutableMapOf<ArenaService, (Boolean) -> Unit>()
+    private val navigationGenerations = mutableMapOf<ArenaService, Long>()
+    private val navigationTargets = mutableMapOf<ArenaService, String>()
+    /** Last not-ready reason seen by the fresh-page probe; reported when the page never became usable. */
+    private val freshReasons = mutableMapOf<ArenaService, String>()
+
+    override fun freshConversationFailure(service: ArenaService): String? = when (freshReasons[service]) {
+        "draft" -> "${service.displayName} 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试"
+        "history", "not_root" -> "${service.displayName} 打开新对话后仍显示旧对话内容，本轮未发送；请打开原网页确认后重试"
+        "queued" -> "${service.displayName} 新对话里有排队中的消息，本轮未发送；请打开原网页处理后重试"
+        "no_editor" -> "${service.displayName} 新对话的输入框迟迟没有加载完成，本轮未发送；请稍后重试"
+        "navigation" -> "${service.displayName} 新对话网页没有打开，本轮未发送；请确认网络后重试"
+        else -> null
+    }
 
     override fun conversationUrl(service: ArenaService): String =
         webViews[service]?.url.orEmpty().takeIf { it.startsWith("https://") }.orEmpty()
@@ -236,23 +279,65 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) {
         if (destroyed) return callback(false)
         val webView = ensureWebView(service) ?: return callback(false)
+        if (ArenaWebMessageIdentity.supported(service)) {
+            // A restored root URL is not evidence of an empty conversation. Start a navigation
+            // owned by this request, then require an empty, hydrated editor on the root page.
+            pendingFreshPages.remove(service)?.invoke(false)
+            freshReasons.remove(service)
+            val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
+            val deadline = hardDeadline
+            var settled = false
+            lateinit var complete: (Boolean) -> Unit
+            val watchdog = Runnable { complete(false) }
+            complete = { ok ->
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service complete ok=$ok settled=$settled left=${deadline - SystemClock.elapsedRealtime()} hardLeft=${hardDeadline - SystemClock.elapsedRealtime()}")
+                if (!settled) {
+                    settled = true
+                    handler.removeCallbacks(watchdog)
+                    if (pendingFreshPages[service] === complete) pendingFreshPages.remove(service)
+                    refreshVisibility()
+                    callback(ok && !destroyed && webViews[service] === webView && SystemClock.elapsedRealtime() < deadline)
+                }
+            }
+            pendingFreshPages[service] = complete
+            refreshVisibility()
+            handler.postDelayed(watchdog, hardDeadline - SystemClock.elapsedRealtime())
+            navigate(service, webView, service.url, timeoutMillis = 60_000L, freshOwner = complete) { ok ->
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service navigated ok=$ok hardLeft=${hardDeadline - SystemClock.elapsedRealtime()} url=${webView.url}")
+                if (!settled) {
+                    if (!ok) freshReasons[service] = "navigation"
+                    if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
+                    else {
+                        // The editor may mount 40+ s after load while other pages occupy the shared renderer
+                        // thread (2026-09-23), so it keeps the whole remaining budget. Waiting never sends;
+                        // the native watchdog still covers a renderer that never returns JS results.
+                        waitForFreshPage(service, webView, navigationGenerations[service], deadline, complete)
+                    }
+                }
+            }
+            return
+        }
         val current = webView.url.orEmpty()
         // 还没发过消息、且就停在站点根地址：已经是干净的新对话，别再白等一次加载
         if (service !in sentSinceLoad && isRootUrl(service, current)) return callback(true)
-        navigate(service, webView, service.url, callback)
+        navigate(service, webView, service.url, callback = callback)
     }
 
     override fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) {
         if (destroyed || !url.startsWith("https://")) return callback(false)
         val webView = ensureWebView(service) ?: return callback(false)
         if (webView.url == url) return callback(true)
-        navigate(service, webView, url, callback)
+        navigate(service, webView, url, callback = callback)
     }
 
-    private fun navigate(service: ArenaService, webView: WebView, url: String, callback: (Boolean) -> Unit) {
+    private fun navigate(service: ArenaService, webView: WebView, url: String, timeoutMillis: Long = NAVIGATION_TIMEOUT_MS,
+        freshOwner: ((Boolean) -> Unit)? = null, callback: (Boolean) -> Unit) {
         // 自动化进行中不能换页面：会把正在收的回答和在途的 JS 回调一起弄丢
         if (service in automations) return callback(false)
+        if (pendingFreshPages[service] !== freshOwner) pendingFreshPages.remove(service)?.invoke(false)
         pendingLoads.remove(service)?.invoke(false)
+        navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
+        navigationTargets[service] = url
         var settled = false
         val timeout = Runnable {
             if (settled) return@Runnable
@@ -267,7 +352,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 callback(ok)
             }
         }
-        handler.postDelayed(timeout, NAVIGATION_TIMEOUT_MS)
+        handler.postDelayed(timeout, timeoutMillis)
         sentSinceLoad.remove(service)
         webView.loadUrl(url)
     }
@@ -275,13 +360,103 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** 站点根地址（含尾斜杠差异）就算"新对话"页。 */
     private fun isRootUrl(service: ArenaService, url: String): Boolean {
         fun norm(value: String) = value.substringBefore('?').substringBefore('#').trimEnd('/')
-        return norm(url) == norm(service.url)
+        return freshRootUrls(service).any { norm(url) == norm(it) }
+    }
+
+    private fun freshRootUrls(service: ArenaService): List<String> = when (service) {
+        // Read from the logged-in mobile sites on 2026-09-25. These are home routes,
+        // not arbitrary same-origin paths: history navigation still requires exact URLs.
+        ArenaService.YUANBAO -> listOf(service.url, "https://yuanbao.tencent.com/chat/naQivTmsDa")
+        ArenaService.ZHIPU -> listOf(service.url, "https://chatglm.cn/miniapp/home")
+        else -> listOf(service.url)
     }
 
     private fun settlePendingLoad(service: ArenaService, ok: Boolean) {
-        val pending = pendingLoads.remove(service) ?: return
+        val pending = pendingLoads[service] ?: return
+        val generation = navigationGenerations[service]
+        val target = navigationTargets[service]
+        fun normalized(url: String?) = url.orEmpty().substringBefore('?').substringBefore('#').trimEnd('/')
+        if (ok && normalized(webViews[service]?.url) != normalized(target) &&
+            !(target != null && isRootUrl(service, target) && isRootUrl(service, webViews[service]?.url.orEmpty()))) return
         // 单页应用在 onPageFinished 之后还要跑一会儿脚本才会把输入框画出来；留一点余量
-        handler.postDelayed({ pending(ok) }, NAVIGATION_SETTLE_MS)
+        handler.postDelayed({
+            if (pendingLoads[service] === pending && navigationGenerations[service] == generation) {
+                pendingLoads.remove(service)
+                pending(ok)
+            }
+        }, NAVIGATION_SETTLE_MS)
+    }
+
+    private fun waitForFreshPage(
+        service: ArenaService,
+        webView: WebView,
+        generation: Long?,
+        deadline: Long,
+        callback: (Boolean) -> Unit,
+    ) {
+        if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
+            SystemClock.elapsedRealtime() >= deadline) return callback(false)
+        // Fresh-page history is broader than accepted-user identity: failed user placeholders
+        // and assistant-only restored history must also prevent starting a new conversation.
+        val historySelector = when (service) {
+            ArenaService.DEEPSEEK -> ".ds-virtual-list-visible-items .ds-message"
+            ArenaService.DOUBAO -> "[data-target-id=message-box-target-id], [class*=v_list_row][data-observe-row], [data-reply-message]"
+            ArenaService.KIMI -> ".chat-content-item-user, .chat-content-item-assistant"
+            else -> ArenaWebCursorScript.responseSelectors(service).joinToString(",")
+        }
+        val probe = """
+            (() => {
+              ${selectorHelperScript()}
+              const candidates = [...new Set(${ArenaJs.quoteArray(promptInputSelectors(service))}.flatMap(selector => [...document.querySelectorAll(selector)]))];
+              const usable = candidates.filter(input => {
+                if (!input.isConnected || input.disabled || input.readOnly || input.matches(':disabled') || input.closest('[inert]')) return false;
+                if (!/^(TEXTAREA|INPUT)$/.test(input.tagName) && !input.isContentEditable) return false;
+                if (input.getAttribute('aria-disabled') === 'true' || input.getAttribute('aria-readonly') === 'true') return false;
+                const rect = input.getBoundingClientRect();
+                if (!(rect.width > 0 && rect.height > 0)) return false;
+                for (let node = input; node; node = node.parentElement) {
+                  const style = getComputedStyle(node);
+                  if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+                }
+                return true;
+              });
+              const input = usable.length === 1 ? usable[0] : null;
+              $editorDraftHelper
+              const draft = arenaEditorDraft(input);
+              const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
+              const expected = ${ArenaJs.quoteArray(freshRootUrls(service).map { it.trimEnd('/') })};
+              const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
+              ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
+              const queued = ${service == ArenaService.DOUBAO} && !!document.querySelector('[data-item-status=Pending], [data-item-status=Sending]');
+              ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
+              // History or a website send queue on the root page is never ready. Keep polling:
+              // a single hydration sample must not fail the round; the deadline still decides.
+              const blocked = !expected.includes(root) ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft ? 'draft' :
+                (!input || document.readyState !== 'complete') ? 'no_editor' : '';
+              if (blocked) { window.__aiArenaFreshPage = null; return blocked; }
+              const previous = window.__aiArenaFreshPage;
+              if (!previous || previous.input !== input) {
+                window.__aiArenaFreshPage = {input, since: Date.now()}; return false;
+              }
+              return Date.now() - previous.since >= 1600;
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(probe) { raw ->
+            if (BuildConfig.DEBUG) webView.evaluateJavascript("window.__aiArenaFreshDiag") { diag ->
+                android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - SystemClock.elapsedRealtime()} raw=$raw diag=${decodeJsValue(diag)}")
+            }
+            if (navigationGenerations[service] == generation) {
+                val reason = decodeJsValue(raw)
+                if (reason in FRESH_REASONS) freshReasons[service] = reason else freshReasons.remove(service)
+            }
+            if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
+                SystemClock.elapsedRealtime() >= deadline) callback(false)
+            else if (raw == "true") callback(true)
+            else if (SystemClock.elapsedRealtime() < deadline) handler.postDelayed({
+                waitForFreshPage(service, webView, generation, deadline, callback)
+            }, 400L)
+            else callback(false)
+        }
     }
 
     fun probeAll() {
@@ -347,10 +522,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         serviceEpoch: Long = serviceEpochs[service] ?: 0L,
     ) {
         if (!submissionCurrent(service, epoch, serviceEpoch)) return
-        if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn) {
-            callback(SendOutcome(false, requestId, "${service.displayName} 尚未登录"))
-            return
-        }
         // 页面上次没加载出来（多半是当时没网）：先重新加载再发。往错误页里注入脚本必然
         // "找不到输入框"，用户联网后点「重发」会白点一次（2026-09-05 断网实测）。只重试一次，
         // 重载后还是错误页就如实报"网页打不开"。
@@ -371,6 +542,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             service = service,
             requestId = requestId,
             timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
+            strictReceipt = attachmentFiles.isEmpty() && ArenaWebMessageIdentity.supported(service),
             onTimeout = {
                 callback(SendOutcome(false, requestId, "${service.displayName} 网页发送超时，请检查原网页后重试"))
             },
@@ -378,16 +550,33 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             onInterrupted = { detail -> callback(SendOutcome(false, requestId, detail)) },
         ) { webView ->
             val token = automations[service]
-            webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId)) {
-                if (!isCurrent(service, token)) return@evaluateJavascript
-                if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
-                else ArenaAttachmentTransport(handler, fileBroker) { action -> withFocus(service, requestId, action) }
-                    .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
-                    if (!isCurrent(service, token)) return@upload
-                    if (error != null) finishSend(service, SendOutcome(false, requestId, error), callback)
-                    else sendStandard(webView, service, fullPrompt, requestId, callback, nativeAttachmentSend = service == ArenaService.DOUBAO)
+            fun prepareAndSend() {
+                if (!isCurrent(service, token)) return
+                if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn) {
+                    finishSend(service, SendOutcome(false, requestId, "${service.displayName} 登录状态尚未确认，请打开原网页检查"), callback)
+                    return
+                }
+                webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, if (token?.strictReceipt == true) fullPrompt else "", legacyAttachment = attachmentFiles.isNotEmpty())) { raw ->
+                    if (!isCurrent(service, token)) return@evaluateJavascript
+                    if (service == ArenaService.YUANBAO && token?.strictReceipt == true &&
+                        runCatching { JSONObject(decodeJsValue(raw)).optBoolean("yuanbaoUnstableBaseline") }.getOrDefault(false)) {
+                        finishSend(service, SendOutcome(false, requestId, "元宝还有未确认的历史消息，请在原网页核对后再试；本轮未发送"), callback)
+                        return@evaluateJavascript
+                    }
+                    if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
+                    else ArenaAttachmentTransport(handler, fileBroker) { action -> withFocus(service, requestId, action) }
+                        .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
+                        if (!isCurrent(service, token)) return@upload
+                        if (error != null) finishSend(service, SendOutcome(false, requestId, error), callback)
+                        else sendStandard(webView, service, fullPrompt, requestId, callback, nativeAttachmentSend = service == ArenaService.DOUBAO)
+                    }
                 }
             }
+            // Cold-start probes may run before hydration. Check the now-ready, active
+            // page before calling an unconfirmed account logged out; never send blindly.
+            if (statuses[service]?.state != ConnectionState.SIGNED_IN && service !in confirmedSignedIn)
+                evaluateLoginState(service, ::prepareAndSend)
+            else prepareAndSend()
         }
     }
 
@@ -401,7 +590,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             callback(ResponseSnapshot(false, "", false, "网页尚未加载"))
             return
         }
-        webView.evaluateJavascript(ArenaWebResponseScript.build(service, requestId)) { raw ->
+        if (service in FRAME_DRIVEN_SERVICES) keepDrawnWhileReading(service)
+        webView.evaluateJavascript(ArenaWebResponseScript.build(service, requestId, requireIdentity = ArenaWebMessageIdentity.supported(service))) { raw ->
             try {
                 val payload = JSONObject(decodeJsValue(raw))
                 val rawText = payload.optString("text", "")
@@ -429,6 +619,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
     }
 
+    /** A streaming answer advances on animation frames; polling it keeps the page drawn for [READING_LIVE_MS]. */
+    private fun keepDrawnWhileReading(service: ArenaService) {
+        val wasLive = (readingUntil[service] ?: 0L) > SystemClock.elapsedRealtime()
+        readingUntil[service] = SystemClock.elapsedRealtime() + READING_LIVE_MS
+        if (!wasLive) refreshVisibility()
+        handler.postDelayed({
+            if (!destroyed && (readingUntil[service] ?: 0L) <= SystemClock.elapsedRealtime()) {
+                readingUntil.remove(service)
+                refreshVisibility()
+            }
+        }, READING_LIVE_MS + 50L)
+    }
+
     private fun submissionCurrent(service: ArenaService, epoch: Long, serviceEpoch: Long) =
         !destroyed && epoch == cancellationEpoch && serviceEpoch == (serviceEpochs[service] ?: 0L)
 
@@ -437,6 +640,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     override fun cancelAutomation() {
         cancellationEpoch++
+        cancelPendingNavigation()
         automations.keys.toList().forEach { service -> finishAutomation(service) }
         focusQueue.clear()
         fileBroker.cancelAll()
@@ -448,8 +652,21 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     override fun cancelAutomation(service: ArenaService) {
         serviceEpochs[service] = (serviceEpochs[service] ?: 0L) + 1L
+        cancelPendingNavigation(service)
         finishAutomation(service)
         webViews[service]?.let { fileBroker.cancel(it) }
+    }
+
+    private fun cancelPendingNavigation(only: ArenaService? = null) {
+        val services = if (only == null) navigationGenerations.keys.toList() else listOf(only)
+        services.forEach { service ->
+            navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
+            pendingFreshPages.remove(service)?.invoke(false)
+            pendingLoads.remove(service)?.let { pending ->
+                webViews[service]?.stopLoading()
+                pending(false)
+            }
+        }
     }
 
     private fun activateForAutomation(
@@ -459,17 +676,43 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         onBusy: () -> Unit,
         onInterrupted: (String) -> Unit,
         timeoutMillis: Long = AUTOMATION_HARD_TIMEOUT_MS,
+        strictReceipt: Boolean = false,
         block: (WebView) -> Unit,
     ) {
         if (destroyed) return onTimeout()
         if (service in automations) return onBusy()
         val webView = ensureWebView(service) ?: return onTimeout()
-        val token = Automation(requestId, onTimeout, onInterrupted)
+        val token = Automation(requestId, onTimeout, onInterrupted, strictReceipt)
+        token.deadlineWallMillis = System.currentTimeMillis() + timeoutMillis
         automations[service] = token
         val watchdog = Runnable {
             if (!isCurrent(service, token)) return@Runnable
+            val detail = token.timeoutDetail
+            val page = webViews[service]
+            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL)) {
+                // The page may have clicked just before this deadline while its callback is still queued.
+                // Never tell the user "not sent" then: a retry would ask the question twice.
+                var reported = false
+                fun report(clicked: Boolean?) {
+                    if (reported || !isCurrent(service, token)) return
+                    reported = true
+                    finishAutomation(service)
+                    when (clicked) {
+                        true -> onInterrupted(DOUBAO_UNCONFIRMED_DETAIL)
+                        false -> onInterrupted(detail)
+                        null -> onTimeout()
+                    }
+                }
+                // One script cancels first, then reads: every page click path checks the cancel flag
+                // before clicking, so a later click is blocked and an earlier one is seen.
+                val id = ArenaJs.quote(token.requestId)
+                page.evaluateJavascript("(()=>{window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[$id]=true;" +
+                    "return !!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[$id]);})()") { raw -> report(raw == "true") }
+                handler.postDelayed({ report(null) }, 2_000L)
+                return@Runnable
+            }
             finishAutomation(service)
-            onTimeout()
+            detail?.let(onInterrupted) ?: onTimeout()
         }
         token.watchdog = watchdog
         handler.postDelayed(watchdog, timeoutMillis)
@@ -488,7 +731,22 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         onReady: (WebView) -> Unit,
     ) {
         val selectors = ArenaJs.quoteArray(promptInputSelectors(service))
-        val probe = "(function() { ${selectorHelperScript()} return !!arenaFirstMatch($selectors); })();"
+        val probe = """
+            (function() {
+              ${selectorHelperScript()}
+              const input = arenaFirstMatch($selectors);
+              ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
+              if (!${token.strictReceipt}) return !!input;
+              const key = ${ArenaJs.quote(token.requestId)};
+              const text = input ? (input.value || input.innerText || input.textContent || '') : '';
+              const previous = window.__aiArenaReadyProbe;
+              if (!input || document.readyState !== 'complete' || !previous || previous.key !== key || previous.input !== input || previous.text !== text || previous.url !== location.href) {
+                window.__aiArenaReadyProbe = { key, input, text, url: location.href, since: Date.now() };
+                return false;
+              }
+              return Date.now() - previous.since >= 1600;
+            })();
+        """.trimIndent()
         webView.evaluateJavascript(probe) { raw ->
             if (!isCurrent(service, token)) return@evaluateJavascript
             if (raw == "true") onReady(webView)
@@ -521,14 +779,18 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             webView.requestFocus()
             val watchdog = Runnable {
                 if (focusAction !== action) return@Runnable
-                releaseFocus(action)
                 if (isCurrent(action.service, token)) {
+                    // Revoke the old page request before the next input lease can start.
                     finishAutomation(action.service)
-                    token.onInterrupted("${action.service.displayName} 网页输入操作响应超时，请检查原网页后重试")
-                }
+                    token.onInterrupted("${action.service.displayName} 网页输入操作响应超时，请检查原网页；不会自动重复发送")
+                } else releaseFocus(action)
             }
             focusWatchdog = watchdog
-            handler.postDelayed(watchdog, FOCUS_ACTION_TIMEOUT_MS)
+            // A lost callback must not hold every other provider until their shared
+            // 45-second deadlines. Kimi's Lexical paste can legitimately take 15s.
+            val focusTimeout = if (token.strictReceipt && action.service == ArenaService.KIMI)
+                KIMI_FOCUS_ACTION_TIMEOUT_MS else FOCUS_ACTION_TIMEOUT_MS
+            handler.postDelayed(watchdog, focusTimeout)
             // Let Android apply the front view's layout before querying native touch coordinates.
             handler.postDelayed({
                 if (focusAction !== action || !isCurrent(action.service, token)) return@postDelayed
@@ -580,9 +842,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         requestId: String,
         callback: (SendOutcome) -> Unit,
     ) {
-        webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId), null)
-        sentSinceLoad += service
-        finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
+        val token = automations[service]
+        if (token?.strictReceipt == true) {
+            // verifySendScript already verified and bound in one synchronous DOM read.
+            if (!isCurrent(service, token)) return
+            sentSinceLoad += service
+            finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
+            return
+        }
+        webView.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId)) {
+            if (!isCurrent(service, token)) return@evaluateJavascript
+            sentSinceLoad += service
+            finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
+        }
     }
 
     private fun sendStandard(
@@ -606,11 +878,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             finishSend(service, SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
         }
         withFocus(service, requestId) { release ->
-            handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
+            if (token?.strictReceipt != true) handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
             token?.sending = true
             webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
                 // Rich-editor insertText can commit on a later task; release before the guarded send click.
-                handler.postDelayed({ release() }, 220L)
+                if (service == ArenaService.KIMI && token?.strictReceipt == true) {
+                    awaitKimiInput(webView, requestId, release, callback)
+                } else handler.postDelayed({ release() }, 220L)
                 if (!isCurrent(service, token)) return@evaluateJavascript
                 if (scriptCallbackConsumed) return@evaluateJavascript
                 scriptCallbackConsumed = true
@@ -622,47 +896,108 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 }
                 if (service == ArenaService.DOUBAO) {
                     // Doubao's current mobile web build accepts the same programmatic click
-                    // once the host WebView is no longer the visible automation surface.
-                    // Keep the page alive, but hide the Android view before issuing clicks.
+                    // once the host WebView is no longer the front automation surface. It stays
+                    // drawn (not GONE): its send pipeline advances on animation frames.
                     token?.parked = true
                     refreshVisibility()
                     verifyDoubaoSend(webView, requestId, callback)
                     return@evaluateJavascript
                 }
-                // Rich editors (especially Doubao's ProseMirror) update their framework state
-                // asynchronously. Give the scheduled, guarded click/retry enough time to run
-                // before deciding that a send failed.
-                val verifyDelayMs = 2_500L
                 handler.postDelayed({
-                    if (!isCurrent(service, token)) return@postDelayed
-                    var verifyCallbackConsumed = false
-                    val verifyCallbackTimeout = Runnable {
-                        if (!isCurrent(service, token)) return@Runnable
-                        if (verifyCallbackConsumed) return@Runnable
-                        verifyCallbackConsumed = true
-                        finishSend(service, SendOutcome(false, requestId, "网页发送确认超时"), callback)
-                    }
-                    handler.postDelayed(verifyCallbackTimeout, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
-                    webView.evaluateJavascript(verifySendScript(service, requestId)) { verifyRaw ->
-                        if (!isCurrent(service, token)) return@evaluateJavascript
-                        if (verifyCallbackConsumed) return@evaluateJavascript
-                        verifyCallbackConsumed = true
-                        handler.removeCallbacks(verifyCallbackTimeout)
-                        val sent = verifyRaw == "true"
-                        if (sent) {
-                            finishSuccessfulSend(webView, service, requestId, callback)
-                        } else if (service == ArenaService.KIMI) {
-                            // A members-only Kimi model answers the send click with an upgrade modal (2026-09-15).
-                            webView.evaluateJavascript(KIMI_UPGRADE_MODAL_SCRIPT) { modal ->
-                                if (!isCurrent(service, token)) return@evaluateJavascript
-                                val detail = if (modal == "true") KIMI_UPGRADE_DETAIL else "发送后未检测到新消息"
-                                finishSend(service, SendOutcome(false, requestId, detail), callback)
-                            }
-                        } else {
-                            finishSend(service, SendOutcome(false, requestId, "发送后未检测到新消息"), callback)
-                        }
-                    }
-                }, verifyDelayMs)
+                    if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback)
+                }, 2_500L)
+            }
+        }
+    }
+
+    /** Keep the input lease until Lexical has committed the paste, under the request watchdog. */
+    private fun awaitKimiInput(webView: WebView, requestId: String, release: () -> Unit, callback: (SendOutcome) -> Unit) {
+        val service = ArenaService.KIMI
+        val token = automations[service]
+        if (token?.requestId != requestId || !isCurrent(service, token)) { release(); return }
+        val probe = """
+            (function() {
+              ${ArenaWebCursorScript.stateBootstrap(requestId)}
+              if (!state.inputPhase) return 'legacy';
+              if (state.inputFailure) return 'failed';
+              const input = document.querySelector('.chat-input-editor');
+              const text = String(input?.innerText || input?.textContent || '').replace(/\s+/g,' ').trim();
+              return state.submittedAt || (state.inputPhase === 'pasted' && text === state.expectedPrompt) ? 'ready' : 'pending';
+            })();
+        """.trimIndent()
+        webView.evaluateJavascript(probe) { raw ->
+            if (!isCurrent(service, token)) { release(); return@evaluateJavascript }
+            when (decodeJsValue(raw)) {
+                "ready" -> release()
+                "legacy" -> handler.postDelayed({ release() }, 220L)
+                "failed" -> {
+                    release()
+                    finishSend(service, SendOutcome(false, requestId, "网页输入状态发生变化，未发送问题；请检查原网页"), callback)
+                }
+                else -> handler.postDelayed({ awaitKimiInput(webView, requestId, release, callback) }, 100L)
+            }
+        }
+    }
+
+    /** Observe late acknowledgement without clicking again. Empty input alone is not receipt evidence. */
+    private fun verifyStandardSend(
+        webView: WebView,
+        service: ArenaService,
+        requestId: String,
+        callback: (SendOutcome) -> Unit,
+        attempt: Int = 0,
+    ) {
+        val token = automations[service]
+        var consumed = false
+        val timeout = Runnable {
+            if (!isCurrent(service, token) || consumed) return@Runnable
+            consumed = true
+            finishSend(service, SendOutcome(false, requestId, "网页发送确认超时，请检查原网页；不会自动重复发送"), callback)
+        }
+        // A busy provider renderer may acknowledge the single submitted question after 10s.
+        // Strict text requests keep observing under the existing whole-automation watchdog;
+        // a short callback timer must not discard a late, valid receipt or trigger another send.
+        if (token?.strictReceipt != true) handler.postDelayed(timeout, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+        webView.evaluateJavascript(verifySendScript(service, requestId)) { raw ->
+            if (!isCurrent(service, token) || consumed) return@evaluateJavascript
+            consumed = true
+            handler.removeCallbacks(timeout)
+            if (raw == "true") {
+                finishSuccessfulSend(webView, service, requestId, callback)
+            } else if (decodeJsValue(raw) == "scope_changed") {
+                finishSend(service, SendOutcome(false, requestId, ArenaWebMessageIdentity.scopeChangedDetail(service)), callback)
+            } else if (service == ArenaService.ZHIPU && decodeJsValue(raw).startsWith("zhipu_error:")) {
+                val reason = when (decodeJsValue(raw).removePrefix("zhipu_error:")) {
+                    "send_disabled", "no_send_button" -> "发送按钮尚不可用"
+                    "page_changed" -> "页面已切换"
+                    "input_changed", "no_input", "no_input_listener" -> "输入框尚未就绪或内容发生变化"
+                    else -> "网页没有确认发送"
+                }
+                finishSend(service, SendOutcome(false, requestId, "智谱$reason，请打开原网页核对；不会自动重复发送"), callback)
+            } else if (service == ArenaService.KIMI) {
+                // A receipt can arrive between these evaluations. Check it again atomically
+                // with the dialog classification so a stale dialog cannot override delivery.
+                val rejectionScript = "(function(){return (${verifySendScript(service, requestId).removeSuffix(";")}) ? 'accepted' : (window.__aiArenaRequests?.[${ArenaJs.quote(requestId)}]?.inputFailure ? 'input_error' : ${ArenaKimiRejection.expression});})()"
+                webView.evaluateJavascript(rejectionScript) { modal ->
+                    if (!isCurrent(service, token)) return@evaluateJavascript
+                    val rejection = decodeJsValue(modal)
+                    if (rejection == "accepted") finishSuccessfulSend(webView, service, requestId, callback)
+                    else if (rejection == "input_error") finishSend(service, SendOutcome(false, requestId,
+                        "网页输入失败，请检查原网页；未发送问题"), callback)
+                    else if (ArenaKimiRejection.detail(rejection) != null) finishSend(service, SendOutcome(false, requestId,
+                        ArenaKimiRejection.detail(rejection)!!), callback)
+                    else if (attempt < 15) handler.postDelayed({
+                        if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
+                    }, 500L)
+                    else finishSend(service, SendOutcome(false, requestId, "未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
+                }
+            } else {
+                // Yuanbao's formal ID and Zhipu's foreground readiness can arrive late.
+                // Keep observing without another click, bounded by the original watchdog.
+                if (token?.strictReceipt == true && (service == ArenaService.YUANBAO || service == ArenaService.ZHIPU || attempt < 15)) handler.postDelayed({
+                    if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
+                }, 500L)
+                else finishSend(service, SendOutcome(false, requestId, "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
             }
         }
     }
@@ -682,6 +1017,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         var issued = false
         var geometryFailures = 0
         var preparationDeadline = 0L
+        var busySeen = false
         fun current() = isCurrent(service, token)
         fun sameDocument() = current() && fileBroker.generation(webView) == generation && webView.url == origin && ArenaFileChooserBroker.trusted(service, webView.url)
         fun fail(detail: String) { if (current()) finishSend(service, SendOutcome(false, requestId, detail), callback) }
@@ -726,12 +1062,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         fun prepareTouch() {
             if (!current() || issued) return
             if (!sameDocument()) return fail("豆包网页已切换，未发送问题")
-            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail("豆包发送按钮或当前正文尚未就绪，未发送问题")
+            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送按钮或当前正文尚未就绪，未发送问题")
             webView.evaluateJavascript(nativeDoubaoControlScript(requestId, arm = false)) probe@{ raw ->
                 if (!current() || issued) return@probe
                 val ready = read(raw) ?: return@probe fail("豆包发送控件状态无法读取，未发送问题")
                 if (ready.has("error")) return@probe fail(ready.optString("error"))
                 if (!ready.optBoolean("ready")) {
+                    busySeen = busySeen || ready.optBoolean("busy")
                     handler.postDelayed({ prepareTouch() }, 250L)
                     return@probe
                 }
@@ -794,7 +1131,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 val result = decodeJsValue(raw)
                 if (!result.startsWith("sent")) return@evaluateJavascript fail(result.ifBlank { "豆包正文注入失败，未发送问题" })
                 preparationDeadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
-                handler.postDelayed({ if (!issued) fail("豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                handler.postDelayed({ if (!issued) fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                 handler.postDelayed({ prepareTouch() }, 220L)
             }
         }
@@ -850,6 +1187,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
           const native=window.__aiArenaNativeSend;
           if(!native||native.id!==${ArenaJs.quote(requestId)}||window.__aiArenaCancelledRequests?.[native.id])return JSON.stringify({error:'豆包发送请求已取消'});
           if(window.__aiArenaSendClicks?.[native.id])return JSON.stringify({error:'豆包已点击发送，未重复提交'});
+          if(${doubaoHiddenExpression(ArenaService.DOUBAO)})return JSON.stringify({ready:false});
+          if(${doubaoBusyExpression(ArenaService.DOUBAO)})return JSON.stringify({ready:false,busy:true});
           const shown=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>2&&r.height>2&&s.display!=='none'&&s.visibility!=='hidden'};
           const buttons=Array.from(document.querySelectorAll('button#flow-end-msg-send')).filter(shown);
           if(buttons.length>1)return JSON.stringify({error:'无法确认豆包唯一发送按钮，未发送问题'});
@@ -884,21 +1223,47 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val clickDelayMs = if (attempt == 0) 900L else 1_400L
         handler.postDelayed({
             if (!isCurrent(service, token)) return@postDelayed
-            webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) {
+            webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) { clickRaw ->
                 if (!isCurrent(service, token)) return@evaluateJavascript
+                when (decodeJsValue(clickRaw)) {
+                    // Waiting for idle keeps the question in the input and relies on the request watchdog.
+                    "busy" -> token?.timeoutDetail = DOUBAO_BUSY_DETAIL
+                    "hidden" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL) token?.timeoutDetail = DOUBAO_HIDDEN_DETAIL
+                    // Once submitted, a slow website receipt is observed until the watchdog; never click again.
+                    "clicked", "awaiting_confirmation" -> if (token?.timeoutDetail == null || token.timeoutDetail == DOUBAO_BUSY_DETAIL || token.timeoutDetail == DOUBAO_HIDDEN_DETAIL)
+                        token?.timeoutDetail = DOUBAO_UNCONFIRMED_DETAIL
+                }
                 handler.postDelayed({
                     if (!isCurrent(service, token)) return@postDelayed
                     webView.evaluateJavascript(verifySendScript(ArenaService.DOUBAO, requestId)) { raw ->
                         if (!isCurrent(service, token)) return@evaluateJavascript
                         if (raw == "true") {
                             finishSuccessfulSend(webView, ArenaService.DOUBAO, requestId, callback)
-                        } else if (attempt + 1 < DOUBAO_SEND_ATTEMPTS) {
-                            verifyDoubaoSend(webView, requestId, callback, attempt + 1)
                         } else {
-                            finishSend(
-                                service, SendOutcome(false, requestId, "豆包发送按钮未响应，请稍后重试"),
-                                callback,
-                            )
+                            fun continueOrFail(queued: Boolean) {
+                                if (BuildConfig.DEBUG) android.util.Log.i("ArenaDoubaoSend", "$requestId attempt=$attempt verify=$raw queued=$queued timeoutDetail=${token?.timeoutDetail != null}")
+                                if (!isCurrent(service, token)) return
+                                if (queued && token != null) {
+                                    token.timeoutDetail = "本轮消息进入了豆包网页待发送队列，尚未确认送达；请打开原网页核对，勿重复发送"
+                                    // Parked pages stay drawn, so queue dispatch keeps its animation frames.
+                                    // Never grant focus to or click the website queue.
+                                }
+                                if (queued || token?.timeoutDetail != null || attempt + 1 < DOUBAO_SEND_ATTEMPTS)
+                                    verifyDoubaoSend(webView, requestId, callback, attempt + 1)
+                                else finishSend(service, SendOutcome(false, requestId, "豆包发送按钮未响应，请打开原网页核对；不会自动重复发送"), callback)
+                            }
+                            if (token?.strictReceipt == true) webView.evaluateJavascript("""
+                                (()=>{
+                                  ${ArenaWebCursorScript.stateBootstrap(requestId)}
+                                  ${ArenaWebMessageIdentity.helper(service)}
+                                  if (!state.expectedPrompt || !state.submittedAt) return false;
+                                  return Array.from(document.querySelectorAll('[data-item-id][data-item-status]')).some(row =>
+                                    ['Pending','Sending'].includes(row.getAttribute('data-item-status')) &&
+                                    !(state.beforeQueueIds || []).includes(row.getAttribute('data-item-id')) &&
+                                    arenaUserText(row.querySelector('[class*=richTextPreview]') || row) === state.expectedPrompt);
+                                })();
+                            """.trimIndent()) { queue -> continueOrFail(queue == "true") }
+                            else continueOrFail(false)
                         }
                     }
                 }, 600L)
@@ -948,6 +1313,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         confirmedSignedIn.remove(service)
         explicitLoginProbeCounts.remove(service)
         sentSinceLoad.remove(service)
+        pendingFreshPages.remove(service)?.invoke(false)
         pendingLoads.remove(service)?.invoke(false)
         statuses[service] = ServiceStatus()
         container.removeView(webView)
@@ -1111,6 +1477,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         url = request.url.toString(),
                     )
                     pendingLoads.remove(service)?.invoke(false)
+                    pendingFreshPages.remove(service)?.invoke(false)
                 }
 
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -1125,6 +1492,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     webViews.remove(service)
                     confirmedSignedIn.remove(service)
                     sentSinceLoad.remove(service)
+                    pendingFreshPages.remove(service)?.invoke(false)
                     pendingLoads.remove(service)?.invoke(false)
                     container.removeView(view)
                     view.destroy()
@@ -1213,7 +1581,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             return
         }
         // 与自动化链同理：探针的 JS 回调也会随渲染进程一起消失。
-        // 探针超时只结束自身；发送任务不再等待探针，也不借用它的标识。
+        // 探针超时只结束自身；未确认账号的发送会重新核对状态，不能把超时当成登录成功。
         var consumed = false
         val timeout = Runnable {
             if (consumed) return@Runnable
@@ -1364,18 +1732,33 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     }
 
     private fun verifySendScript(service: ArenaService, requestId: String): String {
+        if (automations[service]?.strictReceipt == true) {
+            val bind = ArenaWebCursorScript.bind(service, requestId, requireIdentity = true)
+            if (service == ArenaService.ZHIPU) return """
+                (() => {
+                  const receipt = ${bind.removeSuffix(";")};
+                  if (receipt === true || receipt === 'scope_changed') return receipt;
+                  const failure = window.__aiArenaZhipuDispatchResults?.[${ArenaJs.quote(requestId)}] || '';
+                  return failure.startsWith('error:') ? 'zhipu_error:' + failure.slice(6) : false;
+                })();
+            """.trimIndent()
+            return bind
+        }
         val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val selectorHelper = selectorHelperScript()
+        val requireIdentity = automations[service]?.strictReceipt == true
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         return """
             (function() {
               $stateBootstrap
+              if ($requireIdentity && !state.expectedPrompt) return false;
+              ${ArenaWebMessageIdentity.helper(service)}
               $selectorHelper
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               const clicked = !!(window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]);
-              return ($conversationAdvanced) || (inputText.trim().length === 0 && clicked);
+              return ($conversationAdvanced) || (!state.expectedPrompt && inputText.trim().length === 0 && clicked);
             })();
         """.trimIndent()
     }
@@ -1384,24 +1767,31 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val inputSelectors = ArenaJs.quoteArray(promptInputSelectors(service))
         val sendSelectors = ArenaJs.quoteArray(sendButtonSelectors(service))
         val selectorHelper = selectorHelperScript()
+        val requireIdentity = automations[service]?.strictReceipt == true
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         return """
             (function() {
               $stateBootstrap
+              if ($requireIdentity && !state.expectedPrompt) return 'missing_identity';
+              ${ArenaWebMessageIdentity.helper(service)}
               $selectorHelper
               ${sendControlHelperScript()}
+              if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail(service))};
               if ($conversationAdvanced) return 'already_sent';
               if (window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]) return 'cancelled';
               if (window.__aiArenaNativeSendRequests?.[requestId]) return 'native_managed';
-              if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return 'awaiting_confirmation';
+              if (state.submittedAt || (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId])) return 'awaiting_confirmation';
               const input = arenaFirstMatch($inputSelectors);
               const inputText = input ? (input.value || input.innerText || input.textContent || '') : '';
               if (!inputText.trim()) return 'already_sent_or_missing';
+              if (state.expectedPrompt && arenaNormalize(inputText) !== state.expectedPrompt) return 'prompt_changed';
+              if (${doubaoHiddenExpression(service)}) return 'hidden';
+              if (${doubaoBusyExpression(service)}) return 'busy';
               const send = arenaFirstMatch($sendSelectors);
               if (!arenaSendEnabled(send)) return 'not_ready';
               window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
-              window.__aiArenaSendClicks[requestId] = Date.now();
+              arenaRecordSubmission();
               send.click();
               return 'clicked';
             })();
@@ -1416,6 +1806,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val selectorHelper = selectorHelperScript()
         val firstClickDelayMs = if (service == ArenaService.DOUBAO) 850 else 400
         val retryClickDelayMs = if (service == ArenaService.DOUBAO) 2_400 else 1_400
+        val requireIdentity = automations[service]?.strictReceipt == true
         val stateBootstrap = ArenaWebCursorScript.stateBootstrap(requestId)
         val conversationAdvanced = ArenaWebCursorScript.conversationAdvancedExpression(service)
         val qwenFetchHook = if (service == ArenaService.QWEN) {
@@ -1428,7 +1819,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 window.postMessage({
                   channel: '__ai_arena_zhipu_send_v1',
                   requestId: requestId,
-                  text: text
+                  text: text,
+                  deadlineMillis: ${automations[service]?.deadlineWallMillis ?: 0L}
                 }, location.origin);
                 return 'sent_pending';
             """.trimIndent()
@@ -1439,8 +1831,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             ""
         } else {
             """
-                setTimeout(attemptSend, $firstClickDelayMs);
-                setTimeout(attemptSend, $retryClickDelayMs);
+                if (!delayedInput) {
+                  setTimeout(attemptSend, $firstClickDelayMs);
+                  setTimeout(attemptSend, $retryClickDelayMs);
+                }
             """.trimIndent()
         }
         val focusInput = "input.focus();"
@@ -1450,8 +1844,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               try {
                 const text = $quotedPrompt;
                 $stateBootstrap
+              if ($requireIdentity && !state.expectedPrompt) return 'missing_identity';
+              ${ArenaWebMessageIdentity.helper(service)}
                 const cancelled = () => !!(window.__aiArenaCancelledRequests && window.__aiArenaCancelledRequests[requestId]);
                 if (cancelled()) return 'cancelled';
+                if (!arenaRequestScopeValid()) return ${ArenaJs.quote(ArenaWebMessageIdentity.scopeChangedDetail(service))};
                 $selectorHelper
                 ${sendControlHelperScript()}
                 $qwenFetchHook
@@ -1460,11 +1857,56 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 if (!input) return 'no_input';
                 $focusInput
                 let needsSyntheticInput = true;
+                let delayedInput = false;
                 if ($browserInputOnly) {
                   // Doubao attachments must pass through the browser's editing/input path.
                   // Do not substitute its private setter or a synthetic input event here.
                   document.execCommand('selectAll', false, null);
                   if (!document.execCommand('insertText', false, text)) return '豆包正文浏览器输入失败，未发送问题';
+                  needsSyntheticInput = false;
+                } else if (${service == ArenaService.KIMI} && input.getAttribute('data-lexical-editor') === 'true') {
+                  // Lexical keeps its own selection. Paste only after selectionchange has
+                  // reached that editor; immediate execCommand/selectAll can append to an old draft.
+                  delayedInput = true;
+                  const original = input.textContent;
+                  state.inputPhase = 'focus';
+                  const abortInput = reason => { state.inputFailure = reason; };
+                  // focus() can schedule a Lexical caret reset. Select only after that task.
+                  setTimeout(function() {
+                    if (cancelled()) return;
+                    if (!input.isConnected || document.activeElement !== input) return abortInput('focus_changed');
+                    if (input.textContent !== original) return abortInput('draft_changed');
+                    const selection = window.getSelection();
+                    const range = document.createRange();
+                    range.selectNodeContents(input);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    state.inputPhase = 'selected';
+                    document.dispatchEvent(new Event('selectionchange'));
+                    setTimeout(function() {
+                      if (cancelled()) return;
+                      if (!input.isConnected || document.activeElement !== input) return abortInput('focus_changed');
+                      if (input.textContent !== original) return abortInput('draft_changed');
+                      const selected = window.getSelection();
+                      if (!selected || selected.rangeCount !== 1) return abortInput('selection_changed');
+                      const current = selected.getRangeAt(0);
+                      if (!input.contains(current.startContainer) || !input.contains(current.endContainer) ||
+                          current.cloneContents().textContent !== original) return abortInput('selection_changed');
+                      try {
+                        const transfer = new DataTransfer();
+                        transfer.setData('text/plain', text);
+                        input.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: transfer }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        state.inputPhase = 'pasted';
+                      } catch (error) {
+                        return abortInput('paste_exception');
+                      }
+                      if ($scheduleSubmit) {
+                        setTimeout(attemptSend, $firstClickDelayMs);
+                        setTimeout(attemptSend, $retryClickDelayMs);
+                      }
+                    }, 80);
+                  }, 80);
                   needsSyntheticInput = false;
                 } else if (input.editor && input.editor.commands && typeof input.editor.commands.setContent === 'function') {
                   const paragraphs = text.split(/\r?\n/).map(function(line) {
@@ -1545,18 +1987,21 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 };
                 const attemptSend = function() {
                   if (cancelled()) return;
+                  if (!arenaRequestScopeValid()) return;
                   if (window.__aiArenaNativeSendRequests?.[requestId]) return;
                   if ($conversationAdvanced) return;
-                  if (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId]) return;
-                  if (!currentInputText().trim()) return;
+                  if (state.submittedAt || (window.__aiArenaSendClicks && window.__aiArenaSendClicks[requestId])) return;
+                  if (!input.isConnected || !currentInputText().trim()) return;
+                  if (state.expectedPrompt && arenaNormalize(currentInputText()) !== state.expectedPrompt) return;
+                  if (${doubaoHiddenExpression(service)} || ${doubaoBusyExpression(service)}) return;
                   const send = arenaFirstMatch($sendSelectors);
                   window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
                   if (send) {
                     if (!arenaSendEnabled(send)) return;
-                    window.__aiArenaSendClicks[requestId] = Date.now();
+                    arenaRecordSubmission();
                     send.click();
                   } else {
-                    window.__aiArenaSendClicks[requestId] = Date.now();
+                    arenaRecordSubmission();
                     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
                     input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
                   }
@@ -1570,20 +2015,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
     }
 
-    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
-    private fun sendControlHelperScript(): String = """
-        const arenaSendEnabled = function(send) {
-          if (!send) return false;
-          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
-          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
-          for(let node=send;node&&node!==document.body;node=node.parentElement){
-            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
-            // CSS-module disabled states such as Yuanbao's SendButton_disabled__hash.
-            if(Array.from(node.classList).some(name=>/(^|_)disabled(_|${'$'})/i.test(name)))return false;
-          }
-          return true;
-        };
-    """.trimIndent()
 
     /**
      * 输入框候选，**按优先级从精确到兜底排列**。
@@ -1595,7 +2026,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
      */
     private fun promptInputSelectors(service: ArenaService): List<String> = when (service) {
         ArenaService.DEEPSEEK -> listOf("#chat-input", "textarea[placeholder]", "[contenteditable='true']")
-        ArenaService.DOUBAO -> listOf(".tiptap.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea")
+        // Doubao first hydrates an interim TEXTAREA (data-testid=chat_input_input) and swaps in tiptap
+        // later; the swap can take 15+ s when other pages occupy the shared renderer thread (measured
+        // 2026-09-23). A question typed into the interim box moved into tiptap unsent. Never use it.
+        ArenaService.DOUBAO -> listOf(".tiptap.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea:not([data-testid=chat_input_input])")
         ArenaService.KIMI -> listOf(".chat-input-editor", "[role='textbox']", "[contenteditable='true']", "textarea")
         ArenaService.QWEN -> listOf("[role='textbox']", "[contenteditable='true']", "[contenteditable]", "textarea")
         ArenaService.YUANBAO -> listOf("[contenteditable='true']", "textarea", "#chat-input")
@@ -1610,7 +2044,33 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         promptInputSelectors(service).joinToString(", ")
 
     companion object {
-        private val ZHIPU_DOCUMENT_START_CAPTURE = """
+        internal val editorDraftHelper = """
+            const arenaEditorDraft = input => {
+              if (!input) return '';
+              if (/^(TEXTAREA|INPUT)$/.test(input.tagName)) return String(input.value || '').trim();
+              const copy = input.cloneNode(true);
+              // Slate's empty editor contains a real DOM placeholder (Qwen, 2026-09-25).
+              // Ignore only framework-marked placeholders, never delete the live draft.
+              copy.querySelectorAll('[data-slate-placeholder=true], [data-slate-zero-width]').forEach(node => node.remove());
+              return String(copy.textContent || '').trim();
+            };
+        """.trimIndent()
+    /** Div-based send controls use CSS/data/ARIA disabling; a disabled control must not fall back to Enter. */
+        private fun sendControlHelperScript(): String = """
+        const arenaSendEnabled = function(send) {
+          if (!send) return false;
+          const rect=send.getBoundingClientRect(),style=getComputedStyle(send);
+          if(rect.width<=0||rect.height<=0||style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none')return false;
+          for(let node=send;node&&node!==document.body;node=node.parentElement){
+            if(node.disabled||node.hasAttribute('disabled')||node.getAttribute('aria-disabled')==='true'||['','true'].includes(node.getAttribute('data-disabled'))||node.classList.contains('disabled'))return false;
+            // CSS-module disabled states such as Yuanbao's SendButton_disabled__hash.
+            if(Array.from(node.classList).some(name=>/(^|_)disabled(_|${'$'})/i.test(name)))return false;
+          }
+          return true;
+        };
+    """.trimIndent()
+
+        internal val ZHIPU_DOCUMENT_START_CAPTURE = """
             (function() {
               try {
                 const eventTargetPrototype = window.EventTarget && window.EventTarget.prototype;
@@ -1633,8 +2093,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     !payload || payload.channel !== '__ai_arena_zhipu_send_v1') return;
                   const requestId = String(payload.requestId || '');
                   const text = String(payload.text || '');
+                  if (!requestId || !text || window.__aiArenaCancelledRequests?.[requestId] ||
+                      window.__aiArenaSendClicks?.[requestId]) return;
                   window.__aiArenaZhipuDispatchResults = window.__aiArenaZhipuDispatchResults || {};
+                  if (window.__aiArenaZhipuDispatchResults[requestId]) return;
+                  window.__aiArenaZhipuDispatchResults[requestId] = 'preparing';
                   try {
+                    // Use the native automation's original deadline. Background throttling
+                    // must not consume a separate short readiness window or extend the task.
+                    const deadline = Number(payload.deadlineMillis);
+                    if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error('send_disabled');
+                    const pageUrl = location.href;
+                    const owner = window.__aiArenaRequests?.[requestId];
+                    if (owner && owner.initialUrl !== pageUrl) throw new Error('page_changed');
                     const input = document.querySelector("[contenteditable='true'],[role='textbox'],textarea");
                     if (!input) throw new Error('no_input');
                     const inputPrototype = input.tagName === 'TEXTAREA'
@@ -1666,26 +2137,47 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                       if (typeof listener === 'function') listener.call(input, inputEvent);
                       else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(inputEvent);
                     }
-                    const send = document.querySelector('.button-right-inner');
-                    if (!send) throw new Error('no_send_button');
-                    const rect = send.getBoundingClientRect();
-                    const eventOptions = {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window,
-                      button: 0,
-                      buttons: 1,
-                      clientX: rect.left + rect.width / 2,
-                      clientY: rect.top + rect.height / 2
+                    ${sendControlHelperScript()}
+                    const attempt = function() {
+                      try {
+                        if (window.__aiArenaCancelledRequests?.[requestId] || window.__aiArenaSendClicks?.[requestId]) return;
+                        if (location.href !== pageUrl || (owner && window.__aiArenaRequests?.[requestId] !== owner)) throw new Error('page_changed');
+                        if (Date.now() >= deadline) throw new Error('send_disabled');
+                        if (!input.isConnected) throw new Error('input_changed');
+                        const currentText = String(input.value || input.innerText || input.textContent || '').replace(/\s+/g,' ').trim();
+                        if (currentText !== text.replace(/\s+/g,' ').trim()) throw new Error('input_changed');
+                        if (document.visibilityState !== 'visible') {
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
+                        const send = document.querySelector('.button-right-inner');
+                        if (!arenaSendEnabled(send)) {
+                          if (Date.now() >= deadline) throw new Error('send_disabled');
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
+                        const rect = send.getBoundingClientRect();
+                        if (Date.now() >= deadline) throw new Error('send_disabled');
+                        if (document.visibilityState !== 'visible') {
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
+                        const eventOptions = { bubbles:true, cancelable:true, view:window, button:0, buttons:1,
+                          clientX:rect.left + rect.width / 2, clientY:rect.top + rect.height / 2 };
+                        window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
+                        window.__aiArenaSendClicks[requestId] = Date.now();
+                        if (owner) {
+                          owner.submittedAt = window.__aiArenaSendClicks[requestId];
+                          try { sessionStorage.setItem('__ai_arena_cursor_' + requestId, JSON.stringify(owner)); } catch (_) {}
+                        }
+                        send.dispatchEvent(new MouseEvent('mousedown', eventOptions));
+                        send.dispatchEvent(new MouseEvent('mouseup', Object.assign({}, eventOptions, {buttons:0})));
+                        window.__aiArenaZhipuDispatchResults[requestId] = 'dispatched';
+                      } catch (error) {
+                        window.__aiArenaZhipuDispatchResults[requestId] = 'error:' + String(error && error.message || error);
+                      }
                     };
-                    window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
-                    window.__aiArenaSendClicks[requestId] = Date.now();
-                    send.dispatchEvent(new MouseEvent('mousedown', eventOptions));
-                    send.dispatchEvent(new MouseEvent(
-                      'mouseup',
-                      Object.assign({}, eventOptions, { buttons: 0 })
-                    ));
-                    window.__aiArenaZhipuDispatchResults[requestId] = 'dispatched';
+                    setTimeout(attempt, 0);
                   } catch (error) {
                     window.__aiArenaZhipuDispatchResults[requestId] =
                       'error:' + String(error && error.message || error);
@@ -1726,6 +2218,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[aria-label*='发送']",
             )
             ArenaService.DOUBAO -> listOf(
+                "#input-engine-container #flow-end-msg-send",
                 "#input-engine-container button[class*='bg-dbx-fill-highlight']",
                 "button[class*='send-msg-btn']",
                 "button[class*='g-send-msg']",
@@ -1878,6 +2371,35 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 window.__aiArenaQwenPendingRequestId = requestId;
             """.trimIndent()
 
+        /**
+         * Doubao is still answering or holds a send queue (JS expression, false for other sites).
+         * While `sendMessageStatus` is Submitting/Sending/Receiving the site shows its local break
+         * button, and a new send goes into its input queue instead of the conversation (2026-09-23
+         * failure: the queued question waited behind a status stuck at Sending for 6+ minutes).
+         * Never click in that state; the caller waits for idle or reports that nothing was sent.
+         */
+        internal fun doubaoBusyExpression(service: ArenaService): String =
+            if (service != ArenaService.DOUBAO) "false"
+            else "(() => { const b = document.querySelector('[data-testid=chat_input_local_break_button]'); " +
+                "const shown = !!b && (r => r.width > 0 && r.height > 0)(b.getBoundingClientRect()) && getComputedStyle(b).display !== 'none' && getComputedStyle(b).visibility !== 'hidden'; " +
+                "return shown || !!document.querySelector('[data-testid=queue-message-item], [data-item-id][data-item-status=Pending], [data-item-id][data-item-status=Sending]'); })()"
+
+        /**
+         * Doubao's page is hidden (App in background) or became visible under 1.5 s ago (JS expression).
+         * 2026-09-23 real account: a send click 1.7 s after HOME put the question into Doubao's queue
+         * behind a status stuck at Sending; on becoming visible Doubao also reconnects and refreshes
+         * the conversation. Clicks wait for a settled visible page instead.
+         */
+        internal fun doubaoHiddenExpression(service: ArenaService): String =
+            if (service != ArenaService.DOUBAO) "false"
+            else "(() => { if (!window.__aiArenaVisibilityWatch) { window.__aiArenaVisibilityWatch = true; " +
+                // Seed from the browser's visibility history when available; otherwise assume long visible.
+                "const history = (performance.getEntriesByType && performance.getEntriesByType('visibility-state')) || []; " +
+                "const last = history[history.length - 1]; " +
+                "window.__aiArenaVisibleSince = document.visibilityState !== 'visible' ? 0 : last && last.name === 'visible' && last.startTime > 0 ? performance.timeOrigin + last.startTime : 1; " +
+                "document.addEventListener('visibilitychange', () => { window.__aiArenaVisibleSince = document.visibilityState === 'visible' ? Date.now() : 0; }); } " +
+                "return document.visibilityState !== 'visible' || !window.__aiArenaVisibleSince || Date.now() - window.__aiArenaVisibleSince < 1500; })()"
+
         /** 注入到页面的按优先级查找辅助函数。 */
         internal fun selectorHelperScript(): String = """
             const arenaFirstMatch = function(selectors) {
@@ -1892,16 +2414,22 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
+        private const val READING_LIVE_MS = 5_000L
+        /** Sites whose round work advances on animation frames; only these stay drawn for a whole round. */
+        private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO)
+        private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
+        private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
+        private const val DOUBAO_HIDDEN_DETAIL = "AI 圆桌在后台时不向豆包点击发送，本轮问题未发送；请回到 App 后重试"
+        private const val DOUBAO_BUSY_DETAIL = "豆包网页仍在处理上一条消息（显示停止按钮或有排队消息），本轮问题未发送；请打开原网页核对后重试"
         private const val AUTOMATION_READY_ATTEMPTS = 15
         private const val AUTOMATION_READY_INTERVAL_MS = 800L
         private const val SEND_SCRIPT_CALLBACK_TIMEOUT_MS = 12_000L
         private const val SEND_VERIFY_CALLBACK_TIMEOUT_MS = 10_000L
-        private const val KIMI_UPGRADE_DETAIL = "Kimi 网页提示当前模型或功能需要会员，问题没有发出；请打开原网页换用可用模型后重试"
-        private const val KIMI_UPGRADE_MODAL_SCRIPT = "(function(){return Array.from(document.querySelectorAll('.modal-mask')).some(function(mask){var r=mask.getBoundingClientRect();return r.width>2&&r.height>2&&/Upgrade your membership|higher-tier members|members only|升级会员|开通会员|会员专享|仅.{0,8}会员/i.test(String(mask.innerText||''));});})()"
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
+        private const val KIMI_FOCUS_ACTION_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
         private const val MODE_PROBE_TIMEOUT_MS = 4_000L
         /** 开新对话 / 切历史对话的整页加载上限；超时向调用方报告失败。 */

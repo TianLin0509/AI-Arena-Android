@@ -4,13 +4,14 @@ package com.tianlin.aiarena
 internal object ArenaWebCursorScript {
     private const val STORAGE_PREFIX = "__ai_arena_cursor_"
 
-    fun prepare(service: ArenaService, requestId: String): String {
+    fun prepare(service: ArenaService, requestId: String, prompt: String = "", legacyAttachment: Boolean = false): String {
         val selectors = responseSelectors(service).joinToString(",") { ArenaJs.quote(it) }
         val userCount = userCountExpression(service)
         return """
             (function() {
               window.__aiArenaRequests = window.__aiArenaRequests || {};
               const requestId = ${ArenaJs.quote(requestId)};
+              const cursorKey = ${ArenaJs.quote(STORAGE_PREFIX)} + requestId;
               const selectors = [$selectors];
               let assistantBaseline = 0;
               for (const selector of selectors) {
@@ -21,26 +22,49 @@ internal object ArenaWebCursorScript {
               }
               const userBaseline = $userCount;
               const state = {
+                legacyAttachment: $legacyAttachment,
                 assistantBaseline,
                 userBaseline,
                 startedAt: Date.now(),
-                initialUrl: location.href
+                initialUrl: location.href,
+                expectedPrompt: ${ArenaJs.quote(prompt)}.replace(/\s+/g, ' ').trim(),
+                expectedRawPrompt: ${ArenaJs.quote(prompt)}.replace(/\r\n/g, '\n').trim()
               };
+              ${if (!ArenaWebMessageIdentity.requiresServerId(service)) """
+              window.__aiArenaProviderDocument = window.__aiArenaProviderDocument || Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+              state.documentToken = window.__aiArenaProviderDocument;
+              """.trimIndent() else ""}
+              ${if (service == ArenaService.DEEPSEEK) """
+              // DeepSeek virtual keys are local to a document, unlike a server UUID.
+              window.__aiArenaDeepSeekDocument = window.__aiArenaDeepSeekDocument || Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+              state.documentToken = window.__aiArenaDeepSeekDocument;
+              """.trimIndent() else ""}
+              ${ArenaWebMessageIdentity.helper(service)}
+              const beforeUsers = ${ArenaWebMessageIdentity.users(service)};
+              ${if (service == ArenaService.YUANBAO) "state.yuanbaoUnstableBaseline = beforeUsers.some(row => row.hasAttribute('data-conv-id') && !arenaYuanbaoStableUserId(row));" else ""}
+              state.beforeUserIds = beforeUsers.map(arenaUserId).filter(Boolean);
+              state.beforeUserTexts = beforeUsers.map(arenaUserText);
+              state.beforeQueueIds = Array.from(document.querySelectorAll('[data-item-id][data-item-status]')).map(row => row.getAttribute('data-item-id'));
+              beforeUsers.forEach(row => row.setAttribute('data-ai-arena-before', requestId));
               window.__aiArenaRequests[requestId] = state;
+              ${if (!ArenaWebMessageIdentity.requiresServerId(service)) "arenaInstallNavigationGuard();" else ""}
               try { sessionStorage.setItem(${ArenaJs.quote(STORAGE_PREFIX)} + requestId, JSON.stringify(state)); } catch (_) {}
               return JSON.stringify(state);
             })();
         """.trimIndent()
     }
 
-    fun bind(service: ArenaService, requestId: String): String {
-        val latestUser = latestUserExpression(service)
+    fun bind(service: ArenaService, requestId: String, requireIdentity: Boolean = false): String {
+        val latestUser = if (ArenaWebMessageIdentity.supported(service)) "(state.expectedPrompt ? arenaFindRequestUser() : ${latestUserExpression(service)})" else latestUserExpression(service)
         return """
             (function() {
-              const requestId = ${ArenaJs.quote(requestId)};
+              ${stateBootstrap(requestId)}
+              ${ArenaWebMessageIdentity.helper(service)}
+              if ($requireIdentity && !state.expectedPrompt) return false;
+              if (!arenaRequestScopeValid()) return 'scope_changed';
               const user = $latestUser;
-              if (!user) return false;
-              user.setAttribute('data-ai-arena-request', requestId);
+              if (!user || ($requireIdentity && ${ArenaWebMessageIdentity.requiresServerId(service)} && !arenaUserId(user))) return false;
+              arenaBindRequestUser(user);
               return true;
             })();
         """.trimIndent()
@@ -57,15 +81,10 @@ internal object ArenaWebCursorScript {
     """.trimIndent()
 
     fun conversationAdvancedExpression(service: ArenaService): String = when (service) {
-        ArenaService.DEEPSEEK -> "($userCountDeepSeek) > Number(state.userBaseline || 0)"
-        ArenaService.DOUBAO -> "($userCountDoubao) > Number(state.userBaseline || 0)"
-        ArenaService.KIMI -> "($userCountKimi) > Number(state.userBaseline || 0)"
-        ArenaService.QWEN -> "($userCountQwen) > Number(state.userBaseline || 0)"
-        ArenaService.YUANBAO -> "($userCountYuanbao) > Number(state.userBaseline || 0)"
-        ArenaService.ZHIPU -> "($userCountZhipu) > Number(state.userBaseline || 0)"
-        ArenaService.CLAUDE -> "($userCountClaude) > Number(state.userBaseline || 0)"
-        ArenaService.CHATGPT -> "($userCountChatGpt) > Number(state.userBaseline || 0)"
-        ArenaService.GEMINI -> "($userCountGemini) > Number(state.userBaseline || 0)"
+        ArenaService.DEEPSEEK -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDeepSeek) > Number(state.userBaseline || 0))"
+        ArenaService.DOUBAO -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountDoubao) > Number(state.userBaseline || 0))"
+        ArenaService.KIMI -> "(state.expectedPrompt ? !!arenaFindRequestUser() : ($userCountKimi) > Number(state.userBaseline || 0))"
+        else -> "(state.expectedPrompt ? !!arenaFindRequestUser() : (${userCountExpression(service)}) > Number(state.userBaseline || 0))"
     }
 
     fun responseSelectors(service: ArenaService): List<String> = when (service) {
@@ -92,11 +111,13 @@ internal object ArenaWebCursorScript {
             "[class*='answer-content']",
         )
         ArenaService.YUANBAO -> listOf(
+            ".agent-chat__conv--ai__speech_show",
             "[class*='hyc-content-md']",
             "[class*='hyc-common-markdown']",
             "[class*='assistant'] [class*='content']",
         )
         ArenaService.ZHIPU -> listOf(
+            ".answer .answer-content",
             "[class*='assistant'] [class*='markdown']",
             "[class*='assistant'] [class*='content']",
             "[data-role='assistant']",
@@ -143,7 +164,7 @@ internal object ArenaWebCursorScript {
     }
 
     private const val userCountDeepSeek = "(function() { const root = document.querySelector('.ds-virtual-list-visible-items'); if (!root) return 0; return Array.from(root.children).filter(function(row) { return !row.querySelector('.ds-markdown') && (row.innerText || row.textContent || '').trim().length > 0; }).length; })()"
-    private const val userCountDoubao = "Array.from(document.querySelectorAll('[class*=v_list_row][data-observe-row]')).filter(function(row) { return !!row.querySelector('[class*=bg-g-send]'); }).length"
+    private val userCountDoubao = "${ArenaWebMessageIdentity.users(ArenaService.DOUBAO)}.length"
     private const val userCountKimi = "document.querySelectorAll('.chat-content-item-user').length"
     private const val userCountQwen = "document.querySelectorAll('.message-card-wrap.question, [class*=user] [class*=content], [class*=human] [class*=text]').length"
     // 2026-09-15: "[class*=user] [class*=content]" also matched a navigation guide popup under .yb-nav__user,

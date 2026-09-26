@@ -11,7 +11,7 @@ import org.junit.Test
 import org.junit.rules.ExternalResource
 import java.io.File
 
-/** Production MainActivity and ArenaApp, with a saved synthetic conversation; never sends a prompt. */
+/** Production MainActivity and ArenaApp; synthetic conversations and no provider submissions. */
 class ArenaSimpleAppInstrumentedTest {
     private var previousActive: String? = null
     @get:Rule(order = 0) val fixture = object : ExternalResource() {
@@ -61,6 +61,30 @@ class ArenaSimpleAppInstrumentedTest {
         compose.onNodeWithText("AI 成员").assertIsDisplayed()
         compose.onNodeWithText("账号与登录").assertDoesNotExist()
         capture("production-settings")
+    }
+
+    @Test fun initialQuestionKeepsSelectedMemberWhileItsPageIsLoading() = verifyInitialMembers(setOf(ArenaService.DOUBAO))
+
+    @Test fun coldStartCanQueueAllSelectedMembersBeforeLoginProbeCompletes() = verifyInitialMembers(ArenaService.defaultMembers.toSet())
+
+    private fun verifyInitialMembers(loading: Set<ArenaService>) {
+        compose.onNodeWithContentDescription("新提问").performClick()
+        compose.runOnUiThread {
+            val field = MainActivity::class.java.getDeclaredField("webViewPool").apply { isAccessible = true }
+            val pool = field.get(compose.activity) as ArenaWebViewPool
+            pool.destroy() // Fail navigation locally; this UI contract must never submit to a website.
+            ArenaService.defaultMembers.forEach { service ->
+                pool.statuses[service] = ServiceStatus(
+                    if (service in loading) ConnectionState.LOADING else ConnectionState.SIGNED_IN,
+                    "isolated loading fixture",
+                )
+            }
+        }
+        compose.onNodeWithTag("simple-composer").performTextInput("Keep all three selected members")
+        compose.onNodeWithTag("simple-send").performClick()
+        compose.onNodeWithTag("answer-tab-DEEPSEEK").assertExists()
+        compose.onNodeWithTag("answer-tab-DOUBAO").assertExists()
+        compose.onNodeWithTag("answer-tab-KIMI").assertExists()
     }
 
     private fun capture(name: String) {

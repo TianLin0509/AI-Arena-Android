@@ -58,6 +58,28 @@ class ArenaGuidanceTest {
     }
 
     @Test
+    fun websiteRejectionAndUncertainDeliveryOutrankGenericReadOrSendFailures() {
+        val cases = listOf(
+            ArenaKimiRejection.busyDetail to "官网当前繁忙",
+            "本轮消息进入了豆包网页待发送队列，尚未确认送达；请打开原网页核对，勿重复发送" to "待发送队列",
+            ArenaKimiRejection.membershipDetail to "需要会员",
+            "本轮消息定位信息已丢失，请打开原网页核对；不会自动重复发送" to "无法确认",
+            "网页发送确认超时，请检查原网页；不会自动重复发送" to "无法确认",
+            "未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送" to "无法确认",
+            "Kimi 登录状态尚未确认，请打开原网页检查" to "还不能确认",
+        )
+        cases.forEach { (detail, expected) ->
+            listOf("", "连续读取失败：", "重发失败：", "重新提取失败：").forEach { prefix ->
+                val advice = ArenaErrorHelp.explain(prefix + detail, "Kimi")
+                assertTrue(advice.what, advice.what.contains(expected))
+                assertEquals(ArenaErrorHelp.Action.OPEN_PAGE, advice.primary)
+                assertFalse(advice.what.contains("可能已经回答"))
+                assertFalse(advice.next.contains("点「重发」"))
+            }
+        }
+    }
+
+    @Test
     fun readFailureSuggestsReextractFirst() {
         val advice = ArenaErrorHelp.explain("连续读取失败：TypeError", "Kimi")
         assertEquals(ArenaErrorHelp.Action.REEXTRACT, advice.primary)

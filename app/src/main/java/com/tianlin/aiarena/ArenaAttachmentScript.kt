@@ -97,7 +97,7 @@ internal object ArenaAttachmentScript {
         const state = window.__arenaAttachment;
     """.trimIndent()
 
-    private val reactHelpers: String get() = """
+    internal val reactHelpers: String get() = """
         // Shared bailout children may retain return pointers to the other parent branch.
         // Index actual current child/sibling edges once per synchronous read, including
         // the ancestor path; choosing only a leaf then following return is insufficient.

@@ -12,5 +12,15 @@ internal object ArenaReactFixture {
           const fiber=fixtureNode(props,parent,element);
           element['__reactFiber${'$'}fixture']=fiber;return fiber;
         };
+        window.fixtureDoubaoMessage=(row,text)=>{
+          const boundary=row.querySelector('[data-send-message-boundary]');
+          const root={tag:3,stateNode:{},child:null};root.stateNode.current=root;
+          const host=fixtureFiber(row,{},root);
+          const message={message_id:boundary.getAttribute('data-message-id'),
+            content_blocks:[{block_type:10000,is_deleted:false,content_obj:{text}}]};
+          const owner=fixtureNode({message},host);
+          fixtureFiber(boundary,{},owner);
+          return message;
+        };
     """.trimIndent()
 }

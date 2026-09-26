@@ -210,13 +210,32 @@ object ArenaMarkdown {
             }
 
             if (ch == '`') {
-                val end = source.indexOf('`', index + 1)
-                if (end > index) {
-                    flush()
-                    spans += ArenaMdSpan(source.substring(index + 1, end), code = true)
-                    index = end + 1
-                    continue
+                var width = 1
+                while (index + width < source.length && source[index + width] == '`') width += 1
+                var cursor = index + width
+                var closing = -1
+                while (cursor < source.length) {
+                    val next = source.indexOf('`', cursor)
+                    if (next < 0) break
+                    var run = 1
+                    while (next + run < source.length && source[next + run] == '`') run += 1
+                    if (run == width) { closing = next; break }
+                    cursor = next + run
                 }
+                if (closing >= 0) {
+                    flush()
+                    var content = source.substring(index + width, closing)
+                        .replace("\r\n", " ").replace('\r', ' ').replace('\n', ' ')
+                    if (content.startsWith(' ') && content.endsWith(' ') && content.isNotBlank()) {
+                        content = content.substring(1, content.length - 1)
+                    }
+                    spans += ArenaMdSpan(content, code = true)
+                    index = closing + width
+                } else {
+                    buffer.append("`".repeat(width))
+                    index += width
+                }
+                continue
             }
 
             if (ch == '[') {
