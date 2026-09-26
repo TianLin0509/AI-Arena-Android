@@ -21,6 +21,276 @@ class ArenaOtherProvidersInstrumentedTest {
         ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI)
     private val request = "other-providers-current"
 
+    private val qwenFailure = "<div data-chat-answers-wrap='turn' style='width:300px'><div class='retry-container-mobile' style='min-height:30px'>消息生成失败，请重试</div></div>"
+
+    @Test fun yuanbaoPreexistingTemporaryMessageCannotBecomeThisRequestsReceipt() {
+        listOf(false, true).forEach { remount -> page { view ->
+            val service = ArenaService.YUANBAO
+            html(view, user(service, "pending-before-send").replace("data-message-id", "data-conv-id"))
+            prepare(view, service)
+            submit(view, service)
+            if (remount) html(view, user(service, "existing_3").replace("data-message-id", "data-conv-id") + answer(service, "OLD"))
+            else js(view, "document.querySelector('[data-conv-id]').setAttribute('data-conv-id','existing_3');true")
+            assertEquals("false", bind(view, service))
+            assertFalse(response(view, service).getBoolean("found"))
+        } }
+    }
+
+    @Test fun yuanbaoPoolRejectsPendingBaselineBeforeWritingOrSending() = withPool(ArenaService.YUANBAO, wrongReceipt = false) { pool, view ->
+        js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(user(ArenaService.YUANBAO, "pending").replace("data-message-id", "data-conv-id"))});true")
+        val done = CountDownLatch(1)
+        val outcome = AtomicReference<SendOutcome>()
+        instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) { outcome.set(it); done.countDown() } }
+        assertTrue(done.await(30, TimeUnit.SECONDS))
+        assertFalse(outcome.get().toString(), outcome.get().success)
+        assertTrue(outcome.get().detail.contains("本轮未发送"))
+        assertEquals("0", js(view, "window.sendCount"))
+        assertEquals("", js(view, "document.querySelector('textarea').value"))
+    }
+
+    @Test fun yuanbaoTemporaryIdWaitsForFormalIdOnSameNode() = page { view ->
+        val service = ArenaService.YUANBAO
+        prepare(view, service)
+        html(view, user(service, "65037087cb69d").replace("data-message-id", "data-conv-id") + answer(service, "CURRENT"))
+        submit(view, service)
+        assertEquals("false", bind(view, service))
+        assertFalse(response(view, service).getBoolean("found"))
+        js(view, "document.querySelector('[data-conv-id]').setAttribute('data-conv-id','existing_5');true")
+        assertEquals("true", bind(view, service))
+        assertEquals("existing_5", js(view, "window.__aiArenaRequests['$request'].boundUserId"))
+        assertEquals("CURRENT", response(view, service).getString("text"))
+    }
+
+    @Test fun yuanbaoTemporaryNodeCanRemountWithFormalIdBeforeReceipt() = page { view ->
+        val service = ArenaService.YUANBAO
+        prepare(view, service)
+        html(view, user(service, "temporary").replace("data-message-id", "data-conv-id"))
+        submit(view, service)
+        assertEquals("false", bind(view, service))
+        html(view, user(service, "existing_3").replace("data-message-id", "data-conv-id") + answer(service, "CURRENT"))
+        assertEquals("true", bind(view, service))
+        assertEquals("CURRENT", response(view, service).getString("text"))
+    }
+
+    @Test fun yuanbaoMalformedOrForeignConversationIdCannotUseFallbackIdentity() {
+        listOf("", "other_1", "existing_0", "existing_01", "existing_1_suffix", "existing_1.5").forEach { id -> page { view ->
+            val service = ArenaService.YUANBAO
+            prepare(view, service)
+            html(view, user(service, "fallback").replace("data-message-id=", "data-conv-id='$id' data-message-id=") + answer(service, "WRONG"))
+            submit(view, service)
+            assertEquals(id, "false", bind(view, service))
+            assertFalse(id, response(view, service).getBoolean("found"))
+        } }
+    }
+
+    @Test fun yuanbaoFormalIdentityCannotDriftToLaterSameTextMessage() = page { view ->
+        val service = ArenaService.YUANBAO
+        prepare(view, service)
+        html(view, user(service, "existing_3").replace("data-message-id", "data-conv-id") + answer(service, "FIRST"))
+        submit(view, service)
+        assertEquals("true", bind(view, service))
+        js(view, "document.querySelector('[data-conv-id]').setAttribute('data-conv-id','existing_5');true")
+        assertFalse(response(view, service).getBoolean("found"))
+        html(view, user(service, "existing_3").replace("data-message-id", "data-conv-id") + answer(service, "RESTORED"))
+        assertEquals("RESTORED", response(view, service).getString("text"))
+    }
+
+    private fun yuanbaoHome(view: WebView) {
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa');window.fetch=function(){window.fetchCount=(window.fetchCount||0)+1;return window.fetchResult=Promise.resolve('untouched');};true")
+        prepare(view, ArenaService.YUANBAO)
+        submit(view, ArenaService.YUANBAO)
+    }
+
+    private fun yuanbaoPost(view: WebView, cid: String = "new-cid", fields: String = "") = js(view, """
+        (()=>{const result=fetch('/api/chat/$cid',{method:'POST',body:JSON.stringify({
+          conversationId:'$cid',agentId:'naQivTmsDa',prompt:'current question'$fields})});return result===window.fetchResult;})()
+    """.trimIndent())
+
+    @Test fun yuanbaoMatchingPostAllowsRouteBeforeBubbleButDoesNotAcknowledgeDelivery() = page { view ->
+        yuanbaoHome(view)
+        assertEquals("true", yuanbaoPost(view))
+        assertEquals("1", js(view, "window.fetchCount"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        assertEquals("false", bind(view, ArenaService.YUANBAO))
+        assertFalse(response(view, ArenaService.YUANBAO).getBoolean("found"))
+        html(view, user(ArenaService.YUANBAO, "new-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "CURRENT"))
+        assertEquals("true", bind(view, ArenaService.YUANBAO))
+        assertEquals("CURRENT", response(view, ArenaService.YUANBAO).getString("text"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/other-cid');true")
+        assertTrue(response(view, ArenaService.YUANBAO).has("error"))
+    }
+
+    @Test fun yuanbaoSameTextOldChatWithoutMatchingPostStillFails() = page { view ->
+        yuanbaoHome(view)
+        html(view, user(ArenaService.YUANBAO, "old-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "OLD"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/old-cid');true")
+        assertEquals("scope_changed", bind(view, ArenaService.YUANBAO))
+    }
+
+    @Test fun yuanbaoConflictingDomCannotOverrideNetworkTarget() {
+        listOf("old-cid", "new-cid").forEach { target -> page { view ->
+            yuanbaoHome(view)
+            yuanbaoPost(view)
+            html(view, user(ArenaService.YUANBAO, "old-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "OLD"))
+            js(view, "history.replaceState(null,'','/chat/naQivTmsDa/$target');true")
+            assertEquals(target, if (target == "old-cid") "scope_changed" else "false", bind(view, ArenaService.YUANBAO))
+            assertFalse(response(view, ArenaService.YUANBAO).getBoolean("found"))
+            if (target == "new-cid") {
+                html(view, user(ArenaService.YUANBAO, "new-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "CURRENT"))
+                assertEquals("true", bind(view, ArenaService.YUANBAO))
+                assertEquals("CURRENT", response(view, ArenaService.YUANBAO).getString("text"))
+            }
+        } }
+    }
+
+    @Test fun yuanbaoMatchingPostPinsCorrectBubbleBeforeRoute() = page { view ->
+        yuanbaoHome(view)
+        yuanbaoPost(view)
+        html(view, user(ArenaService.YUANBAO, "new-cid_1").replace("data-message-id", "data-conv-id"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        assertEquals("true", bind(view, ArenaService.YUANBAO))
+        assertEquals("new-cid", js(view, "window.__aiArenaRequests[${JSONObject.quote(request)}].yuanbaoRouteCid"))
+    }
+
+    @Test fun yuanbaoHomepageBubbleCannotConfirmReceiptOrSupplyOldAnswerBeforeRoute() = page { view ->
+        yuanbaoHome(view)
+        yuanbaoPost(view)
+        html(view, user(ArenaService.YUANBAO, "old-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "OLD"))
+        assertEquals("false", bind(view, ArenaService.YUANBAO))
+        assertFalse(response(view, ArenaService.YUANBAO).getBoolean("found"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        html(view, user(ArenaService.YUANBAO, "new-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "CURRENT"))
+        assertEquals("true", bind(view, ArenaService.YUANBAO))
+        assertEquals("CURRENT", response(view, ArenaService.YUANBAO).getString("text"))
+    }
+
+    @Test fun yuanbaoHomepageAliasesWaitForNetworkAndRouteBeforeReceipt() {
+        (listOf("/", "/chat", "/chat/", "/chat/naQivTmsDa", "/chat/naQivTmsDa/") +
+            java.net.URI(ArenaService.YUANBAO.url).path).distinct().forEach { path -> page { view ->
+            js(view, "history.replaceState(null,'',${JSONObject.quote(path)});window.fetch=()=>Promise.resolve();true")
+            js(view, ArenaWebCursorScript.prepare(ArenaService.YUANBAO, request, "current question"))
+            submit(view, ArenaService.YUANBAO)
+            html(view, user(ArenaService.YUANBAO, "new-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "CURRENT"))
+            assertEquals(path, "false", bind(view, ArenaService.YUANBAO))
+            yuanbaoPost(view)
+            assertEquals(path, "false", bind(view, ArenaService.YUANBAO))
+            js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+            assertEquals(path, "true", bind(view, ArenaService.YUANBAO))
+            assertEquals("CURRENT", response(view, ArenaService.YUANBAO).getString("text"))
+        } }
+    }
+
+    @Test fun yuanbaoMismatchingPostCannotAuthorizeFirstRoute() {
+        listOf(",conversationId:'other-cid'", ",agentId:'other-agent'", ",prompt:'current  question'").forEach { invalid -> page { view ->
+            yuanbaoHome(view)
+            yuanbaoPost(view, fields = invalid)
+            js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+            assertEquals(invalid, "scope_changed", bind(view, ArenaService.YUANBAO))
+        } }
+    }
+
+    @Test fun yuanbaoWrongBubbleIdCannotUseMatchingPostAsReceipt() = page { view ->
+        yuanbaoHome(view)
+        yuanbaoPost(view)
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        html(view, user(ArenaService.YUANBAO, "other-cid_1").replace("data-message-id", "data-conv-id") + answer(ArenaService.YUANBAO, "WRONG"))
+        assertEquals("false", bind(view, ArenaService.YUANBAO))
+        assertFalse(response(view, ArenaService.YUANBAO).getBoolean("found"))
+    }
+
+    @Test fun yuanbaoAmbiguousNetworkTargetsAndCancelledRequestsCannotAuthorizeNavigation() {
+        listOf(false, true).forEach { cancel -> page { view ->
+            yuanbaoHome(view)
+            yuanbaoPost(view)
+            if (cancel) js(view, "window.__aiArenaCancelledRequests={${JSONObject.quote(request)}:true};true")
+            else yuanbaoPost(view, "another-cid")
+            js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+            assertEquals("scope_changed", bind(view, ArenaService.YUANBAO))
+        } }
+    }
+
+    @Test fun yuanbaoPreviousOwnerCannotLendEvidenceToRepeatedQuestion() = page { view ->
+        yuanbaoHome(view)
+        js(view, "window.oldObserve=window.__aiArenaYuanbaoRouteObserver.observe;true")
+        prepare(view, ArenaService.YUANBAO)
+        submit(view, ArenaService.YUANBAO)
+        js(view, "window.oldObserve('POST','/api/chat/new-cid',JSON.stringify({conversationId:'new-cid',agentId:'naQivTmsDa',prompt:'current question'}));history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        assertEquals("scope_changed", bind(view, ArenaService.YUANBAO))
+    }
+
+    @Test fun yuanbaoXhrObserverPreservesArgumentsReturnValueAndException() = page { view ->
+        js(view, """
+            window.XMLHttpRequest=function(){};
+            XMLHttpRequest.prototype.open=function(){window.openArgs=Array.from(arguments);return 72;};
+            XMLHttpRequest.prototype.send=function(body){if(body==='throw')throw new Error('original-error');window.sentBody=body;return 81;};true
+        """.trimIndent())
+        yuanbaoHome(view)
+        assertEquals("72", js(view, "window.xhr=new XMLHttpRequest();xhr.open('POST','/api/chat/new-cid',true)"))
+        val body = "{\"conversationId\":\"new-cid\",\"agentId\":\"naQivTmsDa\",\"prompt\":\"current question\"}"
+        assertEquals("81", js(view, "xhr.send(${JSONObject.quote(body)})"))
+        assertEquals(body, js(view, "window.sentBody"))
+        assertEquals("[\"POST\",\"/api/chat/new-cid\",true]", js(view, "JSON.stringify(window.openArgs)"))
+        assertEquals("original-error", js(view, "(()=>{try{xhr.send('throw');return 'missed';}catch(e){return e.message;}})()"))
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        assertEquals("false", bind(view, ArenaService.YUANBAO))
+        assertFalse(response(view, ArenaService.YUANBAO).has("error"))
+    }
+
+    @Test fun yuanbaoForeignOriginGetOrRequestBodyCannotAuthorizeNavigation() {
+        listOf(
+            "fetch('https://other.test/api/chat/new-cid',{method:'POST',body})",
+            "fetch('/api/chat/new-cid',{method:'GET',body})",
+            "fetch(new Request('https://provider-fixture.test/api/chat/new-cid',{method:'POST',body}))"
+        ).forEach { call -> page { view ->
+            yuanbaoHome(view)
+            js(view, "(()=>{const body=JSON.stringify({conversationId:'new-cid',agentId:'naQivTmsDa',prompt:'current question'});$call;return true;})()")
+            js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+            assertEquals(call, "scope_changed", bind(view, ArenaService.YUANBAO))
+        } }
+    }
+
+    @Test fun yuanbaoFollowupCannotAcquireFreshRoutePermission() = page { view ->
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/existing');window.fetch=()=>Promise.resolve();true")
+        prepare(view, ArenaService.YUANBAO)
+        submit(view, ArenaService.YUANBAO)
+        yuanbaoPost(view)
+        js(view, "history.replaceState(null,'','/chat/naQivTmsDa/new-cid');true")
+        assertEquals("scope_changed", bind(view, ArenaService.YUANBAO))
+    }
+
+    @Test fun qwenCurrentGenerationFailureStopsWaiting() = page { view ->
+        prepare(view, ArenaService.QWEN)
+        html(view, user(ArenaService.QWEN, "ours") + qwenFailure)
+        assertEquals("true", js(view, "(()=>{const r=document.querySelector('[class*=retry-container]').getBoundingClientRect();return r.width>2&&r.height>2;})()"))
+        submit(view, ArenaService.QWEN)
+        assertEquals("true", bind(view, ArenaService.QWEN))
+        assertTrue(response(view, ArenaService.QWEN).getString("error").contains("消息生成失败"))
+    }
+
+    @Test fun qwenMarkdownQuotationOfFailureIsAnswerText() = page { view ->
+        prepare(view, ArenaService.QWEN)
+        html(view, user(ArenaService.QWEN, "ours") + answer(ArenaService.QWEN, qwenFailure))
+        submit(view, ArenaService.QWEN)
+        assertEquals("true", bind(view, ArenaService.QWEN))
+        val result = response(view, ArenaService.QWEN)
+        assertFalse(result.toString(), result.has("error"))
+        assertTrue(result.getString("text").contains("消息生成失败"))
+    }
+
+    @Test fun qwenOldLaterHiddenAndQuotedFailuresCannotPoisonCurrentAnswer() = page { view ->
+        prepare(view, ArenaService.QWEN)
+        html(view, qwenFailure + user(ArenaService.QWEN, "ours") +
+            "<div style='display:none'>$qwenFailure</div>" +
+            answer(ArenaService.QWEN, "NORMAL ANSWER") +
+            "<pre>$qwenFailure</pre>" +
+            user(ArenaService.QWEN, "next", "another question") + qwenFailure)
+        submit(view, ArenaService.QWEN)
+        assertEquals("true", bind(view, ArenaService.QWEN))
+        val result = response(view, ArenaService.QWEN)
+        assertFalse(result.toString(), result.has("error"))
+        assertEquals("NORMAL ANSWER", result.getString("text"))
+    }
+
     @Test fun productionPoolWaitsForMatchingReceiptAndClicksOnlyOnce() {
         services.forEach { service -> withPool(service, wrongReceipt = false) { pool, view ->
             val done = CountDownLatch(1)
@@ -38,11 +308,23 @@ class ArenaOtherProvidersInstrumentedTest {
             val done = CountDownLatch(1)
             val outcome = AtomicReference<SendOutcome>()
             instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) { outcome.set(it); done.countDown() } }
-            assertTrue(done.await(30, TimeUnit.SECONDS))
+            assertTrue(done.await(60, TimeUnit.SECONDS))
             assertFalse(outcome.get().toString(), outcome.get().success)
             assertEquals("1", js(view, "window.sendCount"))
         }
     }
+
+    @Test fun yuanbaoPoolWaitsBeyondShortConfirmationWindowForFormalId() =
+        withPool(ArenaService.YUANBAO, wrongReceipt = false, formalIdDelayMillis = 13000) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(35, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", js(view, "window.sendCount"))
+            assertEquals("existing_1", js(view, "window.__aiArenaRequests['$request'].boundUserId"))
+            assertEquals("POOL ANSWER", response(view, ArenaService.YUANBAO).getString("text"))
+        }
 
     @Test fun unrelatedNewUserAndEmptyEditorCannotAcknowledgeOurQuestion() = each { view, service ->
         prepare(view, service)
@@ -188,10 +470,133 @@ class ArenaOtherProvidersInstrumentedTest {
         js(view, "window.realNow=Date.now;window.testNow=realNow();Date.now=()=>testNow;true")
         zhipuPost(view)
         Thread.sleep(150)
-        js(view, "window.testNow+=5000;document.querySelector('button').disabled=false;true")
+        js(view, "window.testNow+=50000;document.querySelector('button').disabled=false;true")
         Thread.sleep(700)
         assertEquals("0", js(view, "window.sendCount"))
         assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+    }
+
+    @Test fun zhipuSlowReadinessUsesOriginalTotalDeadlineWithoutAnotherClick() = page { view ->
+        zhipuSetup(view)
+        zhipuClock(view)
+        zhipuPost(view)
+        Thread.sleep(150)
+        js(view, "window.testNow+=6000;true")
+        Thread.sleep(800)
+        assertEquals("1", js(view, "window.sendCount"))
+        assertEquals("dispatched", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+    }
+
+    @Test fun zhipuHiddenPageWaitsThenSendsOnceAfterForegroundReturn() = page { view ->
+        zhipuSetup(view)
+        zhipuClock(view, hidden = true)
+        zhipuPost(view)
+        Thread.sleep(150)
+        js(view, "window.testNow+=6000;true")
+        Thread.sleep(800)
+        assertEquals("0", js(view, "window.sendCount"))
+        assertEquals("waiting", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+        js(view, "window.fakeVisibility='visible';true")
+        Thread.sleep(500)
+        assertEquals("1", js(view, "window.sendCount"))
+    }
+
+    @Test fun zhipuCancelledHiddenTaskCannotSendAfterForegroundReturn() = page { view ->
+        zhipuSetup(view)
+        zhipuClock(view, hidden = true)
+        zhipuPost(view)
+        Thread.sleep(150)
+        js(view, "window.__aiArenaCancelledRequests={'$request':true};window.testNow+=6000;window.fakeVisibility='visible';true")
+        Thread.sleep(800)
+        assertEquals("0", js(view, "window.sendCount"))
+    }
+
+    @Test fun zhipuHiddenTimeNeverExtendsNativeTotalDeadline() = page { view ->
+        zhipuSetup(view)
+        zhipuClock(view, hidden = true)
+        zhipuPost(view)
+        Thread.sleep(150)
+        js(view, "window.testNow+=50000;window.fakeVisibility='visible';document.querySelector('button').disabled=false;true")
+        Thread.sleep(500)
+        assertEquals("0", js(view, "window.sendCount"))
+        assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+    }
+
+    @Test fun zhipuAlreadyExpiredDispatchDoesNotEvenWriteTheEditor() = page { view ->
+        zhipuSetup(view)
+        js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question',deadlineMillis:Date.now()-1},location.origin);true")
+        Thread.sleep(700)
+        assertEquals("0", js(view, "window.sendCount"))
+        assertEquals("", js(view, "document.querySelector('textarea').value"))
+        assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+    }
+
+    private fun zhipuClock(view: WebView, hidden: Boolean = false) {
+        js(view, "window.testNow=Date.now();Date.now=()=>testNow;window.fakeVisibility='${if (hidden) "hidden" else "visible"}';Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});true")
+    }
+
+    @Test fun zhipuPoolWaitsOverTenSecondsInBackgroundAndDispatchesOnce() =
+        withPool(ArenaService.ZHIPU, wrongReceipt = false, initiallyHidden = true) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it); done.countDown() } }
+            waitForZhipuInput(view)
+            Thread.sleep(13000)
+            assertNull(outcome.get())
+            assertEquals("0", js(view, "window.sendCount"))
+            js(view, "window.fakeVisibility='visible';true")
+            assertTrue(done.await(20, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", js(view, "window.inputCount"))
+            assertEquals("1", js(view, "window.sendCount"))
+        }
+
+    @Test fun zhipuPoolTotalTimeoutPreventsLateForegroundDispatch() =
+        withPool(ArenaService.ZHIPU, wrongReceipt = false, initiallyHidden = true) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            val started = android.os.SystemClock.elapsedRealtime()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it); done.countDown() } }
+            waitForZhipuInput(view)
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertFalse(outcome.get().toString(), outcome.get().success)
+            assertTrue(android.os.SystemClock.elapsedRealtime() - started >= 40000)
+            js(view, "window.fakeVisibility='visible';true")
+            Thread.sleep(700)
+            assertEquals("1", js(view, "window.inputCount"))
+            assertEquals("0", js(view, "window.sendCount"))
+        }
+
+    @Test fun zhipuPoolCancelledBackgroundTaskCannotDispatchOnReturn() =
+        withPool(ArenaService.ZHIPU, wrongReceipt = false, initiallyHidden = true) { pool, view ->
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it) } }
+            waitForZhipuInput(view)
+            instrumentation.runOnMainSync { pool.cancelAutomation(ArenaService.ZHIPU) }
+            js(view, "window.fakeVisibility='visible';true")
+            Thread.sleep(900)
+            assertNull(outcome.get())
+            assertEquals("1", js(view, "window.inputCount"))
+            assertEquals("0", js(view, "window.sendCount"))
+        }
+
+    @Test fun zhipuPoolChangedPageCannotDispatchOnForegroundReturn() =
+        withPool(ArenaService.ZHIPU, wrongReceipt = false, initiallyHidden = true) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it); done.countDown() } }
+            waitForZhipuInput(view)
+            js(view, "history.replaceState(null,'','/other-chat');window.fakeVisibility='visible';true")
+            assertTrue(done.await(10, TimeUnit.SECONDS))
+            assertFalse(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", js(view, "window.inputCount"))
+            assertEquals("0", js(view, "window.sendCount"))
+        }
+
+    private fun waitForZhipuInput(view: WebView) {
+        val deadline = System.currentTimeMillis() + 10000
+        while (js(view, "window.inputCount") == "0" && System.currentTimeMillis() < deadline) Thread.sleep(100)
+        assertEquals("1", js(view, "window.inputCount"))
     }
 
     private fun zhipuSetup(view: WebView) {
@@ -205,7 +610,7 @@ class ArenaOtherProvidersInstrumentedTest {
             button.addEventListener('mousedown',()=>{window.sendCount++;window.sentText=editor.value;});true;
         """.trimIndent())
     }
-    private fun zhipuPost(view: WebView) { js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question'},location.origin);true") }
+    private fun zhipuPost(view: WebView) { js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question',deadlineMillis:Date.now()+45000},location.origin);true") }
 
     @Test fun qwenUnboundNetworkCaptureAndSidebarCannotMasqueradeAsAnswer() = page { view ->
         val service = ArenaService.QWEN
@@ -255,7 +660,7 @@ class ArenaOtherProvidersInstrumentedTest {
         val service = ArenaService.YUANBAO
         prepare(view, service)
         html(view, """
-            <div class='agent-chat__list__item--human' data-conv-id='thread_3'>
+            <div class='agent-chat__list__item--human' data-conv-id='existing_3'>
               <div class='agent-chat__bubble--human'><div class='hyc-content-text'>current question</div></div>
               <div class='expand-control'>Expand</div>
             </div>
@@ -312,7 +717,12 @@ class ArenaOtherProvidersInstrumentedTest {
         }
     }
 
-    private fun prepare(view: WebView, service: ArenaService) { js(view, ArenaWebCursorScript.prepare(service, request, "current question")) }
+    private fun prepare(view: WebView, service: ArenaService) {
+        // Generic receipt tests model an existing chat. First-chat migration has
+        // dedicated network + homepage fixtures above.
+        if (service == ArenaService.YUANBAO) js(view, "if(location.pathname==='/')history.replaceState(null,'','/chat/naQivTmsDa/existing');true")
+        js(view, ArenaWebCursorScript.prepare(service, request, "current question"))
+    }
     private fun submit(view: WebView, service: ArenaService) { js(view, "(()=>{${ArenaWebCursorScript.stateBootstrap(request)}${ArenaWebMessageIdentity.helper(service)}arenaRecordSubmission();return true;})()") }
     private fun bind(view: WebView, service: ArenaService) = js(view, ArenaWebCursorScript.bind(service, request, requireIdentity = true))
     private fun response(view: WebView, service: ArenaService) = JSONObject(js(view, ArenaWebResponseScript.build(service, request, requireIdentity = true)))
@@ -320,11 +730,12 @@ class ArenaOtherProvidersInstrumentedTest {
     private fun each(block: (WebView, ArenaService) -> Unit) { services.forEach { service -> page { block(it, service) } } }
 
     @Suppress("UNCHECKED_CAST")
-    private fun withPool(service: ArenaService, wrongReceipt: Boolean, block: (ArenaWebViewPool, WebView) -> Unit) {
+    private fun withPool(service: ArenaService, wrongReceipt: Boolean, formalIdDelayMillis: Int? = null, initiallyHidden: Boolean = false, block: (ArenaWebViewPool, WebView) -> Unit) {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             lateinit var pool: ArenaWebViewPool
             lateinit var view: WebView
-            val receipt = user(service, "pool-user", if (wrongReceipt) "another question" else "current question") + answer(service, "POOL ANSWER")
+            val userReceipt = user(service, "pool-user", if (wrongReceipt) "another question" else "current question")
+            val receipt = (if (formalIdDelayMillis != null) userReceipt.replace("data-message-id='pool-user'", "data-conv-id='temporary'") else userReceipt) + answer(service, "POOL ANSWER")
             scenario.onActivity { activity ->
                 val field = MainActivity::class.java.getDeclaredField("webViewPool").apply { isAccessible = true }
                 (field.get(activity) as ArenaWebViewPool).destroy()
@@ -338,20 +749,23 @@ class ArenaOtherProvidersInstrumentedTest {
                 val views = ArenaWebViewPool::class.java.getDeclaredField("webViews").apply { isAccessible = true }.get(pool) as Map<ArenaService, WebView>
                 view = views.getValue(service)
                 view.stopLoading()
-                view.loadDataWithBaseURL(service.url, """
+                val fixtureUrl = if (service == ArenaService.YUANBAO) "https://yuanbao.tencent.com/chat/naQivTmsDa/existing" else service.url
+                view.loadDataWithBaseURL(fixtureUrl, """
                     <html><body><textarea id='prompt-textarea'></textarea>
                     <button id='yuanbao-send-btn' class='button-right-inner send-button' aria-label='Send message'>Send</button>
                     <script>
-                    window.sendCount=0;
+                    window.sendCount=0;window.inputCount=0;
+                    ${if (initiallyHidden) "window.fakeVisibility='hidden';Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});" else ""}
                     const input=document.querySelector('textarea');
-                    input.addEventListener('input',function(){});
+                    input.addEventListener('input',function(){window.inputCount++;});
                     document.querySelector('button').addEventListener('${if (service == ArenaService.ZHIPU) "mousedown" else "click"}',function(){
                       window.sendCount++;input.value='';
                       setTimeout(function(){document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(receipt)});},1800);
+                      ${if (formalIdDelayMillis != null) "setTimeout(function(){document.querySelector('[data-conv-id=temporary]')?.setAttribute('data-conv-id','existing_1');},$formalIdDelayMillis);" else ""}
                     });
                     window.fixtureReady=true;
                     </script></body></html>
-                """.trimIndent(), "text/html", "UTF-8", service.url)
+                """.trimIndent(), "text/html", "UTF-8", fixtureUrl)
                 pool.show(null)
             }
             try {

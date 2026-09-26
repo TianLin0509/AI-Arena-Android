@@ -287,6 +287,14 @@ internal object ArenaWebResponseScript {
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
                 if (!text) text = collectText(scoped, ['.qk-md-paragraph'], picked.selector, scoped.anchored);
                 const qwLast = scoped.nodes.length ? scoped.nodes[scoped.nodes.length - 1] : null;
+                // The mobile site can accept the question but render only a retry card.
+                // Match provider UI within this turn, never quoted answer text or old errors.
+                const qwFailures = Array.from(document.querySelectorAll('[data-chat-answers-wrap] [class*=retry-container]'))
+                  .filter(node => !node.closest('[class*=qk-markdown], pre, code') && isVisible(node) &&
+                    /^消息生成失败[，,]请重试$/.test(clean(node.textContent)));
+                if (tagged && scopeAfterTag(qwFailures, tagged, 0).nodes.length) {
+                  throw new Error('千问官网提示消息生成失败，本轮已停止等待；请打开原网页核对，不会自动重复发送');
+                }
                 const qwRow = qwLast ? (qwLast.closest('[class*=message-card-wrap], [class*=answer], [class*=assistant]') || qwLast.parentElement) : null;
                 thinkingUsed = thinkingIn(qwRow, '[class*=think], [class*=thought], [class*=reason]');
                 // SSE 已经建了 record 但还没解析出内容时，networkRecord 存在而 answer 为空。

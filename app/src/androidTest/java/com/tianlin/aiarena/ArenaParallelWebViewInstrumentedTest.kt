@@ -361,6 +361,86 @@ class ArenaParallelWebViewInstrumentedTest {
 
     @Test fun cancelledSlowKimiPasteCannotSendLaterOrBlockAnotherProvider() = verifyKimiMultilinePaste(15_000, cancel = true)
 
+    @Test fun missingKimiSendCallbackReleasesFocusAndLateScriptCannotSend() {
+        withPool(emptyMap()) { pool, views, _ ->
+            lateinit var heldView: HeldSendWebView
+            val loaded = CountDownLatch(1)
+            onMain {
+                val original = views.getValue(ArenaService.KIMI)
+                heldView = HeldSendWebView(original.context)
+                heldView.settings.javaScriptEnabled = true
+                heldView.webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String?) { loaded.countDown() }
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest) =
+                        android.webkit.WebResourceResponse("text/html", "UTF-8", fixture(ArenaService.KIMI, 0L, false).byteInputStream())
+                }
+                @Suppress("UNCHECKED_CAST")
+                val map = field(pool, "webViews") as MutableMap<ArenaService, WebView>
+                map[ArenaService.KIMI] = heldView
+                pool.container.removeView(original)
+                original.stopLoading(); original.destroy()
+                pool.container.addView(heldView, FrameLayout.LayoutParams(-1, -1))
+                heldView.loadUrl(ArenaService.KIMI.url)
+            }
+            assertTrue(loaded.await(10, TimeUnit.SECONDS))
+            val other = views.getValue(ArenaService.DEEPSEEK)
+            evaluate(other, """
+                window.send=()=>{
+                  sendCount++;const input=document.querySelector('textarea');sentText=input.value;input.value='';
+                  window.history.pushState({},'', '/a/chat/s/fixture');
+                  const history=document.createElement('div');history.className='ds-virtual-list-visible-items';
+                  const user=document.createElement('div');user.setAttribute('data-virtual-list-item-key','-2');
+                  user.innerHTML='<div class="ds-message"><div class="ds-collapsible-text"></div></div>';
+                  user.querySelector('.ds-collapsible-text').textContent=sentText;
+                  history.appendChild(user);document.body.appendChild(history);
+                };true;
+            """.trimIndent())
+            val slowCalls = AtomicInteger()
+            val slowOutcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(ArenaService.KIMI, "held input", "lease-held") {
+                    slowOutcome.set(it); slowCalls.incrementAndGet()
+                }
+            }
+            assertTrue("Slow provider must actually own the input lease", heldView.entered.await(10, TimeUnit.SECONDS))
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain {
+                pool.sendPrompt(ArenaService.DEEPSEEK, "independent question", "lease-other") {
+                    outcome.set(it); done.countDown()
+                }
+            }
+            assertTrue("One unresponsive input must not consume another provider's whole 45-second budget", done.await(32, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals(1, slowCalls.get())
+            assertFalse(slowOutcome.get().success)
+            assertTrue(slowOutcome.get().detail.contains("输入操作响应超时"))
+            assertEquals("1", evaluate(other, "sendCount"))
+            onMain { heldView.deliverLate() }
+            val settled = CountDownLatch(1)
+            onMain { heldView.postDelayed({ settled.countDown() }, 2_500L) }
+            assertTrue(settled.await(6, TimeUnit.SECONDS))
+            assertEquals("0", evaluate(heldView, "sendCount"))
+            assertEquals("", evaluate(heldView, "document.querySelector('textarea').value"))
+            assertEquals(1, slowCalls.get())
+            assertEquals("1", evaluate(other, "sendCount"))
+        }
+    }
+
+    private class HeldSendWebView(context: android.content.Context) : WebView(context) {
+        val entered = CountDownLatch(1)
+        private var heldScript: String? = null
+        private var heldCallback: android.webkit.ValueCallback<String>? = null
+        override fun evaluateJavascript(script: String, callback: android.webkit.ValueCallback<String>?) {
+            if (script.contains("const text = \"held input\";") && script.contains("lease-held")) {
+                heldScript = script; heldCallback = callback; entered.countDown()
+            } else super.evaluateJavascript(script, callback)
+        }
+        fun deliverLate() {
+            super.evaluateJavascript(checkNotNull(heldScript), heldCallback)
+        }
+    }
+
     @Test fun kimiSingleLineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true, singleLine = true)
 
     @Test fun kimiMultilineReplacesExistingLexicalDraft() = verifyKimiMultilinePaste(0, existingDraft = true)

@@ -9,7 +9,11 @@ plugins {
 
 // release 签名凭据放在仓库外、且 gitignore 的 keystore.properties 里。
 // 文件不存在时（例如 CI）release 构建照常进行，只是产出未签名包。
-val keystorePropertiesFile = rootProject.file("keystore.properties")
+val externalKeystoreProperties = providers.environmentVariable("ARENA_KEYSTORE_PROPERTIES").orNull
+val keystorePropertiesFile = rootProject.file(externalKeystoreProperties ?: "keystore.properties")
+check(externalKeystoreProperties == null || keystorePropertiesFile.isFile) {
+    "ARENA_KEYSTORE_PROPERTIES must point to an existing signing configuration"
+}
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
         keystorePropertiesFile.inputStream().use(::load)
@@ -18,6 +22,9 @@ val keystoreProperties = Properties().apply {
 val hasReleaseKeystore = keystoreProperties.getProperty("storeFile")
     ?.let(::File)
     ?.exists() == true
+check(externalKeystoreProperties == null || hasReleaseKeystore) {
+    "The external signing configuration must reference an existing keystore"
+}
 
 android {
     namespace = "com.tianlin.aiarena"
@@ -27,8 +34,8 @@ android {
         applicationId = "com.tianlin.aiarena"
         minSdk = 26
         targetSdk = 36
-        versionCode = 26
-        versionName = "0.15.2"
+        versionCode = 27
+        versionName = "0.15.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

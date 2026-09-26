@@ -59,6 +59,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val explicitLoginProbeCounts = mutableMapOf<ArenaService, Int>()
     private var uiSelectedService: ArenaService? = null
     private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit, val strictReceipt: Boolean = false) {
+        var deadlineWallMillis: Long = 0L
         var watchdog: Runnable? = null
         var parked = false
         var sending = false
@@ -555,8 +556,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     finishSend(service, SendOutcome(false, requestId, "${service.displayName} 登录状态尚未确认，请打开原网页检查"), callback)
                     return
                 }
-                webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, if (token?.strictReceipt == true) fullPrompt else "", legacyAttachment = attachmentFiles.isNotEmpty())) {
+                webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, if (token?.strictReceipt == true) fullPrompt else "", legacyAttachment = attachmentFiles.isNotEmpty())) { raw ->
                     if (!isCurrent(service, token)) return@evaluateJavascript
+                    if (service == ArenaService.YUANBAO && token?.strictReceipt == true &&
+                        runCatching { JSONObject(decodeJsValue(raw)).optBoolean("yuanbaoUnstableBaseline") }.getOrDefault(false)) {
+                        finishSend(service, SendOutcome(false, requestId, "元宝还有未确认的历史消息，请在原网页核对后再试；本轮未发送"), callback)
+                        return@evaluateJavascript
+                    }
                     if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
                     else ArenaAttachmentTransport(handler, fileBroker) { action -> withFocus(service, requestId, action) }
                         .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
@@ -677,6 +683,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (service in automations) return onBusy()
         val webView = ensureWebView(service) ?: return onTimeout()
         val token = Automation(requestId, onTimeout, onInterrupted, strictReceipt)
+        token.deadlineWallMillis = System.currentTimeMillis() + timeoutMillis
         automations[service] = token
         val watchdog = Runnable {
             if (!isCurrent(service, token)) return@Runnable
@@ -772,16 +779,18 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             webView.requestFocus()
             val watchdog = Runnable {
                 if (focusAction !== action) return@Runnable
-                releaseFocus(action)
                 if (isCurrent(action.service, token)) {
+                    // Revoke the old page request before the next input lease can start.
                     finishAutomation(action.service)
-                    token.onInterrupted("${action.service.displayName} 网页输入操作响应超时，请检查原网页后重试")
-                }
+                    token.onInterrupted("${action.service.displayName} 网页输入操作响应超时，请检查原网页；不会自动重复发送")
+                } else releaseFocus(action)
             }
             focusWatchdog = watchdog
-            // Strict text sends already have a whole-operation watchdog. A slow editor
-            // or a background/foreground transition must not discard its late callback.
-            if (!token.strictReceipt) handler.postDelayed(watchdog, FOCUS_ACTION_TIMEOUT_MS)
+            // A lost callback must not hold every other provider until their shared
+            // 45-second deadlines. Kimi's Lexical paste can legitimately take 15s.
+            val focusTimeout = if (token.strictReceipt && action.service == ArenaService.KIMI)
+                KIMI_FOCUS_ACTION_TIMEOUT_MS else FOCUS_ACTION_TIMEOUT_MS
+            handler.postDelayed(watchdog, focusTimeout)
             // Let Android apply the front view's layout before querying native touch coordinates.
             handler.postDelayed({
                 if (focusAction !== action || !isCurrent(action.service, token)) return@postDelayed
@@ -983,7 +992,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     else finishSend(service, SendOutcome(false, requestId, "未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
                 }
             } else {
-                if (token?.strictReceipt == true && attempt < 15) handler.postDelayed({
+                // Yuanbao's formal ID and Zhipu's foreground readiness can arrive late.
+                // Keep observing without another click, bounded by the original watchdog.
+                if (token?.strictReceipt == true && (service == ArenaService.YUANBAO || service == ArenaService.ZHIPU || attempt < 15)) handler.postDelayed({
                     if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
                 }, 500L)
                 else finishSend(service, SendOutcome(false, requestId, "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
@@ -1808,7 +1819,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 window.postMessage({
                   channel: '__ai_arena_zhipu_send_v1',
                   requestId: requestId,
-                  text: text
+                  text: text,
+                  deadlineMillis: ${automations[service]?.deadlineWallMillis ?: 0L}
                 }, location.origin);
                 return 'sent_pending';
             """.trimIndent()
@@ -2087,6 +2099,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (window.__aiArenaZhipuDispatchResults[requestId]) return;
                   window.__aiArenaZhipuDispatchResults[requestId] = 'preparing';
                   try {
+                    // Use the native automation's original deadline. Background throttling
+                    // must not consume a separate short readiness window or extend the task.
+                    const deadline = Number(payload.deadlineMillis);
+                    if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error('send_disabled');
                     const pageUrl = location.href;
                     const owner = window.__aiArenaRequests?.[requestId];
                     if (owner && owner.initialUrl !== pageUrl) throw new Error('page_changed');
@@ -2122,7 +2138,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                       else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(inputEvent);
                     }
                     ${sendControlHelperScript()}
-                    const deadline = Date.now() + 4000;
                     const attempt = function() {
                       try {
                         if (window.__aiArenaCancelledRequests?.[requestId] || window.__aiArenaSendClicks?.[requestId]) return;
@@ -2131,6 +2146,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         if (!input.isConnected) throw new Error('input_changed');
                         const currentText = String(input.value || input.innerText || input.textContent || '').replace(/\s+/g,' ').trim();
                         if (currentText !== text.replace(/\s+/g,' ').trim()) throw new Error('input_changed');
+                        if (document.visibilityState !== 'visible') {
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
                         const send = document.querySelector('.button-right-inner');
                         if (!arenaSendEnabled(send)) {
                           if (Date.now() >= deadline) throw new Error('send_disabled');
@@ -2138,6 +2157,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                           setTimeout(attempt, 100); return;
                         }
                         const rect = send.getBoundingClientRect();
+                        if (Date.now() >= deadline) throw new Error('send_disabled');
+                        if (document.visibilityState !== 'visible') {
+                          window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
+                          setTimeout(attempt, 100); return;
+                        }
                         const eventOptions = { bubbles:true, cancelable:true, view:window, button:0, buttons:1,
                           clientX:rect.left + rect.width / 2, clientY:rect.top + rect.height / 2 };
                         window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
@@ -2405,6 +2429,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
+        private const val KIMI_FOCUS_ACTION_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
         private const val MODE_PROBE_TIMEOUT_MS = 4_000L
         /** 开新对话 / 切历史对话的整页加载上限；超时向调用方报告失败。 */

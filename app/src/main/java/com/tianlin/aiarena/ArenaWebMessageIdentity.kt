@@ -25,6 +25,14 @@ internal object ArenaWebMessageIdentity {
 
     fun helper(service: ArenaService): String = """
         const arenaNormalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+        ${if (service == ArenaService.YUANBAO) "const arenaYuanbaoHome = path => path === '/' || ['/chat', '/chat/naQivTmsDa'].includes(path.replace(/\\/${'$'}/, ''));" else ""}
+        ${if (service == ArenaService.YUANBAO) """
+        const arenaYuanbaoStableUserId = row => {
+          const cid = /^\/chat\/naQivTmsDa\/([^/]+)\/?${'$'}/.exec(location.pathname)?.[1];
+          const id = row.getAttribute('data-conv-id') || '';
+          return cid && id.startsWith(cid + '_') && /^[1-9][0-9]*${'$'}/.test(id.slice(cid.length + 1)) ? id : '';
+        };
+        """.trimIndent() else ""}
         ${if (service == ArenaService.DOUBAO) doubaoRawTextHelper else ""}
         const arenaUserText = row => {
           ${if (service == ArenaService.DOUBAO) "const raw = arenaDoubaoRawText(row); if (raw.present) return raw.valid ? arenaNormalize(raw.text) : '';" else ""}
@@ -37,6 +45,13 @@ internal object ArenaWebMessageIdentity {
         };
         const arenaUserId = row => ${if (service == ArenaService.DEEPSEEK) "row.getAttribute('data-virtual-list-item-key') || ''" else "${if (service == ArenaService.YUANBAO) "row.getAttribute('data-conv-id') || " else ""}row.getAttribute('data-conversation-turn-id') || row.getAttribute('data-archer-id') || row.getAttribute('data-message-id') || row.querySelector('[data-message-id]')?.getAttribute('data-message-id') || ${if (requiresServerId(service)) "row.id || " else ""}''"};
         const arenaMatchesRequestUser = row => {
+          ${if (service == ArenaService.YUANBAO) """
+          if (state.yuanbaoUnstableBaseline) return false;
+          // Optimistic rows have a temporary random ID which is replaced on acknowledgement.
+          // Wait for the conversation-scoped ID instead of pinning the temporary value.
+          if (row.hasAttribute('data-conv-id') && !arenaYuanbaoStableUserId(row)) return false;
+          if (state.yuanbaoRouteCid && row.getAttribute('data-conv-id') !== state.yuanbaoRouteCid + '_1') return false;
+          """.trimIndent() else ""}
           ${if (service == ArenaService.DOUBAO) """
           const raw = arenaDoubaoRawText(row);
           if (raw.present) return raw.valid && typeof state.expectedRawPrompt === 'string' &&
@@ -80,6 +95,12 @@ internal object ArenaWebMessageIdentity {
         };
         const arenaFindRequestUser = () => {
           if (!arenaRequestScopeValid()) return null;
+          ${if (service == ArenaService.YUANBAO) """
+          // A restored homepage bubble must not acknowledge a send before its route
+          // has been tied to this request's outgoing conversation ID.
+          if (state.expectedPrompt && state.legacyAttachment !== true &&
+              arenaYuanbaoHome(new URL(state.initialUrl).pathname) && !state.transitioned) return null;
+          """.trimIndent() else ""}
           ${if (service == ArenaService.DEEPSEEK) "if (state.expectedPrompt && state.legacyAttachment !== true && !/^\\/a\\/chat\\/s\\/[^/]+\\/?${'$'}/.test(location.pathname)) return null;" else ""}
           const users = ${users(service)};
           if (!state.expectedPrompt) return users.find(row => row.getAttribute('data-ai-arena-request') === requestId) || users.slice(Number(state.userBaseline || 0)).pop() || null;
@@ -126,10 +147,12 @@ internal object ArenaWebMessageIdentity {
           window.__aiArenaSendClicks = window.__aiArenaSendClicks || {};
           window.__aiArenaSendClicks[requestId] = state.submittedAt;
         };
+        ${if (service == ArenaService.YUANBAO) yuanbaoRouteObserver else ""}
         ${if (!requiresServerId(service)) """
         // A route shape alone cannot distinguish a new chat from an old same-text chat.
         // Pin the submitted user node BEFORE a first-chat SPA navigation takes place.
         const arenaInstallNavigationGuard = () => {
+          ${if (service == ArenaService.YUANBAO) "arenaInstallYuanbaoRouteObserver();" else ""}
           if (!window.__aiArenaNavigationGuard) {
             const guard = {before:null};
             window.__aiArenaNavigationGuard = guard;
@@ -150,17 +173,80 @@ internal object ArenaWebMessageIdentity {
             const initial = new URL(state.initialUrl), target = new URL(value, location.href);
             if (location.href !== initial.href || target.origin !== initial.origin || target.href === initial.href) return null;
             if (!(${freshRouteExpression(service).replace("location.", "target.")})) return null;
-            const user = arenaFindRequestUser();
-            if (!user) return null;
-            arenaBindRequestUser(user);
+            ${if (service == ArenaService.YUANBAO) """
+            const evidence = state.yuanbaoRouteEvidence;
+            const witnessedSend = evidence && evidence.targetUrl === target.href &&
+              evidence.submittedAt === state.submittedAt && evidence.documentToken === window.__aiArenaProviderDocument;
+            // A same-text bubble can be restored before an old-chat route changes.
+            // Yuanbao's first migration always needs the exact outgoing CID, even
+            // when a user bubble is already mounted. Conflicting DOM is not a receipt.
+            if (!witnessedSend) return null;
+            """.trimIndent() else "const user = arenaFindRequestUser(); if (!user) return null; arenaBindRequestUser(user);"}
             return () => {
               state.transitioned = true;
+              ${if (service == ArenaService.YUANBAO) "state.yuanbaoRouteCid = evidence.cid; delete state.yuanbaoRouteEvidence;" else ""}
               state.boundConversationUrl = target.origin + target.pathname + target.search + target.hash;
               try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
             };
           };
         };
         """.trimIndent() else ""}
+    """.trimIndent()
+
+    // Yuanbao mobile navigates before mounting its first user bubble. Observe only the
+    // outgoing request identity; never read network answers or change provider requests.
+    private val yuanbaoRouteObserver = """
+        const arenaInstallYuanbaoRouteObserver = () => {
+          if (!window.__aiArenaYuanbaoRouteObserver) {
+            const observer = {observe:null};
+            window.__aiArenaYuanbaoRouteObserver = observer;
+            const fetchOriginal = window.fetch;
+            if (typeof fetchOriginal === 'function') window.fetch = function(resource, init) {
+              const observe = observer.observe;
+              const result = fetchOriginal.apply(this, arguments);
+              try {
+                // The current website sends a URL and JSON string. Request/stream bodies
+                // are intentionally unsupported rather than consumed or delayed.
+                if (typeof resource === 'string' && init) observe?.(init.method, resource, init.body);
+              } catch (_) {}
+              return result;
+            };
+            const requests = new WeakMap(), openOriginal = XMLHttpRequest.prototype.open,
+              sendOriginal = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+              const result = openOriginal.apply(this, arguments);
+              requests.set(this, {method, url});
+              return result;
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+              const request = requests.get(this), observe = observer.observe;
+              const result = sendOriginal.apply(this, arguments);
+              try { if (request) observe?.(request.method, request.url, body); } catch (_) {}
+              return result;
+            };
+          }
+          window.__aiArenaYuanbaoRouteObserver.observe = (method, resource, body) => {
+            if (String(method).toUpperCase() !== 'POST' || typeof body !== 'string' ||
+                !state.expectedPrompt || !state.submittedAt || state.transitioned || state.scopeFailure ||
+                state.legacyAttachment || state.userBaseline !== 0 || state.beforeUserTexts.length ||
+                state.documentToken !== window.__aiArenaProviderDocument ||
+                window.__aiArenaRequests?.[requestId] !== state || window.__aiArenaCancelledRequests?.[requestId]) return;
+            const initial = new URL(state.initialUrl), url = new URL(resource, location.href);
+            if (location.href !== initial.href || !arenaYuanbaoHome(initial.pathname) ||
+                url.origin !== initial.origin || url.search || url.hash) return;
+            const match = /^\/api\/chat\/([A-Za-z0-9_-]+)${'$'}/.exec(url.pathname);
+            if (!match) return;
+            const payload = JSON.parse(body), cid = match[1];
+            if (payload.conversationId !== cid || payload.agentId !== 'naQivTmsDa' ||
+                payload.prompt !== state.expectedRawPrompt) return;
+            const targetUrl = initial.origin + '/chat/naQivTmsDa/' + cid;
+            if (state.yuanbaoRouteEvidence && state.yuanbaoRouteEvidence.targetUrl !== targetUrl) {
+              state.scopeFailure = true;
+              delete state.yuanbaoRouteEvidence;
+            } else state.yuanbaoRouteEvidence = {cid, targetUrl, submittedAt:state.submittedAt, documentToken:state.documentToken};
+            try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+          };
+        };
     """.trimIndent()
 
     private fun userBodySelector(service: ArenaService): String = when (service) {
@@ -174,7 +260,7 @@ internal object ArenaWebMessageIdentity {
 
     private fun freshRouteExpression(service: ArenaService): String = when (service) {
         ArenaService.QWEN -> "initial.pathname === '/' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
-        ArenaService.YUANBAO -> "initial.pathname === '/chat/naQivTmsDa' && /^\\/chat\\/naQivTmsDa\\/[^/]+\\/?${'$'}/.test(location.pathname)"
+        ArenaService.YUANBAO -> "arenaYuanbaoHome(initial.pathname) && /^\\/chat\\/naQivTmsDa\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.CLAUDE -> "initial.pathname === '/new' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.CHATGPT -> "initial.pathname === '/' && /^\\/c\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.GEMINI -> "/^\\/app\\/?${'$'}/.test(initial.pathname) && /^\\/app\\/[^/]+\\/?${'$'}/.test(location.pathname)"

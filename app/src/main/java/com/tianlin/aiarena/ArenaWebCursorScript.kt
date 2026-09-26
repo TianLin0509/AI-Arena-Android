@@ -41,6 +41,7 @@ internal object ArenaWebCursorScript {
               """.trimIndent() else ""}
               ${ArenaWebMessageIdentity.helper(service)}
               const beforeUsers = ${ArenaWebMessageIdentity.users(service)};
+              ${if (service == ArenaService.YUANBAO) "state.yuanbaoUnstableBaseline = beforeUsers.some(row => row.hasAttribute('data-conv-id') && !arenaYuanbaoStableUserId(row));" else ""}
               state.beforeUserIds = beforeUsers.map(arenaUserId).filter(Boolean);
               state.beforeUserTexts = beforeUsers.map(arenaUserText);
               state.beforeQueueIds = Array.from(document.querySelectorAll('[data-item-id][data-item-status]')).map(row => row.getAttribute('data-item-id'));
