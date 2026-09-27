@@ -285,8 +285,12 @@ internal object ArenaWebResponseScript {
                 const picked = pickSelector(['[class*=qk-markdown]', '.qk-md-paragraph', '[class*=assistant] [class*=content]', '[class*=answer-content]']);
                 const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
                 const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
-                if (!text) text = collectText(scoped, ['.qk-md-paragraph'], picked.selector, scoped.anchored);
-                const qwLast = scoped.nodes.length ? scoped.nodes[scoped.nodes.length - 1] : null;
+                // Current Qwen renders COMPLETE markdown inside thinking-content before
+                // its answer-common-card exists. Never fall back to thinking-only nodes.
+                const qwAnswerNodes = scoped.nodes.filter(node => !node.closest(auxiliaryPattern));
+                const qwAnswerScope = { nodes: qwAnswerNodes, anchored: scoped.anchored };
+                if (!text) text = collectText(qwAnswerScope, ['.qk-md-paragraph'], picked.selector, scoped.anchored);
+                const qwLast = qwAnswerNodes.length ? qwAnswerNodes[qwAnswerNodes.length - 1] : null;
                 // The mobile site can accept the question but render only a retry card.
                 // Match provider UI within this turn, never quoted answer text or old errors.
                 const qwFailures = Array.from(document.querySelectorAll('[data-chat-answers-wrap] [class*=retry-container]'))
@@ -302,6 +306,9 @@ internal object ArenaWebResponseScript {
                 // 把千问思考过程中的半截答案当作最终答案存下来。
                 if (networkAnswer.length === 0) {
                   streaming = Array.from(document.querySelectorAll('button[class*=stop], button[aria-label*=停止], button[aria-label*=Stop], [class*=generating]')).some(isVisible);
+                  const qwModernAnswers = topLevelOnly(qwAnswerNodes).filter(node => node.matches('.qk-markdown-react'));
+                  streaming = streaming || (!qwAnswerNodes.length && scoped.nodes.length > 0) ||
+                    qwModernAnswers.some(node => !node.classList.contains('qk-markdown-complete'));
                   weakDoneSignal = true;
                 }
                 if (securityChallenge && !text) {
@@ -418,7 +425,9 @@ internal object ArenaWebResponseScript {
             (function() {
               $stateBootstrap
               ${ArenaWebMessageIdentity.helper(service)}
-              const arenaResponseUsers = ${ArenaWebMessageIdentity.users(service)};
+              // An attachment-only next turn is still a response boundary, even
+              // though its card cannot acknowledge our submitted text question.
+              const arenaResponseUsers = ${if (service == ArenaService.QWEN) "Array.from(document.querySelectorAll('.message-card-wrap.question'))" else ArenaWebMessageIdentity.users(service)};
               const clean = function(value) { return String(value || '').trim(); };
               ${ArenaMarkdownScript.helper}
               $scopeHelper

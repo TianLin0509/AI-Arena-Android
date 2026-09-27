@@ -42,7 +42,6 @@ enum class ArenaService(
         loginHint = "支付宝或手机号登录",
         brandGlyph = "千",
         brandColor = 0xFF6B55D9,
-        experimental = true,
     ),
     YUANBAO(
         displayName = "元宝",
@@ -51,7 +50,6 @@ enum class ArenaService(
         loginHint = "微信或 QQ 快捷登录",
         brandGlyph = "元",
         brandColor = 0xFF2F74D0,
-        experimental = true,
     ),
     ZHIPU(
         displayName = "智谱",
@@ -60,7 +58,6 @@ enum class ArenaService(
         loginHint = "微信或手机号登录",
         brandGlyph = "智",
         brandColor = 0xFF295FB8,
-        experimental = true,
     ),
     CLAUDE(
         displayName = "Claude",
@@ -339,6 +336,8 @@ data class ResponseSnapshot(
 }
 
 interface ArenaGateway {
+    /** Read-only activity description; must never start a website action. */
+    fun sendProgress(service: ArenaService, requestId: String): ArenaSendProgress? = null
     /** 必须确认附件就绪后再发送文字；旧实现必须明确拒绝附件，不能静默漏发。 */
     fun sendPromptWithAttachments(
         service: ArenaService,

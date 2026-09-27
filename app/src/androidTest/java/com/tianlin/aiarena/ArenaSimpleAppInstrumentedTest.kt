@@ -39,7 +39,7 @@ class ArenaSimpleAppInstrumentedTest {
 
     @Test fun productionNavigationPreservesSelectedAnswerAndDraftAcrossWebpage() {
         compose.onNodeWithTag("simple-answer-DEEPSEEK").assertIsDisplayed()
-        compose.onNodeWithTag("choose-attachments").assertDoesNotExist()
+        compose.onNodeWithTag("choose-attachments").assertIsDisplayed().assertIsEnabled()
         capture("production-answer")
         compose.onNodeWithTag("answer-tab-KIMI").performClick()
         compose.onNodeWithTag("simple-composer").performTextInput("保留这条追问草稿")

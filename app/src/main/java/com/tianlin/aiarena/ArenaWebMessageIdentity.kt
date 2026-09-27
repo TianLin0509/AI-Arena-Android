@@ -15,7 +15,9 @@ internal object ArenaWebMessageIdentity {
         ArenaService.DEEPSEEK -> "Array.from(document.querySelector('.ds-virtual-list-visible-items')?.children || []).filter(row => { const body = row.querySelector('.ds-message .ds-collapsible-text'); return !!body && !body.closest('.ds-markdown, .ds-think-content'); })"
         ArenaService.DOUBAO -> "$doubaoRows.filter(row => !!row.querySelector('[data-send-message-boundary], [class*=bg-g-send]'))"
         ArenaService.KIMI -> "Array.from(document.querySelectorAll('.chat-content-item-user:not(.awaiting-failure)'))"
-        ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question'))"
+        // One Qwen question has separate image/file cards and a text card. Only the
+        // text card counts toward the same-prompt prefix used to identify a new send.
+        ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question')).filter(row => !!row.querySelector('.question-text-card'))"
         ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human'))"
         ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).filter(row => !row.parentElement?.closest('.conversation.question, [data-role=user], [class*=user-message]'))"
         ArenaService.CLAUDE -> "Array.from(document.querySelectorAll('[data-testid=user-message]'))"

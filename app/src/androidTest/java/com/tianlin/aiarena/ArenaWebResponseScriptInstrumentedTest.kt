@@ -168,6 +168,54 @@ class ArenaWebResponseScriptInstrumentedTest {
     }
 
     @Test
+    fun qwenCompletedThinkingNeverBecomesTheFinalAnswer() {
+        // Observed on the current mobile site: thinking has its own COMPLETE markdown
+        // before the answer-common-card exists, even while no stop button is visible.
+        val thinking = """
+            <div class="user-row"><div class="content">读取附件</div></div>
+            <div data-chat-answers-wrap="answer-1">
+              <div class="thinking-content-tIwPU3"><div class="markdown-pc-special-class" data-md-skip-card-detect>
+                <div class="qk-markdown qk-markdown-react qk-markdown-complete"><p>先理解目标并检查输入内容，不是最终答案。</p></div>
+              </div></div>
+              FINAL_ANSWER
+            </div>
+        """.trimIndent()
+        for (strict in listOf(false, true)) {
+            fun read(suffix: String, final: String): JSONObject {
+                val old = """<div class="message-card-wrap question" data-message-id="qwen-old"><div class="question-text-card">读取附件</div></div><div class="qk-markdown qk-markdown-react qk-markdown-complete">上一轮答案</div>"""
+                val next = """<div class="message-card-wrap question" data-message-id="qwen-next"><div class="question-text-card">另一个问题</div></div><div class="qk-markdown qk-markdown-react qk-markdown-complete">下一轮答案</div>"""
+                val current = thinking.replace("FINAL_ANSWER", final).replace(
+                    """<div class="user-row"><div class="content">读取附件</div></div>""",
+                    """<div class="message-card-wrap question" data-message-id="qwen-current"><div class="question-text-card">读取附件</div></div>""",
+                )
+                val result = evaluate(ArenaService.QWEN, "qwen_${strict}_$suffix", if (strict) old else current,
+                    strictPrompt = if (strict) "读取附件" else "", afterPrepareHtml = if (strict) current + next else null)
+                if (strict) {
+                    assertTrue(result.getBoolean("localTagBound"))
+                    assertEquals("读取附件", result.getString("expectedPrompt"))
+                    assertEquals("qwen-current", result.getString("boundUserId"))
+                }
+                assertFalse(result.getBoolean("requestIdVisible"))
+                return result
+            }
+            val pending = read("thinking_only", "")
+            assertFalse("Thinking alone must not become a stable answer", pending.getBoolean("found"))
+            assertEquals("", pending.getString("text"))
+            assertTrue(pending.getBoolean("streaming"))
+            for (complete in listOf(false, true)) {
+                val final = """<div class="answer-common-card"><div class="markdown-pc-special-class"><div class="qk-markdown qk-markdown-react ${if (complete) "qk-markdown-complete" else ""}"><p>CODE: DOC-73908700</p><p>APPLES: 7</p><p>PEARS: 4</p></div></div></div>"""
+                val result = read("real_answer_$complete", final)
+                assertTrue(result.getBoolean("found"))
+                assertEquals("CODE: DOC-73908700\n\nAPPLES: 7\n\nPEARS: 4", result.getString("text"))
+                assertEquals(!complete, result.getBoolean("streaming"))
+            }
+            val split = read("split_answer", """<div class="answer-common-card"><div class="qk-markdown qk-markdown-react">仍在生成的第一段</div><div class="qk-markdown qk-markdown-react qk-markdown-complete">已完成的第二段</div></div>""")
+            assertTrue(split.getBoolean("streaming"))
+            assertEquals("仍在生成的第一段\n\n已完成的第二段", split.getString("text"))
+        }
+    }
+
+    @Test
     fun yuanbaoExperimentalAdapterExtractsHycMarkdown() {
         val payload = evaluate(
             ArenaService.YUANBAO,
@@ -429,7 +477,8 @@ class ArenaWebResponseScriptInstrumentedTest {
             "<div class='message-action-bar' style='height:32px'><button>复制</button></div></div>",
     ).getString("text")
 
-    private fun evaluate(service: ArenaService, requestId: String, bodyHtml: String): JSONObject {
+    private fun evaluate(service: ArenaService, requestId: String, bodyHtml: String,
+                         strictPrompt: String = "", afterPrepareHtml: String? = null): JSONObject {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val result = AtomicReference<JSONObject>()
         val failure = AtomicReference<Throwable>()
@@ -447,17 +496,19 @@ class ArenaWebResponseScriptInstrumentedTest {
                     override fun onPageFinished(view: WebView, url: String?) {
                         if (evaluated) return
                         evaluated = true
-                        view.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId)) {
+                        view.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, strictPrompt)) {
                             val simulateAnswerArrivingAfterBaseline = """
                                 (function() {
                                   const state = window.__aiArenaRequests && window.__aiArenaRequests[${JSONObject.quote(requestId)}];
-                                  if (state) state.assistantBaseline = 0;
+                                  if (state && ${strictPrompt.isEmpty()}) state.assistantBaseline = 0;
+                                  if (state && ${strictPrompt.isNotEmpty()}) state.submittedAt = Date.now();
+                                  ${afterPrepareHtml?.let { "document.body.insertAdjacentHTML('beforeend', ${JSONObject.quote(it)});" } ?: ""}
                                   return true;
                                 })();
                             """.trimIndent()
                             view.evaluateJavascript(simulateAnswerArrivingAfterBaseline) {
-                            view.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId)) {
-                                view.evaluateJavascript(ArenaWebResponseScript.build(service, requestId)) { raw ->
+                            view.evaluateJavascript(ArenaWebCursorScript.bind(service, requestId, strictPrompt.isNotEmpty())) {
+                                view.evaluateJavascript(ArenaWebResponseScript.build(service, requestId, strictPrompt.isNotEmpty())) { raw ->
                                     try {
                                         val decoded = JSONTokener(raw).nextValue() as String
                                         val payload = JSONObject(decoded)
@@ -468,7 +519,8 @@ class ArenaWebResponseScriptInstrumentedTest {
                                               const localTagBound = Array.from(document.querySelectorAll('[data-ai-arena-request]')).some(function(row) {
                                                 return row.getAttribute('data-ai-arena-request') === requestId;
                                               });
-                                              return JSON.stringify({ visible, localTagBound });
+                                              const state = window.__aiArenaRequests?.[requestId];
+                                              return JSON.stringify({ visible, localTagBound, expectedPrompt: state?.expectedPrompt || '', boundUserId: state?.boundUserId || '' });
                                             })();
                                         """.trimIndent()
                                         view.evaluateJavascript(metadataScript) { metadataRaw ->
@@ -477,6 +529,8 @@ class ArenaWebResponseScriptInstrumentedTest {
                                                 val metadata = JSONObject(metadataDecoded)
                                                 payload.put("requestIdVisible", metadata.getBoolean("visible"))
                                                 payload.put("localTagBound", metadata.getBoolean("localTagBound"))
+                                                payload.put("expectedPrompt", metadata.getString("expectedPrompt"))
+                                                payload.put("boundUserId", metadata.getString("boundUserId"))
                                                 result.set(payload)
                                             } catch (error: Throwable) {
                                                 failure.set(error)

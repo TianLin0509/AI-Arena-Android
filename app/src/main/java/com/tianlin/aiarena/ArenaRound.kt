@@ -501,7 +501,7 @@ internal fun runStatusWord(run: ParticipantRun, status: ServiceStatus): String {
     if (run.requestId.isNotBlank() || run.detail != "等待开始") {
         return when (run.phase) {
             ParticipantPhase.IDLE -> "等待"
-            ParticipantPhase.QUEUED -> "排队"
+            ParticipantPhase.QUEUED -> if (run.detail.contains("等上一家")) "等上一家" else "准备网页"
             ParticipantPhase.SENDING -> "发送中"
             ParticipantPhase.WAITING -> "等待中"
             ParticipantPhase.STREAMING -> "回答中"
