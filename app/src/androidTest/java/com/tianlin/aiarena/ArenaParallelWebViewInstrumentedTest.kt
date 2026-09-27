@@ -43,6 +43,47 @@ class ArenaParallelWebViewInstrumentedTest {
     private val members = ArenaService.defaultMembers
     private fun onMain(block: () -> Unit) = instrumentation.runOnMainSync(block)
 
+    @Test fun attachmentDeliveryBindsExactQuestionAndProviderMessageIdentity() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val done = CountDownLatch(members.size)
+            val outcomes = mutableListOf<SendOutcome>()
+            onMain { members.forEach { service ->
+                pool.sendPromptWithAttachments(service, "附件问题 ${service.name}", "strict-file-${service.name}", listOf(attachment)) {
+                    outcomes += it; done.countDown()
+                }
+            } }
+            assertTrue(done.await(30, TimeUnit.SECONDS))
+            onMain { assertTrue(outcomes.toString(), outcomes.all { it.success }) }
+            members.forEach { service ->
+                val view = views.getValue(service)
+                val state = JSONObject(evaluate(view, "JSON.stringify(window.__aiArenaRequests['strict-file-${service.name}'])"))
+                assertEquals("附件问题 ${service.name}", state.getString("expectedPrompt"))
+                assertFalse(state.optBoolean("legacyAttachment", false))
+                assertTrue(state.toString(), state.optString("boundUserId").isNotBlank())
+                assertEquals("1", evaluate(view, "sendCount"))
+                verifyBytes(view, attachment)
+            }
+        }
+    }
+
+    @Test fun attachmentUploadAndEmptyEditorAloneCannotConfirmQuestionDelivery() {
+        withPool(emptyMap()) { pool, views, attachment ->
+            val view = views.getValue(ArenaService.KIMI)
+            evaluate(view, "window.fixtureReceipt=()=>{};true")
+            val outcomes = mutableListOf<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.KIMI, "missing-file-receipt", "missing-file-receipt", listOf(attachment)) { outcomes += it } }
+            waitUntil("Website clicked send once") { evaluate(view, "sendCount") == "1" }
+            Thread.sleep(3_500)
+            assertEquals("", evaluate(view, "document.querySelector('textarea').value"))
+            verifyBytes(view, attachment)
+            onMain {
+                assertTrue("Missing question identity must not report success", outcomes.none { it.success })
+                pool.cancelAutomation(ArenaService.KIMI)
+            }
+            assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
     @Test fun doubaoFollowupUsesV2OnlyRawMessageWithoutResendingOrReadingFirstAnswer() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)
@@ -1353,7 +1394,7 @@ class ArenaParallelWebViewInstrumentedTest {
             window.send=()=>{
               const text=editorText();if(!text.trim())return;
               if(!fileStates.length||fileStates.some(f=>f.status!=='Normal'||f.parseState!==1))throw Error('send before attachment ready');
-              window.sentText=text;window.sentHtml=input.innerHTML;window.sentInnerText=input.innerText;window.sendCount++;input.replaceChildren();
+              window.sentText=text;window.sentHtml=input.innerHTML;window.sentInnerText=input.innerText;window.sendCount++;fixtureReceipt(text);input.replaceChildren();
             };true;
         """.trimIndent())
     }
@@ -1368,7 +1409,7 @@ class ArenaParallelWebViewInstrumentedTest {
                 document.addEventListener('keydown',e=>{if(e.key==='Enter')enterEvents++;},true);
                 button.addEventListener('click',e=>sendEvents.push({trusted:e.isTrusted,focus:document.hasFocus(),visible:document.visibilityState}),true);
                 window.send=()=>{const input=document.querySelector('textarea'),text=input.value;if(!text)return;
-                  pendingDelivery++;setTimeout(()=>{window.focusDuringDelivery=document.hasFocus();window.sentText=text;window.sendCount++;input.value='';pendingDelivery--;},1000);};true;
+                  pendingDelivery++;setTimeout(()=>{window.focusDuringDelivery=document.hasFocus();window.sentText=text;window.sendCount++;fixtureReceipt(text);input.value='';pendingDelivery--;},1000);};true;
             """.trimIndent())
             val done = CountDownLatch(1)
             val outcome = AtomicReference<SendOutcome>()
@@ -1386,6 +1427,30 @@ class ArenaParallelWebViewInstrumentedTest {
             assertEquals("false", evaluate(view, "focusDuringDelivery"))
             verifyBytes(view, attachment)
             assertEquals("1", evaluate(view, "sendCount"))
+        }
+    }
+
+    @Test fun nativeAttachmentWaitsForLateOfficialReceiptWithoutClickingTwice() {
+        withPool(emptyMap(), fileName = "probe.png") { pool, views, attachment ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            evaluate(view, """
+                window.acceptedSends=0;
+                window.send=()=>{const input=document.querySelector('textarea'),text=input.value;
+                  if(!text.trim())return;acceptedSends++;
+                  setTimeout(()=>{fixtureReceipt(text);window.sentText=text;window.sendCount++;input.value='';},12000);
+                };true;
+            """.trimIndent())
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            onMain { pool.sendPromptWithAttachments(ArenaService.DOUBAO, "late-image-metadata", "late-image-metadata", listOf(attachment)) {
+                outcome.set(it); done.countDown()
+            } }
+            assertTrue(done.await(35, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", evaluate(view, "acceptedSends"))
+            assertEquals("true", evaluate(view, "window.__aiArenaRequests['late-image-metadata'].submittedAt>0"))
+            assertEquals("true", evaluate(view, "JSON.parse(sessionStorage.getItem('__ai_arena_cursor_late-image-metadata')).submittedAt>0"))
+            verifyBytes(view, attachment)
         }
     }
 
@@ -2081,8 +2146,7 @@ class ArenaParallelWebViewInstrumentedTest {
                   if(fileStates.length!==1||fileStates[0].status!=='Normal')throw Error('attachment not ready');
                   acceptedSends++;pendingSends++;
                   setTimeout(()=>{
-                    const row=document.createElement('div');row.className='v_list_row';row.setAttribute('data-observe-row','');
-                    const user=document.createElement('span');user.className='bg-g-send';user.textContent=text;row.appendChild(user);document.body.appendChild(row);
+                    fixtureReceipt(text);
                     window.sentText=text;window.sendCount++;input.value='';pendingSends--;
                   },1800);
                 };true;
@@ -3027,7 +3091,7 @@ class ArenaParallelWebViewInstrumentedTest {
             <button class="toolkit-trigger-btn" id="fixture-toolkit" aria-haspopup="menu" aria-controls="menu" aria-expanded="false" onclick="this.setAttribute('aria-expanded','true');menu.innerHTML='<label class=&quot;toolkit-item&quot; role=&quot;menuitem&quot; style=&quot;display:block;width:140px;height:50px&quot;>Upload files<input id=&quot;upload&quot; type=&quot;file&quot; style=&quot;display:none&quot;></label>';upload.onchange=handle;">Add</button><div id="menu" role="menu" aria-labelledby="fixture-toolkit"></div>
         """ else if (modernDoubao) """
             <div class="relative"><input id="upload" type="file" accept="image/*" style="display:none">$area</div>
-            <div class="guidance-input-actions"><button id="upload-trigger" data-slot="dropdown-menu-trigger" aria-haspopup="menu" onclick="document.getElementById('upload-menu').style.display='block'"></button></div>
+            <div class="guidance-input-actions"><div id="upload-trigger" data-slot="dropdown-menu-trigger" aria-haspopup="menu" onclick="document.getElementById('upload-menu').style.display='block'"></div></div>
         """ else """
             <button data-testid="upload_file_button" onclick="upload.click()">Upload files</button><input id="upload" type="file" accept=".txt,image/*" style="display:none">
         """
@@ -3059,9 +3123,29 @@ class ArenaParallelWebViewInstrumentedTest {
               cards.appendChild(card);const reader=new FileReader();reader.onload=()=>{received.push({name:file.name,data:reader.result,at:Date.now()});setTimeout(completeFixture,$delay);};reader.readAsDataURL(file);
             }}
             const direct=document.getElementById('upload');if(direct)direct.onchange=handle;
+            // A cleared editor is not a delivery receipt. Model the accepted user row,
+            // including provider identity and raw text, only after the fixture accepts.
+            window.fixtureReceipt=text=>{
+              const row=document.createElement('div'),body=document.createElement('div');
+              if('${service.name}'==='DEEPSEEK'){
+                history.replaceState({},'', '/a/chat/s/fixture');
+                let list=document.querySelector('.ds-virtual-list-visible-items');
+                if(!list){list=document.createElement('div');list.className='ds-virtual-list-visible-items';document.body.appendChild(list);}
+                row.setAttribute('data-virtual-list-item-key',String(list.children.length+1));
+                body.className='ds-message';const textNode=document.createElement('div');textNode.className='ds-collapsible-text';textNode.textContent=text;
+                body.appendChild(textNode);row.appendChild(body);list.appendChild(row);
+              }else if('${service.name}'==='DOUBAO'){
+                row.setAttribute('data-target-id','message-box-target-id');body.setAttribute('data-send-message-boundary','');
+                body.setAttribute('data-message-id','accepted-'+document.querySelectorAll('[data-send-message-boundary]').length);
+                body.textContent=text;row.appendChild(body);document.body.appendChild(row);fixtureDoubaoMessage(row,text);
+              }else if('${service.name}'==='KIMI'){
+                row.className='chat-content-item-user';row.setAttribute('data-conversation-turn-id','accepted-'+document.querySelectorAll('.chat-content-item-user').length);
+                body.textContent=text;row.appendChild(body);document.body.appendChild(row);
+              }
+            };
             function send(){const input=document.querySelector('textarea');if(!input.value.trim())return;
               if(!fileStates.length||fileStates.some(f=>f.status!=='${if(service == ArenaService.DOUBAO) "Normal" else "SUCCESS"}'||f.parseState!==1))throw Error('send before attachment ready');
-              window.sentText=input.value;window.sendCount++;input.value='';}
+              window.sentText=input.value;window.sendCount++;fixtureReceipt(input.value);input.value='';}
             </script>
         """.trimIndent()
     }

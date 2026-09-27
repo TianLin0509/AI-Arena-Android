@@ -81,7 +81,8 @@ class AiModePolicyTest {
     fun runStatusWordFallsBackToPageStateBeforeTheRoundStarts() {
         assertEquals("就绪", runStatusWord(ParticipantRun(), ServiceStatus(state = ConnectionState.SIGNED_IN)))
         assertEquals("要登录", runStatusWord(ParticipantRun(), ServiceStatus(state = ConnectionState.NEEDS_LOGIN)))
-        assertEquals("排队", runStatusWord(ParticipantRun(phase = ParticipantPhase.QUEUED, requestId = "r"), ServiceStatus()))
+        assertEquals("准备网页", runStatusWord(ParticipantRun(phase = ParticipantPhase.QUEUED, requestId = "r"), ServiceStatus()))
+        assertEquals("等上一家", runStatusWord(ParticipantRun(phase = ParticipantPhase.QUEUED, requestId = "r", detail = "等上一家"), ServiceStatus()))
         assertEquals("没成功", runStatusWord(ParticipantRun(phase = ParticipantPhase.ERROR, requestId = "r"), ServiceStatus()))
         assertEquals("完成", runStatusWord(ParticipantRun(phase = ParticipantPhase.COMPLETE, requestId = "r"), ServiceStatus()))
     }

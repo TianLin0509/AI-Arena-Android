@@ -178,15 +178,23 @@ class ArenaSimpleInstrumentedTest {
         capture("settings")
     }
 
-    @Test fun questionPageHasNoAttachmentEntryAndAvatarOpensProvider() {
+    @Test fun questionPageCanSendAttachmentOnlyAndNewQuestionClearsDraft() {
         var opened: ArenaService? = null
+        var sends = 0
+        var picks = 0
+        val draft = AttachmentDraft(listOf(ArenaAttachment("ui-file", "说明.txt", "text/plain", 12, "a".repeat(64))))
         compose.setContent { ArenaTheme {
-            SimpleAskHome("", {}, ArenaService.defaultMembers, 3, {}, {}, { opened = it }, {}, {}, {}, {}, null, false, null, {})
+            SimpleAskHome("", {}, ArenaService.defaultMembers, 3, {}, {}, { opened = it }, {}, { sends++ }, {}, {}, null, false, null, {},
+                attachmentDraft = draft, onChooseAttachments = { picks++ })
         } }
-        compose.onNodeWithTag("choose-attachments").assertDoesNotExist()
+        compose.onNodeWithTag("choose-attachments").assertIsDisplayed().performClick()
+        compose.onNodeWithText("说明.txt").assertIsDisplayed()
+        compose.onNodeWithTag("simple-send").performClick()
+        compose.runOnIdle { assertEquals(1, sends); assertEquals(1, picks) }
         compose.onNodeWithContentDescription("打开 豆包 网页").performClick()
         compose.runOnIdle { assertEquals(ArenaService.DOUBAO, opened) }
-        compose.onNodeWithTag("simple-send").assertIsDisplayed()
+        compose.onNodeWithTag("new-session").performClick()
+        compose.onNodeWithText("说明.txt").assertDoesNotExist()
         capture("home")
     }
 
@@ -264,6 +272,37 @@ class ArenaSimpleInstrumentedTest {
             compose.runOnIdle { assertEquals(ArenaService.DOUBAO, sentTo) }
             compose.onNodeWithText("由 豆包 整理 · 标准").assertIsDisplayed()
         } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
+    }
+
+    @Test fun summaryRetryAfterDraftWasClearedKeepsOriginalFilesAndPrompt() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val file = ArenaAttachment("summary-file", "保留.txt", "text/plain", 4, "a".repeat(64))
+        val original = DiscussionSummary(phase = ParticipantPhase.ERROR, judge = ArenaService.DOUBAO,
+            prompt = "原始完整总结问题", attachments = listOf(file), detail = "上传失败")
+        var sent: List<ArenaAttachment>? = null
+        var deliveredPrompt: String? = null
+        lateinit var controller: ArenaSessionController
+        inst.runOnMainSync {
+            controller = ArenaSessionController(object : ArenaGateway {
+                override fun sendPrompt(service: ArenaService, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) =
+                    fail("Retry must use attachment gateway")
+                override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,
+                    attachments: List<ArenaAttachment>, callback: (SendOutcome) -> Unit) {
+                    assertEquals(ArenaService.DOUBAO, service); sent = attachments; deliveredPrompt = prompt
+                }
+                override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) = Unit
+            }, sessionRepository = FixtureRepository(savedSummary = original))
+        }
+        try {
+            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+                SimpleSummary(controller, ArenaService.defaultMembers, ArenaCaptainPreferences(inst.targetContext),
+                    true, "", {}, {}, null, null, remember { SnackbarHostState() }, attachments = emptyList())
+            } } }
+            compose.onNodeWithText("上次综合附件：保留.txt").performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("按原内容重试", substring = false).performScrollTo().performClick()
+            compose.onNodeWithText("确认重试", substring = false).performClick()
+            compose.runOnIdle { assertEquals(listOf(file), sent); assertEquals(original.prompt, deliveredPrompt) }
+        } finally { inst.runOnMainSync { controller.destroy() } }
     }
 
     @Test fun summarySecurityChallengeKeepsTheActionVisibleWhileWaiting() {

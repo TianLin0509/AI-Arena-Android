@@ -98,7 +98,8 @@ fun ArenaApp(
     val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
     val sessionRepository = remember(context) { ArenaSessionStore(context) }
     val sessionController = remember(pool, sessionRepository) {
-        ArenaSessionController(pool = ArenaTextOnlyGateway(pool), sessionRepository = sessionRepository)
+        ArenaSessionController(pool = pool, sessionRepository = sessionRepository,
+            progressTracker = ArenaProgressTracker(ArenaDurationStore(context)))
     }
     val questionDraft = rememberSaveable { mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion }) }
     val guidanceDraft = rememberSaveable { mutableStateOf("") }
@@ -422,9 +423,16 @@ private fun RoundtableRoot(
     val usableCount = selectedServices.count {
         pool.statuses[it]?.state?.isUsable() == true
     }
+    val initialAttachments = rememberSaveable(saver = AttachmentDraft.Saver) { AttachmentDraft() }
+    val followupAttachments = rememberSaveable(saver = AttachmentDraft.Saver) { AttachmentDraft() }
+    DisposableEffect(initialAttachments, followupAttachments) {
+        onDispose { initialAttachments.invalidate(); followupAttachments.invalidate() }
+    }
     if (!showConnectionGuide) {
         DiscussionHome(
             pool = pool,
+            initialAttachments = initialAttachments,
+            followupAttachments = followupAttachments,
             sessionController = sessionController,
             selectedServices = selectedServices,
             onSelectedServicesChange = onSelectedServicesChange,
@@ -481,6 +489,8 @@ private fun RoundtableRoot(
 @Composable
 private fun DiscussionHome(
     pool: ArenaWebViewPool,
+    initialAttachments: AttachmentDraft,
+    followupAttachments: AttachmentDraft,
     sessionController: ArenaSessionController,
     selectedServices: List<ArenaService>,
     onSelectedServicesChange: (List<ArenaService>) -> Unit,
@@ -521,6 +531,12 @@ private fun DiscussionHome(
     // 队长与总结深度的记忆：结果页「队长总结」用它记住上次的选择。
     val captainPreferences = remember(context) { ArenaCaptainPreferences(context) }
     var roundGuidance by guidanceDraft
+    fun chooseFiles(draft: AttachmentDraft) {
+        val retained = (initialAttachments.attachments + followupAttachments.attachments +
+            sessionController.lastRoundAttachments + sessionController.summary.attachments +
+            sessionController.history.flatMap { it.attachments }).map { it.id }.toSet()
+        draft.choose { callback -> pool.chooseAttachments(retained, callback) }
+    }
     val scope = rememberCoroutineScope()
     val loginNeededServices = selectedServices.filter {
         when (pool.statuses[it]?.state ?: ConnectionState.NOT_LOADED) {
@@ -567,6 +583,8 @@ private fun DiscussionHome(
         if (resetSucceeded) {
             question = ""
             roundGuidance = ""
+            initialAttachments.clear()
+            followupAttachments.clear()
         } else {
             scope.launch { snackbarHostState.showSnackbar(sessionController.storageWarning ?: "当前讨论未能保存，暂未开始新会话") }
         }
@@ -578,6 +596,8 @@ private fun DiscussionHome(
         if (outcome == RestoreOutcome.OK || outcome == RestoreOutcome.OK_AFTER_STOP) {
             question = sessionController.originalQuestion
             roundGuidance = ""
+            initialAttachments.clear()
+            followupAttachments.clear()
             onPageChange(RoundtablePage.HOME)
             onSelectedServicesChange(sessionController.sessionServices)
         }
@@ -668,6 +688,7 @@ private fun DiscussionHome(
 
             RoundtablePage.HOME -> if (sessionStage == SessionStage.IDLE) {
                 SimpleAskHome(
+                    attachmentDraft = initialAttachments, onChooseAttachments = { chooseFiles(initialAttachments) },
                     question = question, onQuestionChange = { question = it },
                     selectedServices = selectedServices, usableCount = usableCount,
                     pendingConnectionCount = selectedServices.count {
@@ -677,16 +698,17 @@ private fun DiscussionHome(
                     onConnections = onManageConnections, onOpenService = onOpenService, onNavigate = onPageChange,
                     lengthAdvisory = QuestionLengthPolicy.advisory(question, selectedServices), offline = offline,
                     crashNotice = unacknowledgedCrash, onCrashDismiss = onAcknowledgeCrash,
-                    onNeedQuestion = { scope.launch { snackbarHostState.showSnackbar("先写下问题") } },
+                    onNeedQuestion = { scope.launch { snackbarHostState.showSnackbar("先写下问题或添加附件") } },
                     onTooLong = { scope.launch { snackbarHostState.showSnackbar("问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字了") } },
                     onStart = {
-                        if (!sessionController.startInitial(question, selectedServices, AnswerMode.PARALLEL)) {
+                        if (!sessionController.startInitial(question, selectedServices, AnswerMode.PARALLEL, initialAttachments.attachments)) {
                             scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
-                        }
+                        } else initialAttachments.clear()
                     },
                 )
             } else {
                 SimpleRoundStage(
+                    attachmentDraft = followupAttachments, onChooseAttachments = { chooseFiles(followupAttachments) },
                     statuses = pool.statuses, sessionController = sessionController,
                     roundGuidance = roundGuidance, onRoundGuidanceChange = { roundGuidance = it },
                     onNewSession = { startFresh() }, onNavigate = onPageChange, onOpenService = onOpenService,
@@ -784,7 +806,7 @@ internal fun RunStatusPill(phase: ParticipantPhase) {
     val colors = ArenaStyle.colors
     val (background, foreground, label) = when (phase) {
         ParticipantPhase.IDLE -> Triple(colors.surfaceAlt, colors.muted, "等待")
-        ParticipantPhase.QUEUED -> Triple(colors.accentSoft, colors.accent, "已排队")
+        ParticipantPhase.QUEUED -> Triple(colors.accentSoft, colors.accent, "准备中")
         ParticipantPhase.SENDING -> Triple(colors.accentSoft, colors.accent, "发送中")
         ParticipantPhase.WAITING -> Triple(colors.accentSoft, colors.accent, "等待回答")
         ParticipantPhase.STREAMING -> Triple(colors.accentSoft, colors.accent, "回答中")

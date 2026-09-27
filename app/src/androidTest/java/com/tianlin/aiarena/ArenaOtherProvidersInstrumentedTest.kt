@@ -23,6 +23,101 @@ class ArenaOtherProvidersInstrumentedTest {
 
     private val qwenFailure = "<div data-chat-answers-wrap='turn' style='width:300px'><div class='retry-container-mobile' style='min-height:30px'>消息生成失败，请重试</div></div>"
 
+    @Test fun qwenSameTextAttachmentFollowupBindsOnlyItsNewTextCard() {
+        for (kind in listOf("image/url", "file/url")) page { view ->
+            val service = ArenaService.QWEN
+            val cards = "<div class='message-card-wrap question' data-mt='$kind'><img alt='file'></div>".repeat(2)
+            val text = user(service, "unused").replace(" data-message-id='unused'", "")
+            html(view, cards + text + answer(service, "OLD ANSWER"))
+            prepare(view, service)
+            assertEquals("1", js(view, "window.__aiArenaRequests['$request'].userBaseline"))
+            assertEquals("1", js(view, "window.__aiArenaRequests['$request'].beforeUserTexts.length"))
+            submit(view, service)
+            js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(cards + text + answer(service, "NEW ANSWER"))});true")
+            assertEquals("A multi-card upload still adds exactly one question", "true", bind(view, service))
+            assertEquals("NEW ANSWER", response(view, service).getString("text"))
+            assertEquals("1", js(view, "document.querySelectorAll('[data-ai-arena-request=\"$request\"]').length"))
+            assertEquals("true", js(view, "!!document.querySelector('[data-ai-arena-request=\"$request\"] .question-text-card')"))
+        }
+    }
+
+    @Test fun qwenAttachmentOnlyAndRemountedOldTextCannotAcknowledgeFollowup() = page { view ->
+        val service = ArenaService.QWEN
+        val text = user(service, "unused").replace(" data-message-id='unused'", "")
+        html(view, text + answer(service, "OLD ANSWER"))
+        prepare(view, service)
+        submit(view, service)
+        val file = "<div class='message-card-wrap question' data-mt='file/url'>current question</div>"
+        js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(file)});true")
+        assertEquals("false", bind(view, service))
+        assertFalse(response(view, service).getBoolean("found"))
+        js(view, "document.body.innerHTML=document.body.innerHTML;true")
+        assertEquals("Old matching text remount is not a new question", "false", bind(view, service))
+        assertFalse(response(view, service).getBoolean("found"))
+    }
+
+    @Test fun qwenAnswerStopsAtNextAttachmentOnlyQuestion() = page { view ->
+        val service = ArenaService.QWEN
+        prepare(view, service)
+        html(view, user(service, "ours") + answer(service, "OWN ANSWER"))
+        submit(view, service)
+        assertEquals("true", bind(view, service))
+        val next = "<div class='message-card-wrap question' data-mt='image/url'><img alt='next'></div>"
+        js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(next + answer(service, "WRONG ANSWER"))});true")
+        assertEquals("OWN ANSWER", response(view, service).getString("text"))
+    }
+
+    @Test fun yuanbaoLateSendControlWaitsWithoutEnterAndSubmitsOnlyOnce() {
+        for (absent in listOf(false, true)) withPool(ArenaService.YUANBAO, wrongReceipt = false, formalIdDelayMillis = 4000) { pool, view ->
+            js(view, "window.savedSend=document.getElementById('yuanbao-send-btn');savedSend.disabled=true;window.enterCount=0;document.querySelector('textarea').addEventListener('keydown',e=>{if(e.key==='Enter')enterCount++;});${if (absent) "savedSend.remove();" else ""}true")
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) { outcome.set(it); done.countDown() } }
+            waitForYuanbaoInput(view)
+            Thread.sleep(2200)
+            assertEquals("No early Enter fallback", "0", js(view, "enterCount"))
+            assertEquals("0", js(view, "sendCount"))
+            assertEquals("false", js(view, "!!window.__aiArenaSendClicks?.['$request']"))
+            js(view, "document.querySelector('[data-new-input-card]').appendChild(savedSend);savedSend.disabled=false;true")
+            assertTrue("Late enabled control must still receive the single submission", done.await(9, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            Thread.sleep(600)
+            assertEquals("1", js(view, "sendCount"))
+            assertEquals("1", js(view, "inputCount"))
+        }
+    }
+
+    @Test fun yuanbaoLateReadinessCannotOutliveItsOwnerInputPageOrDeadline() {
+        for (change in listOf("cancel", "deadline", "input", "owner", "page", "draft", "ambiguous")) {
+            withPool(ArenaService.YUANBAO, wrongReceipt = false) { pool, view ->
+                js(view, "document.getElementById('yuanbao-send-btn').disabled=true;true")
+                instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) {} }
+                waitForYuanbaoInput(view)
+                Thread.sleep(1800)
+                when (change) {
+                    "cancel" -> instrumentation.runOnMainSync { pool.cancelAutomation(ArenaService.YUANBAO) }
+                    "deadline" -> js(view, "window.futureNow=Date.now()+120000;Date.now=()=>futureNow;true")
+                    "input" -> js(view, "const n=document.querySelector('textarea'),copy=n.cloneNode(true);copy.value=n.value;n.replaceWith(copy);true")
+                    "owner" -> js(view, "window.__aiArenaRequests['$request']={...window.__aiArenaRequests['$request']};true")
+                    "page" -> js(view, "history.replaceState(null,'','/another-conversation');true")
+                    "draft" -> js(view, "document.querySelector('textarea').value='user changed the draft';true")
+                    "ambiguous" -> js(view, "document.querySelector('[data-new-input-card]').appendChild(document.getElementById('yuanbao-send-btn').cloneNode(true));true")
+                }
+                js(view, "document.querySelectorAll('#yuanbao-send-btn').forEach(n=>n.disabled=false);true")
+                Thread.sleep(700)
+                assertEquals(change, "0", js(view, "sendCount"))
+                assertEquals(change, "1", js(view, "inputCount"))
+                assertEquals(change, if (change == "draft") "user changed the draft" else "current question", js(view, "document.querySelector('textarea').value"))
+            }
+        }
+    }
+
+    private fun waitForYuanbaoInput(view: WebView) {
+        val deadline = System.currentTimeMillis() + 8000
+        while (js(view, "inputCount") != "1" && System.currentTimeMillis() < deadline) Thread.sleep(50)
+        assertEquals("1", js(view, "inputCount"))
+    }
+
     @Test fun yuanbaoPreexistingTemporaryMessageCannotBecomeThisRequestsReceipt() {
         listOf(false, true).forEach { remount -> page { view ->
             val service = ArenaService.YUANBAO
@@ -697,7 +792,7 @@ class ArenaOtherProvidersInstrumentedTest {
     }
 
     private fun user(service: ArenaService, id: String, text: String = "current question") = when (service) {
-        ArenaService.QWEN -> "<div class='message-card-wrap question' data-message-id='$id'>$text</div>"
+        ArenaService.QWEN -> "<div class='message-card-wrap question' data-mt='text/plain' data-message-id='$id'><div class='question-text-card'>$text</div></div>"
         ArenaService.YUANBAO -> "<div class='agent-chat__list__item--human' data-message-id='$id'>$text</div>"
         ArenaService.ZHIPU -> "<div class='conversation question' data-message-id='$id'>$text</div>"
         ArenaService.CLAUDE -> "<div data-testid='user-message' data-message-id='$id'>$text</div>"
@@ -751,8 +846,9 @@ class ArenaOtherProvidersInstrumentedTest {
                 view.stopLoading()
                 val fixtureUrl = if (service == ArenaService.YUANBAO) "https://yuanbao.tencent.com/chat/naQivTmsDa/existing" else service.url
                 view.loadDataWithBaseURL(fixtureUrl, """
-                    <html><body><textarea id='prompt-textarea'></textarea>
+                    <html><body><div data-new-input-card><textarea id='prompt-textarea'></textarea>
                     <button id='yuanbao-send-btn' class='button-right-inner send-button' aria-label='Send message'>Send</button>
+                    </div>
                     <script>
                     window.sendCount=0;window.inputCount=0;
                     ${if (initiallyHidden) "window.fakeVisibility='hidden';Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});" else ""}

@@ -183,7 +183,9 @@ internal object ArenaAttachmentScript {
                 const surfaces=Array.from(document.querySelectorAll('.guidance-input-surface')).filter(e=>visible(e)&&e.querySelector('textarea,[contenteditable=true]')&&e.querySelector('input[type=file]'));
                 const scope=surfaces.length===1?surfaces[0]:document;
                 if(surfaces.length===1){
-                  const triggers=Array.from(scope.querySelectorAll('.guidance-input-actions button[data-slot=dropdown-menu-trigger][aria-haspopup=menu]')).filter(e=>visible(e)&&e.id&&e.querySelector('button[data-dbx-name=button][aria-haspopup=menu]'));
+                  // The 2026-09-26 composer uses a DIV Radix trigger around the same
+                  // local upload button; keep the linked-menu and uniqueness checks.
+                  const triggers=Array.from(scope.querySelectorAll('.guidance-input-actions :is(button,div)[data-slot=dropdown-menu-trigger][aria-haspopup=menu]')).filter(e=>visible(e)&&e.id&&e.querySelector('button[data-dbx-name=button][aria-haspopup=menu]'));
                   if(triggers.length===1){
                     const trigger=triggers[0];
                     const inner=Array.from(trigger.querySelectorAll('button[data-dbx-name=button][aria-haspopup=menu]'));

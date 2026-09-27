@@ -445,9 +445,13 @@ class ArenaSessionControllerInstrumentedTest {
             onMain { assertTrue(controller.retrySend(ArenaService.DEEPSEEK)) }
             Thread.sleep(750)
             onMain {
-                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals(ParticipantPhase.QUEUED, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                val progress = controller.waitingProgress(ArenaService.DEEPSEEK, android.os.SystemClock.elapsedRealtime())!!
+                assertEquals("准备新对话", progress.title)
+                assertFalse(progress.limit, progress.limit.contains("已到"))
                 assertFalse(gateway.sentServices.contains(ArenaService.DEEPSEEK))
                 gateway.completeFresh(ArenaService.DEEPSEEK, true)
+                assertEquals(ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
             }
             Thread.sleep(250)
             onMain { gateway.completeSend(ArenaService.DEEPSEEK) }

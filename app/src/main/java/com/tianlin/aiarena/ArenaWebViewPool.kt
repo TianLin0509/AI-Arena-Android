@@ -32,6 +32,8 @@ import java.io.File
 import java.util.concurrent.Executors
 
 class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
+    fun chooseAttachments(retainedIds: Set<String>, callback: (Result<List<ArenaAttachment>>) -> Unit) =
+        activity.chooseAttachments(retainedIds, callback)
     val statuses = mutableStateMapOf<ArenaService, ServiceStatus>().apply {
         ArenaService.entries.forEach { service -> put(service, ServiceStatus()) }
     }
@@ -59,7 +61,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val explicitLoginProbeCounts = mutableMapOf<ArenaService, Int>()
     private var uiSelectedService: ArenaService? = null
     private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit, val strictReceipt: Boolean = false) {
+        var progressDescription: String = "等待网页输入框就绪"
         var deadlineWallMillis: Long = 0L
+        var deadlineElapsedMillis: Long = 0L
         var watchdog: Runnable? = null
         var parked = false
         var sending = false
@@ -68,6 +72,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         var timeoutDetail: String? = null
     }
     private val automations = mutableMapOf<ArenaService, Automation>()
+    override fun sendProgress(service: ArenaService, requestId: String): ArenaSendProgress? =
+        automations[service]?.takeIf { it.requestId == requestId }?.let { ArenaSendProgress(requestId, it.progressDescription) }
     private val serviceEpochs = mutableMapOf<ArenaService, Long>()
     private var cancellationEpoch = 0L
     private val fileBroker = ArenaFileChooserBroker(activity)
@@ -542,7 +548,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             service = service,
             requestId = requestId,
             timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
-            strictReceipt = attachmentFiles.isEmpty() && ArenaWebMessageIdentity.supported(service),
+            strictReceipt = ArenaWebMessageIdentity.supported(service),
             onTimeout = {
                 callback(SendOutcome(false, requestId, "${service.displayName} 网页发送超时，请检查原网页后重试"))
             },
@@ -556,7 +562,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     finishSend(service, SendOutcome(false, requestId, "${service.displayName} 登录状态尚未确认，请打开原网页检查"), callback)
                     return
                 }
-                webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, if (token?.strictReceipt == true) fullPrompt else "", legacyAttachment = attachmentFiles.isNotEmpty())) { raw ->
+                webView.evaluateJavascript(ArenaWebCursorScript.prepare(service, requestId, if (token?.strictReceipt == true) fullPrompt else "")) { raw ->
                     if (!isCurrent(service, token)) return@evaluateJavascript
                     if (service == ArenaService.YUANBAO && token?.strictReceipt == true &&
                         runCatching { JSONObject(decodeJsValue(raw)).optBoolean("yuanbaoUnstableBaseline") }.getOrDefault(false)) {
@@ -565,7 +571,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     }
                     if (attachmentFiles.isEmpty()) sendStandard(webView, service, fullPrompt, requestId, callback)
                     else ArenaAttachmentTransport(handler, fileBroker) { action -> withFocus(service, requestId, action) }
-                        .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) }) { error ->
+                        .upload(webView, service, requestId, attachmentFiles, { isCurrent(service, token) },
+                            onProgress = { description -> if (isCurrent(service, token)) token?.progressDescription = description }) { error ->
                         if (!isCurrent(service, token)) return@upload
                         if (error != null) finishSend(service, SendOutcome(false, requestId, error), callback)
                         else sendStandard(webView, service, fullPrompt, requestId, callback, nativeAttachmentSend = service == ArenaService.DOUBAO)
@@ -684,6 +691,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val webView = ensureWebView(service) ?: return onTimeout()
         val token = Automation(requestId, onTimeout, onInterrupted, strictReceipt)
         token.deadlineWallMillis = System.currentTimeMillis() + timeoutMillis
+        token.deadlineElapsedMillis = SystemClock.elapsedRealtime() + timeoutMillis
         automations[service] = token
         val watchdog = Runnable {
             if (!isCurrent(service, token)) return@Runnable
@@ -871,6 +879,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
         val token = automations[service]
         var scriptCallbackConsumed = false
+        token?.progressDescription = "等待输入操作，其他成员同时进行"
         val scriptCallbackTimeout = Runnable {
             if (!isCurrent(service, token)) return@Runnable
             if (scriptCallbackConsumed) return@Runnable
@@ -878,6 +887,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             finishSend(service, SendOutcome(false, requestId, "网页发送脚本响应超时"), callback)
         }
         withFocus(service, requestId) { release ->
+            token?.progressDescription = "正在填写问题"
             if (token?.strictReceipt != true) handler.postDelayed(scriptCallbackTimeout, SEND_SCRIPT_CALLBACK_TIMEOUT_MS)
             token?.sending = true
             webView.evaluateJavascript(sendScript(service, ArenaJs.quote(fullPrompt), requestId)) { raw ->
@@ -894,6 +904,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     finishSend(service, SendOutcome(false, requestId, result.ifBlank { "注入失败" }), callback)
                     return@evaluateJavascript
                 }
+                token?.progressDescription = "等待官网确认收到问题"
                 if (service == ArenaService.DOUBAO) {
                     // Doubao's current mobile web build accepts the same programmatic click
                     // once the host WebView is no longer the front automation surface. It stays
@@ -903,10 +914,27 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     verifyDoubaoSend(webView, requestId, callback)
                     return@evaluateJavascript
                 }
+                if (token?.strictReceipt == true) handler.postDelayed({
+                    verifyEarlyReceipt(webView, service, requestId, callback)
+                }, 500L)
                 handler.postDelayed({
                     if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback)
                 }, 2_500L)
             }
+        }
+    }
+
+    /** Read-only fast path: never click, never shorten the existing failure deadline. */
+    private fun verifyEarlyReceipt(webView: WebView, service: ArenaService, requestId: String,
+                                   callback: (SendOutcome) -> Unit, remaining: Int = 4) {
+        val token = automations[service]?.takeIf { it.requestId == requestId } ?: return
+        if (!isCurrent(service, token) || !token.strictReceipt) return
+        webView.evaluateJavascript(verifySendScript(service, requestId)) { raw ->
+            if (!isCurrent(service, token)) return@evaluateJavascript
+            if (raw == "true") finishSuccessfulSend(webView, service, requestId, callback)
+            else if (remaining > 1) handler.postDelayed({
+                if (isCurrent(service, token)) verifyEarlyReceipt(webView, service, requestId, callback, remaining - 1)
+            }, 500L)
         }
     }
 
@@ -1012,6 +1040,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private fun sendDoubaoAttachmentNative(webView: WebView, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
         val service = ArenaService.DOUBAO
         val token = automations[service] ?: return
+        token.progressDescription = "正在填写问题"
         val origin = webView.url
         val generation = fileBroker.generation(webView)
         var issued = false
@@ -1033,6 +1062,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             }
         }
         fun awaitClick(release: () -> Unit) {
+            token.progressDescription = "等待官网确认收到问题"
             var settled = false
             lateinit var timeout: Runnable
             fun settle() {
@@ -1041,8 +1071,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 handler.removeCallbacks(timeout)
                 release()
                 if (current()) {
-                    val deadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
-                    handler.postDelayed({ fail("豆包发送确认响应超时，请查看原网页；未重复点击发送") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
+                    // Uploaded-image replies can expose their official message metadata late.
+                    // Use the existing request watchdog, exactly as strict text sends do;
+                    // acknowledgement polling never takes focus or clicks a second time.
+                    val deadline = if (token.strictReceipt) token.deadlineElapsedMillis
+                        else SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                    token.timeoutDetail = DOUBAO_UNCONFIRMED_DETAIL
+                    if (!token.strictReceipt) handler.postDelayed({ fail("豆包发送确认响应超时，请查看原网页；未重复点击发送") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                     verify(deadline)
                 }
             }
@@ -1131,6 +1166,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 val result = decodeJsValue(raw)
                 if (!result.startsWith("sent")) return@evaluateJavascript fail(result.ifBlank { "豆包正文注入失败，未发送问题" })
                 preparationDeadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                token.progressDescription = "等待官网发送按钮就绪"
                 handler.postDelayed({ if (!issued) fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                 handler.postDelayed({ prepareTouch() }, 220L)
             }
@@ -1139,6 +1175,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun nativeDoubaoSetupScript(requestId: String, prompt: String): String = """
         (()=>{
+          ${ArenaWebCursorScript.stateBootstrap(requestId)}
           ${sendControlHelperScript()}
           const previous=window.__aiArenaNativeSend;if(previous?.cleanup)previous.cleanup();
           window.__aiArenaNativeSendRequests=window.__aiArenaNativeSendRequests||{};
@@ -1173,6 +1210,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             window.__aiArenaSendClicks=window.__aiArenaSendClicks||{};
             if(window.__aiArenaSendClicks[native.id]){e.preventDefault();e.stopImmediatePropagation();return;}
             window.__aiArenaSendClicks[native.id]=Date.now();
+            state.submittedAt=Date.now();
+            try { sessionStorage.setItem(cursorKey,JSON.stringify(state)); } catch (_) {}
             setTimeout(()=>{if(alive())native.completed=true;},0);
           };
           native.cleanup=()=>{document.removeEventListener('pointerdown',native.pointer,true);document.removeEventListener('pointerup',native.pointer,true);document.removeEventListener('click',native.click,true);};
@@ -1829,6 +1868,40 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
         val scheduleClicks = if (service == ArenaService.ZHIPU || !scheduleSubmit) {
             ""
+        } else if (service == ArenaService.YUANBAO && automations[service] != null) {
+            """
+                // Wait for this composer's FIRST send control, within the existing watchdog.
+                // Never rewrite/refocus the draft, fall back to Enter, or retry a claimed click.
+                const readyDeadline = ${automations[service]?.deadlineWallMillis ?: 0L};
+                const readyUrl = location.href;
+                const composer = input.closest('[data-new-input-card]');
+                const visibleMatches = (root, selectors) => Array.from(new Set(selectors.flatMap(selector =>
+                  Array.from(root.querySelectorAll(selector))))).filter(node => {
+                    const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+                  });
+                const awaitFirstSend = function() {
+                  if (cancelled() || Date.now() >= readyDeadline || location.href !== readyUrl ||
+                      window.__aiArenaRequests?.[requestId] !== state || !arenaRequestScopeValid()) return;
+                  if (state.submittedAt || window.__aiArenaSendClicks?.[requestId] ||
+                      window.__aiArenaNativeSendRequests?.[requestId] || $conversationAdvanced) return;
+                  if (!input.isConnected || !composer?.isConnected || input.closest('[data-new-input-card]') !== composer) return;
+                  const inputs = visibleMatches(document, $inputSelectors);
+                  const composers = visibleMatches(document, ['[data-new-input-card]']);
+                  if (inputs.length !== 1 || inputs[0] !== input || composers.length !== 1 || composers[0] !== composer) return;
+                  const current = arenaNormalize(currentInputText());
+                  if (current && current !== (state.expectedPrompt || arenaNormalize(text))) return;
+                  const controls = visibleMatches(composer, $sendSelectors);
+                  if (controls.length > 1) return;
+                  if (current && document.visibilityState === 'visible' && controls.length === 1 && arenaSendEnabled(controls[0])) {
+                    arenaRecordSubmission();
+                    controls[0].click();
+                    return;
+                  }
+                  setTimeout(awaitFirstSend, 250);
+                };
+                if (!delayedInput) setTimeout(awaitFirstSend, $firstClickDelayMs);
+            """.trimIndent()
         } else {
             """
                 if (!delayedInput) {

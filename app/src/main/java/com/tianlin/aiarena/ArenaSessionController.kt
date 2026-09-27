@@ -27,10 +27,25 @@ class ArenaSessionController(
     private val pool: ArenaGateway,
     private val timing: ControllerTiming = ControllerTiming(),
     private val sessionRepository: ArenaSessionRepository? = null,
+    private val progressTracker: ArenaProgressTracker = ArenaProgressTracker(),
 ) {
-    val runs = mutableStateMapOf<ArenaService, ParticipantRun>().apply {
+    private val runStates = mutableStateMapOf<ArenaService, ParticipantRun>().apply {
         ArenaService.entries.forEach { service -> put(service, ParticipantRun()) }
     }
+    val runs: MutableMap<ArenaService, ParticipantRun> = object : MutableMap<ArenaService, ParticipantRun> by runStates {
+        override fun put(key: ArenaService, value: ParticipantRun): ParticipantRun? {
+            progressTracker.observe(key, value, SystemClock.elapsedRealtime(), lastRoundAttachments.isNotEmpty())
+            return runStates.put(key, value)
+        }
+    }
+
+    fun waitingProgress(service: ArenaService, nowElapsedMillis: Long): ArenaWaitProgress? =
+        runs[service]?.let { run ->
+            val answerStarted = recoveryExecution?.takeIf { it.service == service && it.requestId == run.requestId }?.startedAtElapsedMillis
+                ?: pollStates[service]?.takeIf { it.requestId == run.requestId }?.startedAtElapsedMillis
+            progressTracker.describe(service, run, nowElapsedMillis, timing, pool.sendProgress(service, run.requestId),
+                answerStarted?.plus(timing.responseTimeoutMillis))
+        }
     val history = mutableStateListOf<RoundRecord>()
     val recentSessions = mutableStateListOf<RecentArenaSession>()
 
@@ -56,8 +71,20 @@ class ArenaSessionController(
     var roundNumber by mutableIntStateOf(0)
         private set
 
-    var summary by mutableStateOf(DiscussionSummary())
-        private set
+    private val summaryState = mutableStateOf(DiscussionSummary())
+    var summary: DiscussionSummary
+        get() = summaryState.value
+        private set(value) {
+            value.judge?.let { judge -> progressTracker.observe(judge, value.progressRun(), SystemClock.elapsedRealtime(), value.attachments.isNotEmpty()) }
+            summaryState.value = value
+        }
+
+    private fun DiscussionSummary.progressRun() = ParticipantRun(phase = phase, requestId = requestId, response = text, detail = detail)
+
+    fun summaryWaitingProgress(nowElapsedMillis: Long): ArenaWaitProgress? = summary.judge?.let { judge ->
+        progressTracker.describe(judge, summary.progressRun(), nowElapsedMillis, timing, pool.sendProgress(judge, summary.requestId),
+            summaryExecution?.takeIf { it.requestId == summary.requestId }?.startedAtElapsedMillis?.plus(timing.responseTimeoutMillis))
+    }
 
     var sessionServices by mutableStateOf(ArenaService.defaultMembers)
         private set
@@ -562,6 +589,7 @@ class ArenaSessionController(
             startedAtMillis = System.currentTimeMillis(),
             requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
         )
+        lastRoundAttachments = attachments.toList()
         // 所有参与者立即有请求号和准备状态；并行发送不等其他成员的发送回调。
         ArenaService.entries.forEach { service ->
             runs[service] = if (service in services) {
@@ -574,7 +602,6 @@ class ArenaSessionController(
                 ParticipantRun(ParticipantPhase.IDLE, detail = "本轮未参与")
             }
         }
-        lastRoundAttachments = attachments.toList()
         lastRoundPrompts = prompts.mapValues { (_, prompt) -> prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS) }
         activeExecution = execution
         pool.setProtectedServices(services.toSet())
@@ -667,7 +694,7 @@ class ArenaSessionController(
         )
         recoveryExecution = execution
         runs[service] = previous.copy(
-            phase = if (resend) ParticipantPhase.SENDING else ParticipantPhase.WAITING,
+            phase = if (!resend) ParticipantPhase.WAITING else if (currentRoundKind == RoundKind.INITIAL) ParticipantPhase.QUEUED else ParticipantPhase.SENDING,
             requestId = requestId,
             response = if (resend) "" else previous.response,
             detail = if (resend) "正在重发" else "正在重新提取",
@@ -692,6 +719,7 @@ class ArenaSessionController(
         }
         val send = send@{
             if (sendSettled || !isRecoveryActive(execution)) return@send
+            runs[service] = runs.getValue(service).copy(phase = ParticipantPhase.SENDING, detail = "正在重发")
             handler.postDelayed(sendTimeout, if (lastRoundAttachments.isEmpty()) timing.sendTimeoutMillis else timing.attachmentSendTimeoutMillis)
             pool.sendPromptWithAttachments(service, prompt.orEmpty(), requestId, lastRoundAttachments) { outcome ->
                 if (sendSettled || !isRecoveryActive(execution)) return@sendPromptWithAttachments
@@ -1486,7 +1514,7 @@ class ArenaSessionController(
         val attachments: List<ArenaAttachment>,
         val guidance: String,
         val startedAtMillis: Long,
-        /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示"已排队"。 */
+        /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示准备进度。 */
         val requestIds: Map<ArenaService, String>,
         val freshReadiness: MutableMap<ArenaService, Boolean> = mutableMapOf(),
         val dispatchedServices: MutableSet<ArenaService> = mutableSetOf(),

@@ -24,6 +24,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import android.os.SystemClock
 
 /** A compact header shared by the question and answer pages. */
 @Composable
@@ -70,6 +72,8 @@ internal fun SimpleComposer(
     text: String, onChange: (String) -> Unit, hint: String, scope: String,
     enabled: Boolean, busy: Boolean = false, onSend: () -> Unit,
     onStop: () -> Unit = {}, onDiscuss: (() -> Unit)? = null, onSummary: (() -> Unit)? = null,
+    attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
+    attachmentNotice: String? = null,
 ) {
     var more by remember { mutableStateOf(false) }
     val colors = ArenaStyle.colors
@@ -77,6 +81,23 @@ internal fun SimpleComposer(
         Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
             color = colors.card, shape = RoundedCornerShape(18.dp)) {
             Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                if (attachmentDraft != null && attachmentDraft.attachments.isNotEmpty()) {
+                    Column(Modifier.fillMaxWidth().heightIn(max = 140.dp).verticalScroll(rememberScrollState())) {
+                        attachmentDraft.attachments.forEach { file ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(file.name, Modifier.weight(1f).padding(start = 10.dp), maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                                SimpleIcon(R.drawable.ic_close, "移除附件 ${file.name}", { attachmentDraft.remove(file.id) },
+                                    enabled = enabled && !busy && !attachmentDraft.picking)
+                            }
+                        }
+                    }
+                    Text(attachmentNotice ?: "文件将自动发给本轮成员；各家确认附件就绪后再提问。",
+                        Modifier.padding(horizontal = 10.dp).testTag("attachment-member-notice"),
+                        style = MaterialTheme.typography.labelSmall, color = if (attachmentNotice == null) colors.muted else colors.warning)
+                }
+                attachmentDraft?.error?.let { SimpleNotice(it) }
+                if (attachmentDraft?.picking == true) Text("正在添加附件…", Modifier.padding(10.dp), style = MaterialTheme.typography.labelSmall)
                 TextField(value = text, onValueChange = onChange, placeholder = { Text(hint) },
                     modifier = Modifier.fillMaxWidth().testTag("simple-composer"), minLines = 1, maxLines = 3,
                     textStyle = MaterialTheme.typography.bodyMedium,
@@ -84,16 +105,18 @@ internal fun SimpleComposer(
                         focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
                         unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent))
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    if (onChooseAttachments != null) SimpleIcon(R.drawable.ic_add, "添加照片或文件", onChooseAttachments,
+                        Modifier.testTag("choose-attachments"), enabled = enabled && !busy && attachmentDraft?.picking != true)
                     Text(scope, Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
                     if (onDiscuss != null) Box {
                         SimpleIcon(R.drawable.ic_more, "更多讨论方式", { more = true })
                         DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
-                            DropdownMenuItem(text = { Text("让 AI 互相讨论") }, enabled = enabled && !busy,
+                            DropdownMenuItem(text = { Text("让 AI 互相讨论") }, enabled = enabled && !busy && attachmentDraft?.picking != true,
                                 onClick = { more = false; onDiscuss() })
                             if (onSummary != null) DropdownMenuItem(text = { Text("综合一下") }, onClick = { more = false; onSummary() })
                         }
                     }
-                    IconButton(onClick = if (busy) onStop else onSend, enabled = busy || enabled,
+                    IconButton(onClick = if (busy) onStop else onSend, enabled = busy || (enabled && attachmentDraft?.picking != true),
                         modifier = Modifier.size(48.dp).testTag("simple-send")
                             .semantics { contentDescription = if (busy) "停止等待" else "发送问题" }) {
                         Box(Modifier.size(34.dp).background(if (busy || enabled) colors.accent else colors.surfaceAlt, CircleShape), contentAlignment = Alignment.Center) {
@@ -114,10 +137,11 @@ internal fun SimpleAskHome(
     onNavigate: (RoundtablePage) -> Unit, onStart: () -> Unit, onNeedQuestion: () -> Unit, onTooLong: () -> Unit,
     lengthAdvisory: String?, offline: Boolean, crashNotice: ArenaCrashReport?, onCrashDismiss: () -> Unit,
     pendingConnectionCount: Int = 0,
+    attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
     Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
-        SimpleHeader(false, { onQuestionChange("") }, onNavigate)
+        SimpleHeader(false, { onQuestionChange(""); attachmentDraft?.clear() }, onNavigate)
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             if (offline) SimpleNotice("网络未连接，请检查 Wi-Fi 或手机流量。")
@@ -143,12 +167,13 @@ internal fun SimpleAskHome(
         SimpleComposer(question, onQuestionChange, "问一个问题…", selectedServices.joinToString(" · ") { it.shortName }, true,
             onSend = {
                 when {
-                    question.isBlank() -> onNeedQuestion()
+                    question.isBlank() && attachmentDraft?.attachments.isNullOrEmpty() -> onNeedQuestion()
                     question.length > ArenaLimits.MAX_QUESTION_CHARS -> onTooLong()
                     usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS -> onConnections()
                     else -> onStart()
                 }
-            })
+            }, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
+            attachmentNotice = ArenaAttachmentSupport.notice(selectedServices, attachmentDraft?.attachments.orEmpty()))
     }
 }
 
@@ -233,6 +258,7 @@ internal fun SimpleRoundStage(
     onNavigate: (RoundtablePage) -> Unit, onOpenService: (ArenaService) -> Unit,
     snackbarHostState: SnackbarHostState, copyText: TextCopyRequest?, shareText: TextShareRequest?,
     offline: Boolean, captainPreferences: ArenaCaptainPreferences,
+    attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
     val members = sessionController.sessionServices
@@ -258,19 +284,27 @@ internal fun SimpleRoundStage(
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 item("question") {
                     Surface(Modifier.fillMaxWidth().padding(start = 20.dp), color = colors.card, shape = RoundedCornerShape(14.dp)) {
-                        SelectionContainer {
-                            Text(if (current == "summary") "讨论主题：${sessionController.originalQuestion}" else currentQuestion,
-                                Modifier.padding(13.dp).testTag("current-question"), style = MaterialTheme.typography.bodyMedium)
+                        Column(Modifier.padding(13.dp)) {
+                            SelectionContainer {
+                                Text(if (current == "summary") "讨论主题：${sessionController.originalQuestion}" else currentQuestion,
+                                    Modifier.testTag("current-question"), style = MaterialTheme.typography.bodyMedium)
+                            }
+                            val files = if (current == "summary") sessionController.summary.attachments else sessionController.lastRoundAttachments
+                            if (files.isNotEmpty()) Text("本轮附件：${files.joinToString("、") { it.name }}",
+                                Modifier.padding(top = 6.dp).testTag("round-attachment-names"),
+                                style = MaterialTheme.typography.labelSmall, color = colors.muted)
                         }
                     }
                 }
                 if (current == "summary") item("summary") {
                     SimpleSummary(sessionController, members, captainPreferences, ready, roundGuidance,
-                        onStarted = { onRoundGuidanceChange("") }, onOpenService, copyText, shareText, snackbarHostState)
+                        onStarted = { onRoundGuidanceChange(""); attachmentDraft?.clear() }, onOpenService, copyText, shareText, snackbarHostState,
+                        attachments = attachmentDraft?.attachments.orEmpty(), pickingAttachments = attachmentDraft?.picking == true)
                 } else item("answer") {
                     val service = members.first { it.name == current }
                     val run = sessionController.runs[service] ?: ParticipantRun()
                     Column {
+                        SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) })
                         SimpleAnswer(service, run, statuses[service] ?: ServiceStatus(), { onOpenService(service) },
                             onCopy = copyText?.let { copy -> { scope.launch {
                                 val prepared = ShareTextPolicy.discussionSummary(currentQuestion, run.response)
@@ -283,11 +317,7 @@ internal fun SimpleRoundStage(
                                 else if (prepared.truncated) snackbarHostState.showSnackbar("回答过长，已截取后分享")
                             }; Unit } }, busy = busy,
                             onReextract = { notifyFailure(sessionController.retryExtraction(service)) },
-                            onResend = {
-                                if (sessionController.lastRoundAttachments.isNotEmpty()) scope.launch {
-                                    snackbarHostState.showSnackbar("这条历史包含附件，请在原网页手动上传并发送。圆桌不会自动重传。")
-                                } else notifyFailure(sessionController.retrySend(service))
-                            }, onSummary = summarize)
+                            onResend = { notifyFailure(sessionController.retrySend(service)) }, onSummary = summarize)
                     }
                 }
             }
@@ -295,17 +325,48 @@ internal fun SimpleRoundStage(
         SimpleComposer(roundGuidance, onRoundGuidanceChange, "继续追问…",
             "发给本轮成功的 ${sessionController.completedCount} 家 AI", ready, busy,
             onSend = {
-                if (roundGuidance.isBlank()) scope.launch { snackbarHostState.showSnackbar("先写下想追问的内容") }
-                else if (sessionController.startIteration(AnswerMode.PARALLEL, roundGuidance)) onRoundGuidanceChange("")
+                if (roundGuidance.isBlank() && attachmentDraft?.attachments.isNullOrEmpty()) scope.launch { snackbarHostState.showSnackbar("先写下想追问的内容或添加附件") }
+                else if (sessionController.startIteration(AnswerMode.PARALLEL, roundGuidance, attachmentDraft?.attachments.orEmpty())) {
+                    onRoundGuidanceChange(""); attachmentDraft?.clear()
+                }
                 else notifyFailure(false)
             }, onStop = sessionController::cancelCurrentRound,
             onDiscuss = {
                 if (roundGuidance.length > ArenaLimits.MAX_GUIDANCE_CHARS) scope.launch {
                     snackbarHostState.showSnackbar("本轮要求超过 ${ArenaLimits.MAX_GUIDANCE_CHARS} 字，请缩短后重试")
                 }
-                else if (sessionController.startDebate(AnswerMode.PARALLEL, roundGuidance)) onRoundGuidanceChange("")
+                else if (sessionController.startDebate(AnswerMode.PARALLEL, roundGuidance, attachmentDraft?.attachments.orEmpty())) {
+                    onRoundGuidanceChange(""); attachmentDraft?.clear()
+                }
                 else notifyFailure(false)
-            }, onSummary = summarize)
+            }, onSummary = summarize, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
+            attachmentNotice = ArenaAttachmentSupport.notice(members.filter { sessionController.runs[it]?.phase == ParticipantPhase.COMPLETE },
+                attachmentDraft?.attachments.orEmpty()))
+    }
+}
+
+@Composable
+private fun SimpleWaitProgress(controller: ArenaSessionController, service: ArenaService, run: ParticipantRun,
+                               onOpen: () -> Unit, summary: Boolean = false) {
+    val active = run.phase in setOf(ParticipantPhase.QUEUED, ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING)
+    var now by remember(run.requestId) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(run.requestId, active) {
+        while (active) { now = SystemClock.elapsedRealtime(); delay(1_000L) }
+    }
+    val progress = if (summary) controller.summaryWaitingProgress(now) else controller.waitingProgress(service, now)
+    if (!active || progress == null) return
+    val colors = ArenaStyle.colors
+    Surface(Modifier.fillMaxWidth().testTag("wait-progress-${service.name}"), color = colors.card, shape = RoundedCornerShape(12.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp)
+                Text(progress.title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
+                Text(progress.elapsed, style = MaterialTheme.typography.labelSmall)
+            }
+            Text(progress.expectation, style = MaterialTheme.typography.labelSmall, color = colors.muted)
+            Text(progress.limit, style = MaterialTheme.typography.labelSmall, color = colors.muted)
+            if (progress.needsAttention) TextButton(onClick = onOpen) { Text("等待较久，打开官网核对", style = MaterialTheme.typography.labelSmall) }
+        }
     }
 }
 
@@ -314,23 +375,32 @@ internal fun SimpleSummary(
     controller: ArenaSessionController, members: List<ArenaService>, preferences: ArenaCaptainPreferences,
     ready: Boolean, guidance: String, onStarted: () -> Unit, onOpen: (ArenaService) -> Unit,
     copy: TextCopyRequest?, share: TextShareRequest?, snackbar: SnackbarHostState,
+    attachments: List<ArenaAttachment> = emptyList(),
+    pickingAttachments: Boolean = false,
 ) {
     var captainName by rememberSaveable { mutableStateOf(preferences.loadCaptain()?.name) }
     var depthName by rememberSaveable { mutableStateOf(preferences.loadDepth().name) }
     var options by rememberSaveable { mutableStateOf(false) }
     val captain = CaptainPolicy.resolve(ArenaService.fromName(captainName), members)
     val depth = SummaryDepth.fromName(depthName)
+    val scope = rememberCoroutineScope()
     val summary = controller.summary
+    var confirmOriginalRetry by remember { mutableStateOf(false) }
+    if (confirmOriginalRetry) ConfirmDialog("按原内容重试综合？",
+        "将再次发送上次的完整问题和 ${summary.attachments.size} 个附件。请先打开原网页确认是否已经收到，避免重复发送。",
+        "确认重试", onConfirm = {
+            confirmOriginalRetry = false
+            if (!controller.retrySummary()) scope.launch { snackbar.showSnackbar(controller.sessionMessage) }
+        }, onDismiss = { confirmOriginalRetry = false })
     val nextJudge = CaptainPolicy.judgePreference(members, captain).firstOrNull {
         controller.runs[it]?.let { run -> run.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank() } == true
     }
-    val scope = rememberCoroutineScope()
     val start = {
         preferences.saveCaptain(captain); preferences.saveDepth(depth)
         if (guidance.length > ArenaLimits.MAX_GUIDANCE_CHARS) scope.launch {
             snackbar.showSnackbar("本轮要求超过 ${ArenaLimits.MAX_GUIDANCE_CHARS} 字，请缩短后重试")
         }
-        else if (controller.startSummary(CaptainPolicy.judgePreference(members, captain), guidance, depth)) onStarted()
+        else if (controller.startSummary(CaptainPolicy.judgePreference(members, captain), guidance, depth, attachments = attachments)) onStarted()
         else scope.launch { snackbar.showSnackbar(controller.sessionMessage) }
         Unit
     }
@@ -359,7 +429,17 @@ internal fun SimpleSummary(
             }
         }
         SimpleSummaryResult(summary, onOpen)
-        Button(onClick = start, enabled = ready) { Text(if (summary.phase == ParticipantPhase.IDLE) "生成综合答案" else "重新生成") }
+        if (summary.attachments.isNotEmpty()) {
+            Text("上次综合附件：${summary.attachments.joinToString("、") { it.name }}", style = MaterialTheme.typography.bodySmall)
+            if (attachments.isEmpty()) Text("按当前要求重新生成不会带上次附件；保留原附件请用“按原内容重试”。", style = MaterialTheme.typography.labelSmall)
+        }
+        if (summary.prompt.isNotBlank() && summary.attachments.isNotEmpty()) TextButton(
+            onClick = { confirmOriginalRetry = true }, enabled = ready && !pickingAttachments) { Text("按原内容重试") }
+        summary.judge?.let { judge -> SimpleWaitProgress(controller, judge,
+            ParticipantRun(phase = summary.phase, requestId = summary.requestId, detail = summary.detail), { onOpen(judge) }, summary = true) }
+        if (attachments.isNotEmpty()) Text("这次综合仅向 ${nextJudge?.shortName ?: "整理人"} 发送所选附件。" +
+            ArenaAttachmentSupport.notice(listOfNotNull(nextJudge), attachments).orEmpty(), style = MaterialTheme.typography.bodySmall)
+        Button(onClick = start, enabled = ready && !pickingAttachments) { Text(if (summary.phase == ParticipantPhase.IDLE) "生成综合答案" else "按当前要求重新生成") }
         if (!ready && !controller.isBusy) Text("至少两家回答完成后可生成。", style = MaterialTheme.typography.bodySmall)
         if (summary.text.isNotBlank()) Row {
             if (copy != null) TextButton(onClick = {
@@ -430,7 +510,7 @@ internal fun SimpleSettingsPage(
                 SimpleSettingRow("账号与登录", "", onConnections)
                 SimpleSettingRow("帮助与故障处理", "", { help = !help })
                 if (help) {
-                    Text("点击 AI 头像打开网页，可在网页里手动上传文件。文件只供那一家使用。", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
+                    Text("输入框旁的加号可添加照片或文件，自动发给本轮支持附件的 AI；不支持时会明确提示。网页里手动上传的文件只供那一家使用。", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
                     SimpleSettingRow("重新加载 AI 网页", "", onReloadPages)
                     SimpleSettingRow("清除卡住的讨论", "", { confirm = "清除卡住的讨论" })
                     if (onRestartApp != null) SimpleSettingRow("重启应用", "", { confirm = "重启应用" })

@@ -19,6 +19,7 @@ internal class ArenaAttachmentTransport(
         requestId: String,
         files: List<Pair<ArenaAttachment, File>>,
         isCurrent: () -> Boolean,
+        onProgress: (String) -> Unit = {},
         callback: (String?) -> Unit,
     ) {
         val originalUrl = webView.url
@@ -39,7 +40,10 @@ internal class ArenaAttachmentTransport(
         if (!ArenaFileChooserBroker.trusted(service, originalUrl)) return finish("网页已离开 ${service.displayName} 官网，未上传附件")
         fileBroker.prepare(webView, service, requestId, files) { error ->
             if (current()) {
-                if (error != null) finish(error) else delivered = true
+                if (error != null) finish(error) else {
+                    delivered = true
+                    onProgress("文件已交给官网，等待上传和解析")
+                }
             }
         }
         fun poll() {
@@ -151,6 +155,7 @@ internal class ArenaAttachmentTransport(
             if (delivered) inspect {} else withFocus(::inspect)
         }
         fun startUpload() {
+            onProgress("正在打开附件入口")
             webView.evaluateJavascript(ArenaAttachmentScript.prepare(requestId, files.map { it.first }, service)) { raw ->
                 if (current()) {
                     if (raw == "true") poll()
@@ -167,6 +172,7 @@ internal class ArenaAttachmentTransport(
         var cleanupRounds = 0
         var emptyReads = 0
         fun clearLeftovers() {
+            onProgress("检查附件草稿")
             if (!current()) return
             if (!sameDocument()) return finish("网页已切换，附件上传已取消，请重新发送")
             webView.evaluateJavascript(ArenaAttachmentScript.leftovers(service, remove = cleanupRounds < MAX_CLEANUP_ROUNDS)) { raw ->
