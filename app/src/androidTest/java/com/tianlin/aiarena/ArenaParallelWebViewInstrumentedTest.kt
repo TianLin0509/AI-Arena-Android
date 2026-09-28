@@ -870,7 +870,7 @@ class ArenaParallelWebViewInstrumentedTest {
             val method = ArenaWebViewPool::class.java.declaredMethods.single { it.name == "waitForFreshPage" }.apply { isAccessible = true }
             onMain {
                 val generation = (field(pool, "navigationGenerations") as Map<*, *>)[ArenaService.DOUBAO]
-                method.invoke(pool, ArenaService.DOUBAO, view, generation, SystemClock.elapsedRealtime() + 300L,
+                method.invoke(pool, ArenaService.DOUBAO, view, generation, SystemClock.elapsedRealtime() + 300L, "",
                     { value: Boolean -> ready.set(value); done.countDown() })
             }
             assertTrue(view.probed.await(2, TimeUnit.SECONDS))
