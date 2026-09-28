@@ -139,4 +139,15 @@ class ArenaGuidanceTest {
         )
         assertEquals("第 2 轮观点讨论完成：2 位回答了，1 位没成功", text)
     }
+
+    @Test
+    fun quotaAndDraftFailuresAreNotDescribedAsAnUnresponsivePage() {
+        // 2026-09-27 real Kimi account: both details used to fall through to "网页没有正常响应，先点重发".
+        val quota = ArenaErrorHelp.explain("重发失败：Kimi 网页提示账号额度已用完，问题没有发出；请打开原网页查看额度或稍后重试", "Kimi")
+        assertTrue(quota.what.contains("额度"))
+        assertEquals(ArenaErrorHelp.Action.OPEN_PAGE, quota.primary)
+        val draft = ArenaErrorHelp.explain("Kimi 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试", "Kimi")
+        assertTrue(draft.what.contains("没发出的文字"))
+        assertFalse(draft.what.contains("没有正常响应"))
+    }
 }

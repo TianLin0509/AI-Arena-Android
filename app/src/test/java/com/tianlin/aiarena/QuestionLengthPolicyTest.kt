@@ -70,4 +70,20 @@ class QuestionLengthPolicyTest {
         assertNull(QuestionLengthPolicy.advisory("问".repeat(limit), withoutQwen))
         assertNotNull(QuestionLengthPolicy.advisory("问".repeat(limit + 1), withoutQwen))
     }
+
+    @Test
+    fun zhipuInputCapIsRespectedEverywhere() {
+        // 2026-09-27 real Zhipu mobile page keeps only the first 2000 characters of its input box.
+        val members = listOf(ArenaService.DEEPSEEK, ArenaService.ZHIPU)
+        assertEquals(PromptBudgetPolicy.ZHIPU_INPUT_LIMIT, PromptBudgetPolicy.budgetFor(ArenaService.ZHIPU))
+        assertTrue(QuestionLengthPolicy.advisory("问".repeat(2_001), members)!!.contains("智谱"))
+        assertNull(PromptBudgetPolicy.inputLimitError(ArenaService.ZHIPU, "问".repeat(2_000)))
+        assertTrue(PromptBudgetPolicy.inputLimitError(ArenaService.ZHIPU, "问".repeat(2_001))!!.contains("最多接收"))
+        assertNull(PromptBudgetPolicy.inputLimitError(ArenaService.DEEPSEEK, "问".repeat(20_000)))
+        // Discussion prompts for Zhipu compress quoted answers until they fit its box.
+        val fitted = PromptBudgetPolicy.fit(ArenaService.ZHIPU) { quote -> "模板".repeat(200) + "答".repeat(quote * 3) }!!
+        assertTrue(fitted.compressed && fitted.text.length <= PromptBudgetPolicy.ZHIPU_INPUT_LIMIT)
+        val advice = ArenaErrorHelp.explain(PromptBudgetPolicy.inputLimitError(ArenaService.ZHIPU, "问".repeat(2_001))!!, "智谱")
+        assertTrue(advice.what.contains("收不下"))
+    }
 }

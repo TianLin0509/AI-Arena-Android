@@ -251,6 +251,8 @@ data class RoundRecord(
     /** 这一轮实际负责整合的队长；null = 当时没开队长模式。界面靠它判断能不能说"看第一条就够"。 */
     val captain: ArenaService? = null,
     val attachments: List<ArenaAttachment> = emptyList(),
+    /** 基于这一轮回答做过的综合答案；开始下一轮时归档到这里，时光机里还能翻到。 */
+    val summary: DiscussionSummary? = null,
 )
 
 data class DiscussionSummary(
@@ -263,6 +265,8 @@ data class DiscussionSummary(
     val depth: SummaryDepth = SummaryDepth.STANDARD,
     val prompt: String = "",
     val attachments: List<ArenaAttachment> = emptyList(),
+    /** 这份综合依据的是第几轮回答；0 = 老文件没记录。 */
+    val roundNumber: Int = 0,
 )
 
 /**
@@ -393,6 +397,15 @@ interface ArenaGateway {
 
     /** 最近一次 [openFreshConversation] 失败时，网页上看到的具体原因（给用户看）；未知时为 null。 */
     fun freshConversationFailure(service: ArenaService): String? = null
+
+    /** 最近一次新对话因输入框里的草稿而停下时，那段草稿的原文；其他原因时为 null。 */
+    fun freshConversationDraft(service: ArenaService): String? = null
+
+    /**
+     * 用户看过并确认可以替换的那段草稿：只对下一次新对话准备生效一次，且网页里的草稿必须与之完全一致。
+     * 之后照常由发送脚本用本轮问题整体替换输入框内容，发送前仍核对输入框正文与本轮问题一致。
+     */
+    fun allowFreshDraftReplacement(service: ArenaService, draft: String) = Unit
 
     /** 打开某条历史对话的站点地址（各站把每条对话映射成不同 URL），加载完成后回调。 */
     fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) = callback(true)

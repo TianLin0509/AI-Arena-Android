@@ -29,7 +29,8 @@ import android.os.SystemClock
 
 /** A compact header shared by the question and answer pages. */
 @Composable
-internal fun SimpleHeader(busy: Boolean, onNew: () -> Unit, onNavigate: (RoundtablePage) -> Unit) {
+internal fun SimpleHeader(busy: Boolean, onNew: () -> Unit, onNavigate: (RoundtablePage) -> Unit,
+                          onShareSession: (() -> Unit)? = null) {
     var menu by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf(false) }
     if (confirm) ConfirmDialog(
@@ -43,6 +44,11 @@ internal fun SimpleHeader(busy: Boolean, onNew: () -> Unit, onNavigate: (Roundta
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 DropdownMenuItem(text = { Text("历史对话") }, onClick = { menu = false; onNavigate(RoundtablePage.HISTORY) })
                 DropdownMenuItem(text = { Text("设置") }, onClick = { menu = false; onNavigate(RoundtablePage.SETTINGS) })
+                if (onShareSession != null) DropdownMenuItem(text = { Text("分享整场讨论") },
+                    onClick = { menu = false; onShareSession() }, modifier = Modifier.testTag("share-session"))
+                HorizontalDivider(color = ArenaStyle.colors.border, thickness = 0.5.dp)
+                DropdownMenuItem(text = { Text("AI 圆桌 v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelSmall) },
+                    onClick = {}, enabled = false, modifier = Modifier.testTag("menu-version"))
             }
         }
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
@@ -210,18 +216,32 @@ internal fun SimpleAnswer(
     service: ArenaService, run: ParticipantRun, status: ServiceStatus, onOpen: () -> Unit,
     onCopy: (() -> Unit)?, onShare: (() -> Unit)?, busy: Boolean,
     onReextract: () -> Unit, onResend: () -> Unit, onSummary: () -> Unit,
+    draft: String? = null, onReplaceDraft: (String) -> Unit = {},
 ) {
     var confirmResend by remember { mutableStateOf(false) }
+    var confirmDraft by remember { mutableStateOf<String?>(null) }
     var details by rememberSaveable { mutableStateOf(false) }
     val colors = ArenaStyle.colors
     if (confirmResend) ConfirmDialog("重新发送给 ${service.shortName}？", "会再次发送本轮问题。请先打开网页确认是否已收到或仍在排队，避免重复发送。", "确认重发",
         onConfirm = { confirmResend = false; onResend() }, onDismiss = { confirmResend = false })
+    confirmDraft?.let { text ->
+        ConfirmDialog("清空这段草稿并重发？",
+            "${service.shortName} 输入框里的这段文字会被本轮问题替换：\n\n「${text.take(300)}${if (text.length > 300) "…" else ""}」\n\n只替换这一段；网页里的文字若已改变会停下，不会发送。",
+            "清空并重发", onConfirm = { confirmDraft = null; onReplaceDraft(text) }, onDismiss = { confirmDraft = null })
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
         SimpleAvatar(service, onOpen)
         Text(service.shortName, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.weight(1f))
-        if (run.phase != ParticipantPhase.COMPLETE) Text(runStatusWord(run, status), style = MaterialTheme.typography.labelSmall,
+        if (run.phase != ParticipantPhase.COMPLETE) Text(if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") "本轮未参与"
+            else runStatusWord(run, status), style = MaterialTheme.typography.labelSmall,
             color = if (run.phase == ParticipantPhase.ERROR) colors.error else colors.muted)
+    }
+    if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") {
+        // Follow-ups and discussions go only to members that answered the previous round.
+        Text("这一轮没有发给 ${service.shortName}：上一轮它没有成功回答。之前的内容在上方时光机里。",
+            Modifier.padding(vertical = 8.dp).testTag("sat-out-${service.name}"),
+            style = MaterialTheme.typography.bodySmall, color = colors.muted)
     }
     if (run.response.isNotBlank()) SelectionContainer(Modifier.testTag("simple-answer-${service.name}")) {
         MarkdownText(run.response, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
@@ -236,6 +256,17 @@ internal fun SimpleAnswer(
     if (run.phase == ParticipantPhase.ERROR) {
         val advice = ArenaErrorHelp.explain(run.detail, service.shortName)
         SimpleNotice(advice.what + " " + advice.next)
+        if (draft != null) {
+            Surface(Modifier.fillMaxWidth().padding(vertical = 4.dp), color = colors.card, shape = RoundedCornerShape(10.dp)) {
+                Column(Modifier.padding(10.dp)) {
+                    Text("网页输入框里没发出的文字", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                    Text(draft, Modifier.padding(top = 4.dp).testTag("blocking-draft-${service.name}"),
+                        style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            TextButton(onClick = { confirmDraft = draft }, enabled = !busy,
+                modifier = Modifier.testTag("replace-draft-${service.name}")) { Text("清空这段草稿并重发") }
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             TextButton(onClick = onOpen) { Text("打开网页") }
             TextButton(onClick = onReextract, enabled = !busy && run.requestId.isNotBlank()) { Text("重新读取") }
@@ -271,8 +302,19 @@ internal fun SimpleRoundStage(
     val scrollStates = rememberSaveableStateHolder()
     fun notifyFailure(success: Boolean) { if (!success) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } }
     val summarize: () -> Unit = { selected = "summary" }
+    val copyFromTimeline: ((String, String) -> Unit)? = copyText?.let { copy -> { label, text -> scope.launch {
+        snackbarHostState.showSnackbar(if (copy(label, text)) "已复制" else "复制失败")
+    }; Unit } }
+    val shareSession: (() -> Unit)? = shareText?.let { share -> {
+        val prepared = ShareTextPolicy.fullSession(sessionController.originalQuestion, sessionController.askedAtMillis,
+            sessionController.history.toList(), sessionController.summary)
+        scope.launch {
+            if (!share("AI 圆桌整场讨论", prepared.text)) snackbarHostState.showSnackbar("分享失败")
+            else if (prepared.truncated) snackbarHostState.showSnackbar("内容过长，已截取后分享")
+        }; Unit
+    } }
     Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
-        SimpleHeader(busy, onNewSession, onNavigate)
+        SimpleHeader(busy, onNewSession, onNavigate, onShareSession = shareSession.takeIf { sessionController.history.isNotEmpty() })
         SimpleAnswerTabs(members, current, sessionController.runs.mapValues { it.value.phase }) { selected = it }
         if (offline) SimpleNotice("网络未连接；已收到的回答仍可阅读。")
         sessionController.storageWarning?.let { SimpleNotice(it) }
@@ -282,9 +324,34 @@ internal fun SimpleRoundStage(
         scrollStates.SaveableStateProvider("${sessionController.askedAtMillis}-$current") {
             LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("answer-scroll"), state = rememberLazyListState(),
                 contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                val roundNow = sessionController.roundNumber
+                val pastRounds = if (current == "summary") ArenaTimeline.pastSummaries(sessionController.history, roundNow)
+                    else ArenaTimeline.pastRoundsFor(members.first { it.name == current }, sessionController.history, roundNow)
+                if (pastRounds.isNotEmpty()) item("timeline") {
+                    SimpleTimeline(current, sessionController.askedAtMillis, pastRounds,
+                        question = { ArenaTimeline.roundQuestion(it, sessionController.originalQuestion) }) { round ->
+                        if (current == "summary") round.summary?.let { summary ->
+                            TimelineSummary(summary, copyFromTimeline?.let { copy -> { text -> copy("第 ${round.number} 轮综合答案", text) } })
+                        } else {
+                            val service = members.first { it.name == current }
+                            TimelineAnswer(service, round.results[service],
+                                copyFromTimeline?.let { copy -> { text -> copy("${service.shortName} 第 ${round.number} 轮回答", text) } })
+                        }
+                    }
+                }
                 item("question") {
                     Surface(Modifier.fillMaxWidth().padding(start = 20.dp), color = colors.card, shape = RoundedCornerShape(14.dp)) {
                         Column(Modifier.padding(13.dp)) {
+                            if (roundNow > 1) {
+                                val basis = sessionController.summary.roundNumber.takeIf { current == "summary" && it > 0 }
+                                Text(when {
+                                    basis != null -> "依据第 $basis 轮回答整理"
+                                    current == "summary" -> "第 $roundNow 轮"
+                                    else -> "第 $roundNow 轮 · " + (sessionController.currentRoundKind?.let(ArenaTimeline::kindLabel) ?: "") +
+                                        (sessionController.currentRoundStartedAtMillis.takeIf { it > 0L }?.let { " · " + formatAskedTime(it) } ?: "")
+                                }.trimEnd(' ', '·'), Modifier.padding(bottom = 4.dp).testTag("current-round-label"),
+                                    style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                            }
                             SelectionContainer {
                                 Text(if (current == "summary") "讨论主题：${sessionController.originalQuestion}" else currentQuestion,
                                     Modifier.testTag("current-question"), style = MaterialTheme.typography.bodyMedium)
@@ -317,7 +384,9 @@ internal fun SimpleRoundStage(
                                 else if (prepared.truncated) snackbarHostState.showSnackbar("回答过长，已截取后分享")
                             }; Unit } }, busy = busy,
                             onReextract = { notifyFailure(sessionController.retryExtraction(service)) },
-                            onResend = { notifyFailure(sessionController.retrySend(service)) }, onSummary = summarize)
+                            onResend = { notifyFailure(sessionController.retrySend(service)) }, onSummary = summarize,
+                            draft = sessionController.blockingDraft(service),
+                            onReplaceDraft = { text -> notifyFailure(sessionController.retrySendReplacingDraft(service, text)) })
                     }
                 }
             }

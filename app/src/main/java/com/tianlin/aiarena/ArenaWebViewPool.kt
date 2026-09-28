@@ -269,6 +269,17 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private val navigationTargets = mutableMapOf<ArenaService, String>()
     /** Last not-ready reason seen by the fresh-page probe; reported when the page never became usable. */
     private val freshReasons = mutableMapOf<ArenaService, String>()
+    /** Exact draft text seen when the fresh-page probe stopped for a draft; shown to the user verbatim. */
+    private val freshDrafts = mutableMapOf<ArenaService, String>()
+    /** A draft the user confirmed may be replaced; consumed by the next fresh-page preparation only. */
+    private val allowedFreshDrafts = mutableMapOf<ArenaService, String>()
+
+    override fun freshConversationDraft(service: ArenaService): String? =
+        freshDrafts[service]?.takeIf { freshReasons[service] == "draft" && it.isNotBlank() && it.length < MAX_FRESH_DRAFT_CHARS }
+
+    override fun allowFreshDraftReplacement(service: ArenaService, draft: String) {
+        if (draft.isNotBlank()) allowedFreshDrafts[service] = draft
+    }
 
     override fun freshConversationFailure(service: ArenaService): String? = when (freshReasons[service]) {
         "draft" -> "${service.displayName} 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试"
@@ -290,6 +301,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // owned by this request, then require an empty, hydrated editor on the root page.
             pendingFreshPages.remove(service)?.invoke(false)
             freshReasons.remove(service)
+            freshDrafts.remove(service)
+            val allowedDraft = allowedFreshDrafts.remove(service).orEmpty()
             val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
             val deadline = hardDeadline
             var settled = false
@@ -317,7 +330,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         // The editor may mount 40+ s after load while other pages occupy the shared renderer
                         // thread (2026-09-23), so it keeps the whole remaining budget. Waiting never sends;
                         // the native watchdog still covers a renderer that never returns JS results.
-                        waitForFreshPage(service, webView, navigationGenerations[service], deadline, complete)
+                        waitForFreshPage(service, webView, navigationGenerations[service], deadline, allowedDraft, complete)
                     }
                 }
             }
@@ -398,6 +411,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         webView: WebView,
         generation: Long?,
         deadline: Long,
+        allowedDraft: String,
         callback: (Boolean) -> Unit,
     ) {
         if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
@@ -429,6 +443,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               const input = usable.length === 1 ? usable[0] : null;
               $editorDraftHelper
               const draft = arenaEditorDraft(input);
+              // Only the exact text the user saw and confirmed may be replaced by this round's question.
+              const replaceableDraft = !!draft && draft === ${ArenaJs.quote(allowedDraft)};
+              window.__aiArenaFreshDraft = draft && !replaceableDraft ? draft.slice(0, $MAX_FRESH_DRAFT_CHARS) : '';
               const root = location.origin + location.pathname.replace(/\/${'$'}/, '');
               const expected = ${ArenaJs.quoteArray(freshRootUrls(service).map { it.trimEnd('/') })};
               const empty = ${ArenaWebMessageIdentity.users(service)}.length === 0 && !document.querySelector(${ArenaJs.quote(historySelector)});
@@ -437,8 +454,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               ${if (BuildConfig.DEBUG) "window.__aiArenaFreshDiag = JSON.stringify({ready: document.readyState, root, usable: usable.map(e => e.tagName + '.' + String(e.className).slice(0, 30)), empty, queued, draft: !!draft});" else ""}
               // History or a website send queue on the root page is never ready. Keep polling:
               // a single hydration sample must not fail the round; the deadline still decides.
-              const blocked = !expected.includes(root) ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft ? 'draft' :
+              let blocked = !expected.includes(root) ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft && !replaceableDraft ? 'draft' :
                 (!input || document.readyState !== 'complete') ? 'no_editor' : '';
+              // The same unsent draft for 10 s is the website's restored draft, not hydration noise:
+              // report it now instead of holding the whole round until the fresh-page deadline.
+              if (blocked === 'draft') {
+                const seen = window.__aiArenaFreshDraftSeen;
+                if (!seen || seen.text !== draft) window.__aiArenaFreshDraftSeen = {text: draft, since: Date.now()};
+                else if (Date.now() - seen.since >= 10000) blocked = 'draft_stable';
+              } else window.__aiArenaFreshDraftSeen = null;
               if (blocked) { window.__aiArenaFreshPage = null; return blocked; }
               const previous = window.__aiArenaFreshPage;
               if (!previous || previous.input !== input) {
@@ -451,15 +475,27 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             if (BuildConfig.DEBUG) webView.evaluateJavascript("window.__aiArenaFreshDiag") { diag ->
                 android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - SystemClock.elapsedRealtime()} raw=$raw diag=${decodeJsValue(diag)}")
             }
+            val reason = decodeJsValue(raw)
             if (navigationGenerations[service] == generation) {
-                val reason = decodeJsValue(raw)
-                if (reason in FRESH_REASONS) freshReasons[service] = reason else freshReasons.remove(service)
+                val normalized = if (reason == "draft_stable") "draft" else reason
+                if (normalized in FRESH_REASONS) freshReasons[service] = normalized else freshReasons.remove(service)
+                if (normalized != "draft") freshDrafts.remove(service)
+            }
+            if (reason == "draft_stable" && navigationGenerations[service] == generation && webViews[service] === webView && !destroyed) {
+                // Read the exact text before failing so the user can see and confirm it.
+                webView.evaluateJavascript("window.__aiArenaFreshDraft") { text ->
+                    if (navigationGenerations[service] == generation && freshReasons[service] == "draft") {
+                        decodeJsValue(text).takeIf { it.isNotBlank() }?.let { freshDrafts[service] = it }
+                    }
+                    callback(false)
+                }
+                return@evaluateJavascript
             }
             if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
                 SystemClock.elapsedRealtime() >= deadline) callback(false)
             else if (raw == "true") callback(true)
             else if (SystemClock.elapsedRealtime() < deadline) handler.postDelayed({
-                waitForFreshPage(service, webView, generation, deadline, callback)
+                waitForFreshPage(service, webView, generation, deadline, allowedDraft, callback)
             }, 400L)
             else callback(false)
         }
@@ -486,7 +522,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         prompt: String,
         requestId: String,
         callback: (SendOutcome) -> Unit,
-    ) = sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = false)
+    ) {
+        PromptBudgetPolicy.inputLimitError(service, prompt)?.let { return callback(SendOutcome(false, requestId, it)) }
+        sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = false)
+    }
 
     override fun sendPromptWithAttachments(
         service: ArenaService,
@@ -2419,6 +2458,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   const originalFetch = window.fetch;
                   const wrappedFetch = async function() {
                     const args = arguments;
+                    const calledAt = Date.now();
                     const response = await originalFetch.apply(this, args);
                     try {
                       const url = String((args[0] && args[0].url) || args[0] || response.url || '');
@@ -2426,6 +2466,31 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                       if (pendingRequestId && url.includes('/api/v2/chat')) {
                         response.clone().text().then(function(raw) {
                           window.__aiArenaQwenCaptureChunk(raw, pendingRequestId, true);
+                          // The whole stream of this one fetch, read on its own: the typewriter on the page
+                          // can lag far behind (hidden WebView, 2026-09-27) while the stream is complete.
+                          // Only the answer channel counts; other message types are never an answer.
+                          const record = window.__aiArenaQwenResponses[pendingRequestId];
+                          if (record) {
+                            let answer = '';
+                            for (const line of String(raw).split(/\r?\n/)) {
+                              if (!line.startsWith('data:')) continue;
+                              try {
+                                const messages = (JSON.parse(line.slice(5)).data || {}).messages || [];
+                                for (const message of messages) {
+                                  if (message && message.mime_type === 'multi_load/iframe' && typeof message.content === 'string' && message.content.trim()) answer = message.content;
+                                }
+                              } catch (_) {}
+                            }
+                            record.fetchAnswer = answer;
+                            record.fetchCalledAt = calledAt;
+                            record.fetchDone = true;
+                            try {
+                              sessionStorage.setItem('__ai_arena_qwen_response_' + pendingRequestId, JSON.stringify({
+                                done: true, answer: record.answer || '', error: record.error || '',
+                                fetchAnswer: answer, fetchCalledAt: calledAt, fetchDone: true,
+                              }));
+                            } catch (_) {}
+                          }
                         }).catch(function(error) {
                           const record = window.__aiArenaQwenResponses[pendingRequestId] || {
                             done: false, answer: '', error: '', rawBuffer: '', startedAt: Date.now()
@@ -2490,6 +2555,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val READING_LIVE_MS = 5_000L
         /** Sites whose round work advances on animation frames; only these stay drawn for a whole round. */
         private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO)
+        /** Longer drafts are never offered for replacement: the user must see the exact full text. */
+        private const val MAX_FRESH_DRAFT_CHARS = 2_000
         private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
         private const val DOUBAO_UNCONFIRMED_DETAIL = "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
         private const val DOUBAO_HIDDEN_DETAIL = "AI 圆桌在后台时不向豆包点击发送，本轮问题未发送；请回到 App 后重试"

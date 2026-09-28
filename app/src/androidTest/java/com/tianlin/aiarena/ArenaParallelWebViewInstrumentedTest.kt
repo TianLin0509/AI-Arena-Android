@@ -798,6 +798,35 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun freshEditorReportsStableDraftEarlyAndAcceptsOnlyTheConfirmedText() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val view = views.getValue(ArenaService.DOUBAO)
+            interceptFreshPage(view, "<textarea>unsent existing draft</textarea>")
+            fun attempt(): Boolean {
+                val done = CountDownLatch(1)
+                val ready = AtomicBoolean(false)
+                onMain { pool.openFreshConversation(ArenaService.DOUBAO) { ready.set(it); done.countDown() } }
+                assertTrue("A stable draft is reported well before the 85 s fresh-page deadline", done.await(40, TimeUnit.SECONDS))
+                return ready.get()
+            }
+            assertFalse(attempt())
+            var draft: String? = null
+            onMain { draft = pool.freshConversationDraft(ArenaService.DOUBAO) }
+            assertEquals("The exact draft is available for the user to confirm", "unsent existing draft", draft)
+
+            onMain { pool.allowFreshDraftReplacement(ArenaService.DOUBAO, "some other text") }
+            assertFalse("A different confirmed text never unlocks this draft", attempt())
+            assertEquals("unsent existing draft", evaluate(view, "document.querySelector('textarea').value"))
+
+            onMain { pool.allowFreshDraftReplacement(ArenaService.DOUBAO, "unsent existing draft") }
+            assertTrue("The confirmed exact draft may be replaced by this round", attempt())
+            assertEquals("Preparing the page never edits the draft itself", "unsent existing draft",
+                evaluate(view, "document.querySelector('textarea').value"))
+
+            assertFalse("The confirmation is used once only", attempt())
+        }
+    }
+
     @Test fun freshEditorWaitsForVisibleEnabledUniqueCurrentInput() {
         for (body in listOf("<textarea disabled></textarea>", "<textarea readonly></textarea>",
             "<div style='opacity:0'><textarea></textarea></div>", "<textarea></textarea><textarea></textarea>")) {
