@@ -161,7 +161,9 @@ internal fun PresetCard(key: PresetKey, parts: List<PresetPart>, custom: Boolean
                     }
                 }
             } else {
-                val text = parts.filterNot { it.slot }.joinToString(" ") { it.text.trim() }.replace(Regex("\\s+"), " ").trim()
+                // Collapsed preview keeps the slots inline as 「原问题」 so the two lines still read as a sentence.
+                val text = parts.joinToString("") { if (it.slot) "「${it.text}」" else it.text }
+                    .replace("」「", "」、「").replace(Regex("\\s+"), " ").trim()
                 Text(text, style = MaterialTheme.typography.bodySmall, color = colors.muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), maxItemsInEachRow = 4) {
                     parts.filter { it.slot }.distinctBy { it.text }.take(4).forEach { SlotChip(it.text) }
