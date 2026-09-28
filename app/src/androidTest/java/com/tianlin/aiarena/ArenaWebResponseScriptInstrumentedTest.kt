@@ -443,8 +443,8 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertEquals("把2⁸和2ⁿ-1写成；另有x₁ × y²。\n\n| 式 |\n| --- |\n| 2¹⁶ |\n\na/b ≤ 1", result)
         // Nested groups and layout commands seen on DeepSeek / Doubao answers the same day.
         val nested = evaluateMarkdown("<p>${doubao("\\(x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}\\)", "x")}，${doubao("\\(\\boxed{x_1=3,\\ x_2=2}\\)", "x")}，" +
-            "${doubao("\\(1+2+\\cdots+2^{10}\\)", "x")}</p>")
-        assertEquals("x=(-b±√(b²-4ac))/(2a)，x₁=3, x₂=2，1+2+⋯+2¹⁰", nested)
+            "${doubao("\\(1+2+\\cdots+2^{10}\\)", "x")}，${doubao("\\(S=\\dfrac12\\times3\\times4\\)", "x")}</p>")
+        assertEquals("x=(-b±√(b²-4ac))/(2a)，x₁=3, x₂=2，1+2+⋯+2¹⁰，S=1/2×3×4", nested)
         // Yuanbao: data-latex spans; display formulas sit in a PRE without code.
         val yuanbao = evaluateMarkdown("""<pre class="ybc-pre-component"><span class="ybc-markdown-katex ybc-markdown-katex--d" data-latex="ax^2 + bx + c = 0 \quad (a \neq 0)"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true">ax2+bx+c=0(a=0)</span></span></span></span></pre>""" +
             """<p>两边同除以 <span class="ybc-markdown-katex" data-latex="a"><span class="katex"><span class="katex-html" aria-hidden="true">a</span></span></span>：<span class="ybc-markdown-katex" data-latex="x^2 + \frac{b}{a}x = 0"><span class="katex"><span class="katex-html" aria-hidden="true">x</span></span></span></p>""")

@@ -126,7 +126,11 @@ internal object ArenaMarkdownScript {
           for (let pass = 0; pass < 8; pass++) {
             const before = tex;
             tex = scripts(tex.replace(wrappers, function(m, inner) { return inner; })
-              .replace(/\\[dt]?frac\{([^{}]*)\}\{([^{}]*)\}/g, function(m, a, b) { return simple(a) + '/' + simple(b) + '⟪'; })
+              // Braced or single-character arguments: \frac{a}{b}, \frac12, \dfrac1{2}.
+              .replace(/\\[dt]?frac\s*(?:\{([^{}]*)\}|([0-9A-Za-z]))\s*(?:\{([^{}]*)\}|([0-9A-Za-z]))/g, function(m, a1, a2, b1, b2) {
+                const a = a1 === undefined ? a2 : a1, b = b1 === undefined ? b2 : b1;
+                return simple(a) + '/' + simple(b) + '⟪';
+              })
               .replace(/\\sqrt\{([^{}]*)\}/g, function(m, a) { return '√' + simple(a); }));
             if (tex === before) break;
           }
