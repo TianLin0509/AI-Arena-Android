@@ -77,11 +77,16 @@ internal object ArenaMarkdownScript {
           // Yuanbao: span.ybc-markdown-katex[data-latex] around the KaTeX output (2026-09-27).
           const latex = el.getAttribute('data-latex') || el.getAttribute('data-tex');
           if (latex && (/(katex|math|latex|formula)/i.test(cls) || (el.querySelector && el.querySelector('.katex')))) return latex;
+          // Qwen: span.qk-md-katext[role=math][aria-label=TeX] with only KaTeX's visual layer inside (2026-09-28).
+          const label = el.getAttribute('role') === 'math' ? el.getAttribute('aria-label') : '';
+          if (label && (/(katex|math)/i.test(cls) || (el.querySelector && el.querySelector('.katex')))) return label;
           if (el.tagName === 'MATH' || /(^|\s)katex(\s|-display|(?![\s\S]))/.test(cls)) {
             const note = el.querySelector && el.querySelector('annotation[encoding="application/x-tex"]');
             if (note && note.textContent) return note.textContent;
             if (el.tagName === 'MATH') return el.getAttribute('alttext') || el.textContent || '';
-            return '';
+            // No TeX anywhere: keeping KaTeX's visible text ("x2+2x+5=0") beats silently dropping the formula.
+            const visual = el.querySelector && el.querySelector('.katex-html');
+            return visual ? String(visual.textContent || '').split(String.fromCharCode(8203)).join('') : '';
           }
           return null;
         };

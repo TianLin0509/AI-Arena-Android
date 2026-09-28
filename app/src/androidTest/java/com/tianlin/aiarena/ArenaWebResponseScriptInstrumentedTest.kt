@@ -422,6 +422,10 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertEquals(expected, empty.getString("text"))
         val stale = read("stale", "<p><strong>认同</strong>：甲说得对。</p>", full, 60_000)
         assertEquals("A stream from before this round's send never replaces the page", "**认同**：甲说得对。", stale.getString("text"))
+        // Formulas arrive as TeX in the stream but are readable on the page; code keeps its dollar signs.
+        val tex = "由 \$a^2+b^2=c^2\$ 可得：\n\$\$b = \\sqrt{144} = 12\$\$\n\n```sh\necho \$HOME \$PATH\n```\n\n[[inline_action_reply_1]]"
+        val formula = read("formula", """<p>由 <span class="katex"><span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">a^2+b^2=c^2</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">a2+b2=c2</span></span> 可得：</p>""", tex, 0)
+        assertEquals("由 a²+b²=c² 可得：\n\nb = √144 = 12\n\n```sh\necho \$HOME \$PATH\n```", formula.getString("text"))
         val mismatch = read("mismatch", "<p>页面上的另一段回答</p>", "完全不同的一段回答", 0)
         assertEquals("A stream that does not continue the drawn text is ignored", "页面上的另一段回答", mismatch.getString("text"))
     }
@@ -445,6 +449,9 @@ class ArenaWebResponseScriptInstrumentedTest {
         val yuanbao = evaluateMarkdown("""<pre class="ybc-pre-component"><span class="ybc-markdown-katex ybc-markdown-katex--d" data-latex="ax^2 + bx + c = 0 \quad (a \neq 0)"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true">ax2+bx+c=0(a=0)</span></span></span></span></pre>""" +
             """<p>两边同除以 <span class="ybc-markdown-katex" data-latex="a"><span class="katex"><span class="katex-html" aria-hidden="true">a</span></span></span>：<span class="ybc-markdown-katex" data-latex="x^2 + \frac{b}{a}x = 0"><span class="katex"><span class="katex-html" aria-hidden="true">x</span></span></span></p>""")
         assertEquals("ax² + bx + c = 0 (a ≠ 0)\n\n两边同除以 a：x² + b/a·x = 0", yuanbao)
+        // Qwen: role=math aria-label carries the TeX; a KaTeX with no source keeps its visible text.
+        val qwen = evaluateMarkdown("""<div class="qk-md-paragraph">方程 <span class="qk-md-katext qk-md-katext-inline" role="math" aria-label="x^2+2x+5=0"><span class="katex"><span class="katex-html" aria-hidden="true">x2+2x+5=0</span></span></span> 无实根；<span class="katex"><span class="katex-html" aria-hidden="true">y=1</span></span></div>""")
+        assertEquals("方程 x²+2x+5=0 无实根；y=1", qwen)
     }
 
     @Test
