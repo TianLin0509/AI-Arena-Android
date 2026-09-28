@@ -100,6 +100,31 @@ class ArenaSessionControllerInstrumentedTest {
         }
     }
 
+    @Test fun resendingAWorkflowMemberThatNeverHadItsTurnRebuildsTheRelayMaterial() {
+        val gateway = FakeGateway(waitReads = mapOf(ArenaService.KIMI to 1_000))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(responseTimeoutMillis = 60_000), FakeSessionRepository()) }
+        val order = listOf(ArenaService.DEEPSEEK, ArenaService.KIMI, ArenaService.DOUBAO)
+        onMain { assertTrue(controller.startInitial("接力题", ArenaService.defaultMembers, AnswerMode.SERIAL, relayOrder = order)) }
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline && onMain { gateway.sentRecords.none { it.first == ArenaService.KIMI } }) Thread.sleep(20)
+        onMain {
+            assertEquals(ParticipantPhase.COMPLETE, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+            controller.cancelCurrentRound()
+            assertTrue("Doubao never had its turn", gateway.sentRecords.none { it.first == ArenaService.DOUBAO })
+            gateway.sentRecords.clear()
+            assertTrue(controller.retrySend(ArenaService.DOUBAO))
+        }
+        val sent = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < sent && onMain { gateway.sentRecords.isEmpty() }) Thread.sleep(20)
+        onMain {
+            val prompt = gateway.sentRecords.single().second
+            assertTrue(prompt.startsWith("接力题"))
+            assertTrue("The resend still carries the finished earlier answer", prompt.contains("【DeepSeek 的回答】\nDEEPSEEK-answer"))
+            assertFalse(prompt.contains("KIMI-answer"))
+            controller.destroy()
+        }
+    }
+
     @Test fun collabDiscussionUsesItsOwnPresetRoundCountAndRecordsTheStyle() {
         val gateway = FakeGateway()
         val controller = onMain { ArenaSessionController(gateway, fastTiming, FakeSessionRepository()) }

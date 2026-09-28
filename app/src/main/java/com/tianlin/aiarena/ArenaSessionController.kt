@@ -73,6 +73,9 @@ class ArenaSessionController(
     var currentRoundStyle by mutableStateOf<DebateStyle?>(null)
         private set
 
+    /** 本轮工作流的接力顺序；重发还没轮到或被跳过的成员时，据此重新组装「问题 + 前面各位的回答」。 */
+    private var relayOrder: List<ArenaService> = emptyList()
+
     var currentAnswerMode by mutableStateOf(AnswerMode.PARALLEL)
         private set
 
@@ -400,6 +403,23 @@ class ArenaSessionController(
 
     fun retrySend(service: ArenaService): Boolean {
         if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+        if (currentRoundRelay && service in relayOrder && service != relayOrder.first()) {
+            // A member stopped or skipped before its turn still gets the question plus the earlier answers.
+            val question = lastRoundPrompts[relayOrder.first()]
+            if (!question.isNullOrBlank()) {
+                val earlier = LinkedHashMap<ArenaService, String>()
+                relayOrder.takeWhile { it != service }.forEach { previous ->
+                    runs[previous]?.takeIf { it.phase == ParticipantPhase.COMPLETE && it.response.isNotBlank() }?.let { earlier[previous] = it.response }
+                }
+                val budgeted = PromptBudgetPolicy.fit(service, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
+                    RelayPromptBuilder.build(question, earlier, limit, presets)
+                } ?: run {
+                    sessionMessage = "工作流材料超过 ${service.displayName} 的上下文预算（${PromptBudgetPolicy.budgetFor(service)} 字），没有发送"
+                    return false
+                }
+                lastRoundPrompts = lastRoundPrompts + (service to budgeted.text.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+            }
+        }
         val prompt = lastRoundPrompts[service]
         if (prompt.isNullOrBlank()) {
             sessionMessage = "缺少 ${service.displayName} 的原始发送内容，可重新开始问题"
@@ -627,6 +647,7 @@ class ArenaSessionController(
         currentRoundKind = kind
         currentRoundRelay = relay
         currentRoundStyle = style
+        this.relayOrder = if (relay) relayOrder!!.toList() else emptyList()
         currentAnswerMode = answerMode
         stage = when (kind) {
             RoundKind.INITIAL -> SessionStage.INITIAL
@@ -1005,7 +1026,7 @@ class ArenaSessionController(
         sendService(execution, service) { sent ->
             if (!isActive(execution)) return@sendService
             if (sent) {
-                sessionMessage = "串行模式：等待 ${service.displayName} 回答后再发送下一家"
+                sessionMessage = if (execution.relay) "工作流：等待 ${service.displayName} 回答后接力给下一位" else "串行模式：等待 ${service.displayName} 回答后再发送下一家"
             } else {
                 dispatchSerialNext(execution)
             }
@@ -1430,6 +1451,7 @@ class ArenaSessionController(
             currentRoundKind = currentRoundKind,
             currentRoundRelay = currentRoundRelay,
             currentRoundStyle = currentRoundStyle,
+            currentRelayOrder = relayOrder,
             currentAnswerMode = currentAnswerMode,
             services = sessionServices,
             runs = runs.toMap(),
@@ -1512,6 +1534,7 @@ class ArenaSessionController(
         currentRoundKind = snapshot.currentRoundKind ?: snapshot.history.lastOrNull()?.kind
         currentRoundRelay = snapshot.currentRoundRelay || snapshot.history.lastOrNull { it.number == snapshot.roundNumber }?.relay == true
         currentRoundStyle = snapshot.currentRoundStyle ?: snapshot.history.lastOrNull { it.number == snapshot.roundNumber }?.style
+        relayOrder = snapshot.currentRelayOrder.takeIf { currentRoundRelay }.orEmpty()
         currentAnswerMode = snapshot.currentAnswerMode
         sessionServices = snapshot.services.distinct().let { services ->
             if (services.size in ArenaService.MIN_MEMBERS..ArenaService.MAX_MEMBERS) services else ArenaService.defaultMembers

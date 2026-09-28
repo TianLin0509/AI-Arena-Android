@@ -54,7 +54,7 @@ internal fun ModeSegmented(options: List<Pair<String, String>>, selected: String
         horizontalArrangement = Arrangement.spacedBy(3.dp)) {
         options.forEach { (key, label) ->
             val on = key == selected
-            Box(Modifier.weight(1f).heightIn(min = 40.dp).clip(RoundedCornerShape(11.dp))
+            Box(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(11.dp))
                 .background(if (on) colors.accent else colors.card)
                 .clickable(enabled = enabled && !on) { onSelect(key) }
                 .semantics { role = Role.Tab; this.selected = on; contentDescription = label }
@@ -79,11 +79,11 @@ internal fun RelayOrderRow(order: List<ArenaService>, enabled: Boolean, onMoveUp
             if (index > 0) Text("→", Modifier.padding(horizontal = 4.dp), color = colors.muted, style = MaterialTheme.typography.labelMedium)
             Surface(Modifier.padding(start = if (index == 0) 8.dp else 0.dp), shape = RoundedCornerShape(10.dp),
                 color = colors.page, border = BorderStroke(1.dp, colors.border)) {
-                Row(Modifier.height(40.dp).padding(start = 8.dp, end = if (index == 0) 10.dp else 0.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.height(48.dp).padding(start = 8.dp, end = if (index == 0) 10.dp else 0.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("${index + 1}", style = MaterialTheme.typography.labelSmall, color = colors.accent, fontWeight = FontWeight.Bold)
                     BrandAvatar(service, Modifier.padding(start = 6.dp), size = 18.dp)
                     Text(service.shortName, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelMedium, color = colors.ink)
-                    if (index > 0) Box(Modifier.padding(start = 2.dp).size(40.dp).clip(RoundedCornerShape(10.dp))
+                    if (index > 0) Box(Modifier.padding(start = 2.dp).size(48.dp).clip(RoundedCornerShape(10.dp))
                         .clickable(enabled = enabled) { onMoveUp(index) }
                         .semantics { contentDescription = "把 ${service.shortName} 提前一位" },
                         contentAlignment = Alignment.Center) {
@@ -103,12 +103,14 @@ internal fun ChipChoice(label: String, options: List<Pair<String, String>>, sele
         Text(label, style = MaterialTheme.typography.labelMedium, color = colors.muted)
         options.forEach { (key, name) ->
             val on = key == selected
-            Surface(Modifier.padding(start = 6.dp).clip(RoundedCornerShape(9.dp)).clickable(enabled = enabled && !on) { onSelect(key) }
+            Surface(Modifier.padding(start = 6.dp).heightIn(min = 44.dp).clip(RoundedCornerShape(9.dp)).clickable(enabled = enabled && !on) { onSelect(key) }
                 .semantics { this.selected = on; contentDescription = "$label：$name" }.testTag("choice-$key"),
                 shape = RoundedCornerShape(9.dp), color = if (on) colors.accentSoft else colors.page,
                 border = BorderStroke(1.dp, if (on) colors.accent else colors.border)) {
-                Text(name, Modifier.padding(horizontal = 10.dp, vertical = 7.dp), style = MaterialTheme.typography.labelMedium,
-                    color = if (on) colors.accent else colors.ink, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
+                Box(Modifier.heightIn(min = 44.dp).padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
+                    Text(name, style = MaterialTheme.typography.labelMedium,
+                        color = if (on) colors.accent else colors.ink, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
+                }
             }
         }
     }
@@ -146,7 +148,7 @@ internal fun PresetCard(key: PresetKey, parts: List<PresetPart>, custom: Boolean
                 if (custom) Text("已自定义", Modifier.padding(end = 6.dp), style = MaterialTheme.typography.labelSmall, color = colors.accent)
                 Text(if (open) "收起" else "展开", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
                 TextButton(onClick = onEdit, enabled = enabled, contentPadding = PaddingValues(horizontal = 8.dp),
-                    modifier = Modifier.heightIn(min = 36.dp).testTag("edit-preset")) {
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("edit-preset")) {
                     Text("编辑", style = MaterialTheme.typography.labelMedium, color = colors.accent)
                 }
             }

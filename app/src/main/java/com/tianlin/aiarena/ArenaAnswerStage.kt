@@ -44,7 +44,7 @@ internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, pha
                 .semantics { this.selected = on }.testTag("answer-tab-$key"),
                 shape = RoundedCornerShape(20.dp), color = if (on) colors.accentSoft else colors.page,
                 border = BorderStroke(1.dp, if (on) colors.accent.copy(alpha = 0.55f) else colors.border)) {
-                Row(Modifier.heightIn(min = 40.dp).padding(start = 6.dp, end = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.heightIn(min = 48.dp).padding(start = 8.dp, end = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box {
                         if (service != null) BrandAvatar(service, size = 26.dp)
                         else ArenaIcon(R.drawable.ic_logo, tint = androidx.compose.ui.graphics.Color.Unspecified, size = 26.dp)

@@ -130,6 +130,7 @@ class ArenaSimpleInstrumentedTest {
             compose.runOnIdle {
                 assertTrue(shared, shared.contains("第一轮综合正文") && shared.contains("第二轮回答正文") &&
                     shared.contains("换个角度：只说最关键的一条") && shared.contains("把这 30 分钟留给开口"))
+                assertTrue(shared.indexOf("第一轮综合正文") < shared.indexOf("第二轮回答正文"))
             }
         } finally { inst.runOnMainSync { controller.destroy() } }
     }

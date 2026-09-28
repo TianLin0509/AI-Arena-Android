@@ -34,6 +34,8 @@ data class ArenaSessionSnapshot(
     /** 当前轮是不是工作流、用哪种讨论方式；老文件没有这两个字段。 */
     val currentRoundRelay: Boolean = false,
     val currentRoundStyle: DebateStyle? = null,
+    /** 当前工作流轮的接力顺序（重发时重新组装接力材料用）。 */
+    val currentRelayOrder: List<ArenaService> = emptyList(),
 )
 
 data class RecentArenaSession(
@@ -244,6 +246,7 @@ internal object ArenaSessionJson {
         .put("updatedAtMillis", snapshot.updatedAtMillis)
         .put("currentRoundRelay", snapshot.currentRoundRelay)
         .put("currentRoundStyle", snapshot.currentRoundStyle?.name ?: JSONObject.NULL)
+        .put("currentRelayOrder", JSONArray(snapshot.currentRelayOrder.map { it.name }))
 
     /** 只认识到 [SCHEMA_VERSION] 为止的文件；更高版本宁可当作不可读，也不要静默丢字段。 */
     const val SCHEMA_VERSION = 1
@@ -292,6 +295,7 @@ internal object ArenaSessionJson {
             updatedAtMillis = json.optLong("updatedAtMillis"),
             currentRoundRelay = json.optBoolean("currentRoundRelay"),
             currentRoundStyle = json.optString("currentRoundStyle").enumOrNull<DebateStyle>(),
+            currentRelayOrder = json.optJSONArray("currentRelayOrder").enumList<ArenaService>(),
         )
     }
 
