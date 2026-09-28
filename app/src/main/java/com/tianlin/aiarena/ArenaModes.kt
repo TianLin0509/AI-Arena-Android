@@ -120,12 +120,12 @@ internal fun ChipChoice(label: String, options: List<Pair<String, String>>, sele
 @Composable
 internal fun SummaryOptionsRow(members: List<ArenaService>, captain: ArenaService?, depth: SummaryDepth, enabled: Boolean,
                                onCaptain: (ArenaService) -> Unit, onDepth: (SummaryDepth) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(Modifier.horizontalScroll(rememberScrollState())) {
-            ChipChoice("队长", members.map { it.name to it.shortName }, captain?.name.orEmpty(), enabled) { name ->
-                ArenaService.fromName(name)?.let(onCaptain)
-            }
+    // One scrollable row keeps the composer short enough to leave the summary itself visible on small phones.
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+        ChipChoice("队长", members.map { it.name to it.shortName }, captain?.name.orEmpty(), enabled) { name ->
+            ArenaService.fromName(name)?.let(onCaptain)
         }
+        Spacer(Modifier.width(14.dp))
         ChipChoice("深度", SummaryDepth.entries.map { it.name to it.displayName }, depth.name, enabled) { onDepth(SummaryDepth.fromName(it)) }
     }
 }

@@ -403,6 +403,7 @@ class ArenaSimpleInstrumentedTest {
             compose.onNodeWithText("DeepSeek 本轮未完成，将由 豆包 整理").assertIsDisplayed()
             compose.onNodeWithTag("simple-send").performClick()
             compose.runOnIdle { assertEquals(ArenaService.DOUBAO, sentTo) }
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasText("由 豆包 整理"))
             compose.onNodeWithText("由 豆包 整理").assertIsDisplayed()
         } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
     }

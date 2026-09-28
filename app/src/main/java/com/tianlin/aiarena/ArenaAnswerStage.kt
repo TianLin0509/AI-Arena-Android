@@ -199,12 +199,18 @@ internal fun SimpleRoundStage(
     val captain = CaptainPolicy.resolve(ArenaService.fromName(captainName), sessionController.sessionServices)
     fun notifyFailure(success: Boolean) { if (!success) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } }
 
+    // Copies and shares pair the text with the question it actually answered (current round, a reviewed round, or the topic).
+    val shareQuestion = when {
+        current == "summary" -> sessionController.originalQuestion
+        pastRound != null -> ArenaTimeline.roundQuestion(pastRound, sessionController.originalQuestion)
+        else -> sessionController.currentQuestion
+    }
     val copyFrom: ((String, String) -> Unit)? = copyText?.let { copy -> { label, text -> scope.launch {
-        val prepared = ShareTextPolicy.discussionSummary(sessionController.originalQuestion, text)
+        val prepared = ShareTextPolicy.discussionSummary(shareQuestion, text)
         snackbarHostState.showSnackbar(if (!copy(label, prepared.text)) "复制失败" else if (prepared.truncated) "内容过长，已截取后复制" else "已复制")
     }; Unit } }
     val shareFrom: ((String, String) -> Unit)? = shareText?.let { share -> { label, text -> scope.launch {
-        val prepared = ShareTextPolicy.discussionSummary(sessionController.originalQuestion, text)
+        val prepared = ShareTextPolicy.discussionSummary(shareQuestion, text)
         if (!share(label, prepared.text)) snackbarHostState.showSnackbar("分享失败")
         else if (prepared.truncated) snackbarHostState.showSnackbar("内容过长，已截取后分享")
     }; Unit } }
