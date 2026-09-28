@@ -66,7 +66,7 @@ class ArenaTimelineTest {
         val shared = ShareTextPolicy.fullSession("原问题", 0L, history, current)
         assertFalse(shared.truncated)
         val text = shared.text
-        listOf("原问题", "一答", "豆一", "二答", "发送超时", "综合二", "三答", "最新综合", "## 第 3 轮 · 互相讨论").forEach {
+        listOf("原问题", "一答", "豆一", "二答", "发送超时", "综合二", "三答", "最新综合", "## 第 3 轮 · 观点讨论").forEach {
             assertTrue("missing $it", text.contains(it))
         }
         assertTrue(text.indexOf("一答") < text.indexOf("二答") && text.indexOf("综合二") < text.indexOf("三答"))

@@ -688,7 +688,7 @@ internal fun OnboardingPage(onDone: () -> Unit) {
             listOf(
                 Triple("登录你常用的 AI", "DeepSeek、豆包、Kimi 等，用手机号或微信登录。只需登录一次，以后自动记住。", 1),
                 Triple("写下问题，点击发送", "几家 AI 同时回答，用顶部标签切换阅读。点击头像可打开原网页。", 2),
-                Triple("需要时再综合", "点「综合」整理各家回答；更多操作里可以让 AI 互相讨论。文件请在各家网页中手动上传。", 3),
+                Triple("选择下一步怎么做", "输入框上方有四个按钮：独立迭代、工作流（按顺序接力）、观点讨论、队长总结；右上角「时光机」可回看每一轮。", 3),
             ).forEach { (title, detail, number) ->
                 Row(
                     modifier = Modifier.padding(vertical = 8.dp),

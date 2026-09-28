@@ -42,7 +42,7 @@ object ShareTextPolicy {
             append("**问题**：").append(originalQuestion.trim()).append("\n\n")
             if (askedAtMillis > 0L) append("提问时间：").append(formatAskedTime(askedAtMillis)).append("\n\n")
             rounds.forEach { round ->
-                append("## 第 ${round.number} 轮 · ${ArenaTimeline.kindLabel(round.kind)}\n\n")
+                append("## 第 ${round.number} 轮 · ${ArenaTimeline.kindLabel(round)}\n\n")
                 if (round.kind != RoundKind.INITIAL) {
                     append("> ").append(ArenaTimeline.roundQuestion(round, originalQuestion).trim().replace("\n", "\n> ")).append("\n\n")
                 }

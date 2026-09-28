@@ -31,6 +31,9 @@ data class ArenaSessionSnapshot(
     /** 当前这一轮的队长（轮次进行中还没进 history 时也要知道）。 */
     val currentRoundCaptain: ArenaService? = null,
     val updatedAtMillis: Long,
+    /** 当前轮是不是工作流、用哪种讨论方式；老文件没有这两个字段。 */
+    val currentRoundRelay: Boolean = false,
+    val currentRoundStyle: DebateStyle? = null,
 )
 
 data class RecentArenaSession(
@@ -239,6 +242,8 @@ internal object ArenaSessionJson {
         })
         .put("currentRoundCaptain", snapshot.currentRoundCaptain?.name ?: JSONObject.NULL)
         .put("updatedAtMillis", snapshot.updatedAtMillis)
+        .put("currentRoundRelay", snapshot.currentRoundRelay)
+        .put("currentRoundStyle", snapshot.currentRoundStyle?.name ?: JSONObject.NULL)
 
     /** 只认识到 [SCHEMA_VERSION] 为止的文件；更高版本宁可当作不可读，也不要静默丢字段。 */
     const val SCHEMA_VERSION = 1
@@ -285,6 +290,8 @@ internal object ArenaSessionJson {
             }.orEmpty(),
             currentRoundCaptain = json.optString("currentRoundCaptain").enumOrNull<ArenaService>(),
             updatedAtMillis = json.optLong("updatedAtMillis"),
+            currentRoundRelay = json.optBoolean("currentRoundRelay"),
+            currentRoundStyle = json.optString("currentRoundStyle").enumOrNull<DebateStyle>(),
         )
     }
 
@@ -346,6 +353,8 @@ internal object ArenaSessionJson {
         .put("captain", round.captain?.name ?: JSONObject.NULL)
         .put("attachments", encodeAttachments(round.attachments))
         .put("summary", round.summary?.let(::encodeSummary) ?: JSONObject.NULL)
+        .put("relay", round.relay)
+        .put("style", round.style?.name ?: JSONObject.NULL)
 
     private fun decodeRound(json: JSONObject): RoundRecord = RoundRecord(
         number = json.optInt("number"),
@@ -360,6 +369,8 @@ internal object ArenaSessionJson {
         captain = json.optString("captain").enumOrNull<ArenaService>(),
         attachments = decodeAttachments(json),
         summary = json.optJSONObject("summary")?.let(::decodeSummary),
+        relay = json.optBoolean("relay"),
+        style = json.optString("style").enumOrNull<DebateStyle>(),
     )
 
     private fun encodeSummary(summary: DiscussionSummary): JSONObject = JSONObject()

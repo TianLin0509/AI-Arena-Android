@@ -7,11 +7,15 @@ package com.tianlin.aiarena
  */
 object ArenaTimeline {
     /** 用户视角的轮次名称，与输入框上的动作对应（提问 / 追问 / 互相讨论）。 */
-    fun kindLabel(kind: RoundKind): String = when (kind) {
-        RoundKind.INITIAL -> "提问"
-        RoundKind.ITERATION -> "追问"
-        RoundKind.DEBATE -> "互相讨论"
+    fun kindLabel(kind: RoundKind, relay: Boolean = false, style: DebateStyle? = null): String = when {
+        relay -> "工作流"
+        kind == RoundKind.INITIAL -> "提问"
+        kind == RoundKind.ITERATION -> "独立迭代"
+        style == DebateStyle.COLLAB -> "观点讨论 · 取长补短"
+        else -> "观点讨论"
     }
+
+    fun kindLabel(round: RoundRecord): String = kindLabel(round.kind, round.relay, round.style)
 
     /** 这一轮用户问了什么；互相讨论没有额外要求时说明是在讨论原问题。 */
     fun roundQuestion(round: RoundRecord, originalQuestion: String): String = when (round.kind) {
@@ -36,7 +40,7 @@ object ArenaTimeline {
 
     /** 节点标题，例如「第 2 轮 · 追问 · 今天 21:05」。 */
     fun nodeTitle(round: RoundRecord, now: Long = System.currentTimeMillis()): String =
-        "第 ${round.number} 轮 · ${kindLabel(round.kind)}" +
+        "第 ${round.number} 轮 · ${kindLabel(round)}" +
             (round.startedAtMillis.takeIf { it > 0L }?.let { " · ${formatAskedTime(it, now)}" } ?: "")
 
     /** 某成员在某轮的一句话状态；成功时为空，由正文说话。 */

@@ -253,6 +253,10 @@ data class RoundRecord(
     val attachments: List<ArenaAttachment> = emptyList(),
     /** 基于这一轮回答做过的综合答案；开始下一轮时归档到这里，时光机里还能翻到。 */
     val summary: DiscussionSummary? = null,
+    /** 这一轮是工作流（按顺序接力）；results 的顺序即接力顺序。 */
+    val relay: Boolean = false,
+    /** 观点讨论用的方式；其他轮次为 null。 */
+    val style: DebateStyle? = null,
 )
 
 data class DiscussionSummary(

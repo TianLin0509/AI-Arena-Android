@@ -50,6 +50,81 @@ class ArenaSessionControllerInstrumentedTest {
         }
     }
 
+    @Test fun workflowPassesEachFinishedAnswerToTheNextMemberInOrder() {
+        val gateway = FakeGateway()
+        val repository = FakeSessionRepository()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, repository) }
+        val order = listOf(ArenaService.KIMI, ArenaService.DEEPSEEK, ArenaService.DOUBAO)
+        onMain { assertTrue(controller.startInitial("接力问题", ArenaService.defaultMembers, AnswerMode.SERIAL, relayOrder = order)) }
+        awaitHistorySize(controller, 1)
+        onMain {
+            assertEquals(order, gateway.sentRecords.map { it.first })
+            val prompts = gateway.sentRecords.associate { it }
+            assertEquals("接力问题", prompts.getValue(ArenaService.KIMI))
+            assertTrue(prompts.getValue(ArenaService.DEEPSEEK).startsWith("接力问题"))
+            assertTrue(prompts.getValue(ArenaService.DEEPSEEK).contains("【Kimi 的回答】\nKIMI-answer"))
+            assertFalse(prompts.getValue(ArenaService.DEEPSEEK).contains("DOUBAO-answer"))
+            assertTrue(prompts.getValue(ArenaService.DOUBAO).contains("KIMI-answer") && prompts.getValue(ArenaService.DOUBAO).contains("DEEPSEEK-answer"))
+            assertTrue(prompts.getValue(ArenaService.DOUBAO).indexOf("KIMI-answer") < prompts.getValue(ArenaService.DOUBAO).indexOf("DEEPSEEK-answer"))
+            val round = controller.history.single()
+            assertTrue(round.relay)
+            assertEquals(order, round.results.keys.filter { round.results.getValue(it).phase == ParticipantPhase.COMPLETE }
+                .sortedBy { order.indexOf(it) })
+            assertEquals("工作流", ArenaTimeline.kindLabel(round))
+            // Persisted and restored with its workflow marker.
+            controller.destroy()
+            val restored = ArenaSessionController(FakeGateway(), fastTiming, repository)
+            assertTrue(restored.history.single().relay)
+            assertTrue(restored.currentRoundRelay)
+            restored.destroy()
+        }
+    }
+
+    @Test fun workflowSkipsAFailedMemberAndOrderMustMatchTheRound() {
+        val gateway = FakeGateway(neverRespond = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, FakeSessionRepository()) }
+        onMain {
+            assertFalse("A workflow order that differs from the members is refused",
+                controller.startInitial("问题", ArenaService.defaultMembers, AnswerMode.SERIAL, relayOrder = listOf(ArenaService.KIMI, ArenaService.DOUBAO)))
+            assertTrue(controller.startInitial("问题", ArenaService.defaultMembers, AnswerMode.SERIAL,
+                relayOrder = listOf(ArenaService.DEEPSEEK, ArenaService.KIMI, ArenaService.DOUBAO)))
+        }
+        awaitHistorySize(controller, 1, timeoutMillis = 10_000)
+        onMain {
+            val prompts = gateway.sentRecords.associate { it }
+            assertEquals(ParticipantPhase.ERROR, controller.history.single().results.getValue(ArenaService.DEEPSEEK).phase)
+            assertEquals("With no finished answer before it, the next member only gets the question", "问题", prompts.getValue(ArenaService.KIMI))
+            assertTrue(prompts.getValue(ArenaService.DOUBAO).contains("KIMI-answer"))
+            assertFalse(prompts.getValue(ArenaService.DOUBAO).contains("DEEPSEEK"))
+            controller.destroy()
+        }
+    }
+
+    @Test fun collabDiscussionUsesItsOwnPresetRoundCountAndRecordsTheStyle() {
+        val gateway = FakeGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming, FakeSessionRepository()) }
+        onMain { assertTrue(controller.startInitial("讨论问题", ArenaService.defaultMembers)) }
+        awaitHistorySize(controller, 1)
+        onMain { gateway.sentRecords.clear(); assertTrue(controller.startDebate(guidance = "请用表格", style = DebateStyle.COLLAB)) }
+        awaitHistorySize(controller, 2)
+        onMain {
+            val prompt = gateway.sentRecords.first { it.first == ArenaService.DEEPSEEK }.second
+            assertTrue(prompt.startsWith("这是第 1 轮协作。"))
+            assertTrue(prompt.contains("取长补短") || prompt.contains("协作关系"))
+            assertTrue(prompt.endsWith("用户补充要求：\n请用表格"))
+            assertFalse(prompt.contains("DEEPSEEK-answer"))
+            assertEquals(DebateStyle.COLLAB, controller.history.last().style)
+            gateway.sentRecords.clear()
+            assertTrue(controller.startDebate())
+        }
+        awaitHistorySize(controller, 3)
+        onMain {
+            assertTrue("Debate rounds count separately from collab rounds",
+                gateway.sentRecords.first().second.startsWith("这是观点讨论第 1 轮。"))
+            controller.destroy()
+        }
+    }
+
     @Test fun unfinishedRestoredIterationNeverUsesPreviousRoundQuestion() {
         val repository = FakeSessionRepository()
         val snapshot = recoverySnapshot("unfinished current question").let {

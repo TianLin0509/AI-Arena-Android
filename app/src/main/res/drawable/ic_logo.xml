@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 0.18.0 圆桌 Logo：蓝色圆桌 + 四位不同颜色的 AI 围坐 + 桌心点亮的对话气泡（由 ChatGPT 网页生成的方案 3 重绘为矢量）。内容收在中心 72x72 安全区内。 -->
+<!-- App 内的 Logo（首页、顶栏、综合标签）；与启动图标同一套图形。 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-  <group android:scaleX="0.84" android:scaleY="0.84" android:pivotX="54" android:pivotY="54" android:translateX="0.0" android:translateY="0.0">
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="76"
+    android:viewportHeight="76">
+  <group android:scaleX="1.0" android:scaleY="1.0" android:pivotX="54" android:pivotY="54" android:translateX="-16" android:translateY="-16">
     <group android:rotation="0" android:pivotX="54" android:pivotY="54">
         <path android:fillColor="#FF2BB0CF" android:pathData="M54,23.2m-5.9,0a5.9,5.9 0,1 0,11.8 0a5.9,5.9 0,1 0,-11.8 0" />
         <path android:fillColor="#FF2BB0CF" android:pathData="M65,40.13A11,9.2 0,0 0,43,40.13A17.7,17.7 0,0 1,65,40.13Z" />
