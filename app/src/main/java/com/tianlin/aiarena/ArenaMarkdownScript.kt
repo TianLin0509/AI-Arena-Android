@@ -64,6 +64,93 @@ internal object ArenaMarkdownScript {
           return false;
         };
 
+        /**
+         * A rendered formula as one unit. KaTeX marks its visible layer aria-hidden, so walking the DOM
+         * dropped formulas entirely (Doubao 2026-09-27: "把 2^8 写成" became "把、、写成"). Prefer the
+         * site's own TeX source: Doubao's copy-text, else KaTeX's MathML annotation.
+         */
+        const arenaMathSource = function(el) {
+          if (!el || el.nodeType !== 1 || !el.getAttribute) return null;
+          const cls = arenaClassOf(el);
+          const copy = el.getAttribute('copy-text');
+          if (copy && /math/i.test(cls)) return copy;
+          // Yuanbao: span.ybc-markdown-katex[data-latex] around the KaTeX output (2026-09-27).
+          const latex = el.getAttribute('data-latex') || el.getAttribute('data-tex');
+          if (latex && (/(katex|math|latex|formula)/i.test(cls) || (el.querySelector && el.querySelector('.katex')))) return latex;
+          // Qwen: span.qk-md-katext[role=math][aria-label=TeX] with only KaTeX's visual layer inside (2026-09-28).
+          const label = el.getAttribute('role') === 'math' ? el.getAttribute('aria-label') : '';
+          if (label && (/(katex|math)/i.test(cls) || (el.querySelector && el.querySelector('.katex')))) return label;
+          if (el.tagName === 'MATH' || /(^|\s)katex(\s|-display|(?![\s\S]))/.test(cls)) {
+            const note = el.querySelector && el.querySelector('annotation[encoding="application/x-tex"]');
+            if (note && note.textContent) return note.textContent;
+            if (el.tagName === 'MATH') return el.getAttribute('alttext') || el.textContent || '';
+            // No TeX anywhere: keeping KaTeX's visible text ("x2+2x+5=0") beats silently dropping the formula.
+            const visual = el.querySelector && el.querySelector('.katex-html');
+            return visual ? String(visual.textContent || '').split(String.fromCharCode(8203)).join('') : '';
+          }
+          return null;
+        };
+
+        const arenaSupChars = { n: 'ⁿ', i: 'ⁱ', '+': '⁺', '-': '⁻', '−': '⁻', '(': '⁽', ')': '⁾', '=': '⁼' };
+        const arenaSubChars = { '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
+                                n: 'ₙ', i: 'ᵢ', j: 'ⱼ', k: 'ₖ', m: 'ₘ', x: 'ₓ', '+': '₊', '-': '₋' };
+        const arenaTexSymbols = { times: '×', cdot: '·', div: '÷', le: '≤', leq: '≤', ge: '≥', geq: '≥', neq: '≠', ne: '≠',
+          approx: '≈', pm: '±', mp: '∓', infty: '∞', pi: 'π', to: '→', rightarrow: '→', Rightarrow: '⇒', Leftrightarrow: '⇔',
+          cdots: '⋯', ldots: '…', dots: '…', in: '∈', notin: '∉', subset: '⊂', cup: '∪', cap: '∩', forall: '∀', exists: '∃',
+          therefore: '∴', because: '∵', circ: '°', degree: '°', percent: '%', lt: '<', gt: '>', prod: '∏', sum: '∑', int: '∫',
+          partial: '∂', alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', theta: 'θ', lambda: 'λ', mu: 'μ',
+          rho: 'ρ', sigma: 'σ', tau: 'τ', phi: 'φ', omega: 'ω', Delta: 'Δ', Sigma: 'Σ', Omega: 'Ω' };
+
+        /** TeX → readable text: strip delimiters and layout commands, keep symbols, turn simple powers/indices into 2⁸, xₙ. */
+        const arenaReadableTex = function(raw) {
+          // A number or a single letter stands alone; anything longer ("2a", "b^2-4ac") keeps parentheses.
+          const simple = function(part) { return /^([0-9.]+|[A-Za-z])(?![\s\S])/.test(part.trim()) ? part.trim() : '(' + part.trim() + ')'; };
+          let tex = String(raw || '').trim()
+            .replace(/^\\\(|\\\)(?![\s\S])/g, '').replace(/^\\\[|\\\](?![\s\S])/g, '')
+            .replace(/^[\u0024]+|[\u0024]+(?![\s\S])/g, '').trim()
+            .replace(/\\begin\{[^{}]*\}|\\end\{[^{}]*\}/g, ' ').replace(/\\\\/g, '\n').replace(/&/g, '')
+            .replace(/\\\{/g, '⟦').replace(/\\\}/g, '⟧');
+          const wrappers = /\\(?:text|textbf|mathrm|mathbf|mathit|operatorname|boxed|boldsymbol|bm|underline|overline|mbox|displaystyle)\{([^{}]*)\}/g;
+          const map = function(text, table) {
+            let out = '';
+            for (const ch of text) { const mapped = table === arenaSubChars ? arenaSubChars[ch] : (arenaSup[ch] || arenaSupChars[ch]); if (!mapped) return null; out += mapped; }
+            return out;
+          };
+          const scripts = function(value) {
+            return value.replace(/\^\{([^{}]+)\}|\^([0-9A-Za-z])/g, function(m, group, single) {
+                const t = map(group || single, arenaSup); return t === null ? '^' + simple(group || single) : t; })
+              .replace(/_\{([^{}]+)\}|_([0-9A-Za-z])/g, function(m, group, single) {
+                const t = map(group || single, arenaSubChars); return t === null ? '_' + simple(group || single) : t; });
+          };
+          // Innermost groups first, so \frac{1(1-2^{11})}{1-2} or \frac{-b\pm\sqrt{b^2-4ac}}{2a} resolve in a few passes.
+          for (let pass = 0; pass < 8; pass++) {
+            const before = tex;
+            tex = scripts(tex.replace(wrappers, function(m, inner) { return inner; })
+              // Braced or single-character arguments: \frac{a}{b}, \frac12, \dfrac1{2}.
+              .replace(/\\[dt]?frac\s*(?:\{([^{}]*)\}|([0-9A-Za-z]))\s*(?:\{([^{}]*)\}|([0-9A-Za-z]))/g, function(m, a1, a2, b1, b2) {
+                const a = a1 === undefined ? a2 : a1, b = b1 === undefined ? b2 : b1;
+                return simple(a) + '/' + simple(b) + '⟪';
+              })
+              .replace(/\\sqrt\{([^{}]*)\}/g, function(m, a) { return '√' + simple(a); }));
+            if (tex === before) break;
+          }
+          tex = scripts(tex.replace(/\\left|\\right|\\displaystyle|\\qquad|\\quad|\\[,;:! ]/g, ' ')
+            .replace(/\\([A-Za-z]+)/g, function(m, name) { return arenaTexSymbols[name] || m; }))
+            .replace(/[{}]/g, '').replace(/⟦/g, '{').replace(/⟧/g, '}')
+            // "\frac{b}{a}x" reads as b/ax; separate a fraction from a directly following term.
+            .replace(/⟪(?=[A-Za-z0-9(√])/g, '·').replace(/⟪/g, '');
+          return tex.split('\n').map(function(line) { return line.replace(/[ \t]+/g, ' ').trim(); })
+            .filter(function(line) { return line; }).join('\n');
+        };
+
+        /** A drawn list marker: a short bullet or number element whose class calls it a dot, bullet or marker. */
+        const arenaListGlyph = function(el) {
+          const text = String(el.textContent || '').trim();
+          if (!text || text.length > 4) return false;
+          if (!/(dot|bullet|marker)/i.test(arenaClassOf(el))) return false;
+          return /^([•●◦▪·‣⁃-]|[0-9]{1,3}[.)、]?)(?![\s\S])/.test(text);
+        };
+
         const arenaSuperscript = function(digits) {
           return String(digits).replace(/[0-9]/g, function(d) { return arenaSup[d] || d; });
         };
@@ -88,6 +175,18 @@ internal object ArenaMarkdownScript {
         // Observed provider code-widget chrome, not answer text. Require a PRE
         // belonging to the nearest widget; lookalike classes elsewhere stay intact.
         const arenaCodeChrome = function(el) {
+          // Qwen table toolbar ("表格 / 下载为表格 / 导出为图片"), only beside the table it belongs to (2026-09-27).
+          if (el.matches && el.closest && el.matches('.qk-md-table-action') && !el.querySelector('table')) {
+            const table = el.closest('.qk-md-table-wrapper');
+            if (table && table.querySelector('table')) return true;
+          }
+          // Doubao table toolbar ("表格" + icon buttons) beside the table it belongs to (2026-09-27).
+          if (el.matches && el.closest && el.matches('[class*="table-header-"]') && !el.querySelector('table')) {
+            const table = el.closest('[class*="table-wrapper-"]');
+            if (table && table.querySelector('table')) return true;
+          }
+          // Zhipu code-interpreter status line ("python运行：已完成"), not the code or its output (2026-09-27).
+          if (el.matches && el.closest && el.matches('.tool-finished-status') && el.closest('.tool-template-container')) return true;
           if (!el.matches || !el.closest || el.closest('pre') || el.querySelector('pre')) return false;
           const widgets = '.md-code-block,.segment-code,.code-area,.qw-md-code,.artifacts-container';
           const owner = el.closest(widgets);
@@ -112,6 +211,15 @@ internal object ArenaMarkdownScript {
             }
             if (child.nodeType !== 1) continue;
             const tag = child.tagName;
+            const math = arenaMathSource(child);
+            if (math !== null) {
+              const readable = arenaReadableTex(math);
+              // A display formula is its own line even when the site puts several in one paragraph.
+              const display = /(katex-display|math-block|katex--d)/.test(arenaClassOf(child)) ||
+                !!(child.querySelector && child.querySelector('.katex-display')) || /^\s*\\\[/.test(math);
+              if (readable) text(display ? '\n' + arenaEsc(readable) + '\n' : arenaEsc(readable));
+              continue;
+            }
             if (arenaSkipTags[tag] || arenaHidden(child) || arenaCodeChrome(child) || arenaSkipInline.test(tag)) continue;
             if (arenaIsCitation(child)) {
               text(arenaSuperscript((child.textContent || '').trim()));
@@ -224,6 +332,11 @@ internal object ArenaMarkdownScript {
           }
           if (node.nodeType !== 1) return '';
           const tag = node.tagName;
+          const math = arenaMathSource(node);
+          if (math !== null) {
+            const readable = arenaReadableTex(math);
+            return readable ? arenaEsc(readable) + '\n\n' : '';
+          }
           if (arenaSkipTags[tag] || arenaHidden(node) || arenaCodeChrome(node)) return '';
 
           if (/^H[1-6](?![\s\S])/.test(tag)) {
@@ -238,6 +351,11 @@ internal object ArenaMarkdownScript {
           if (tag === 'HR') return '---\n\n';
 
           if (tag === 'PRE') {
+            // Yuanbao wraps display formulas in a PRE with no code: that is a formula, not a code block.
+            if (node.querySelector && !node.querySelector('code') && node.querySelector('.katex')) {
+              const formula = arenaInline(node).trim();
+              return formula ? formula + '\n\n' : '';
+            }
             const holder = node.querySelector ? (node.querySelector('code') || node) : node;
             const classes = arenaClassOf(holder) + ' ' + arenaClassOf(node) + ' ' + arenaClassOf(node.parentElement);
             const matched = classes.match(/language-([A-Za-z0-9+#._-]+)/);
@@ -293,16 +411,22 @@ internal object ArenaMarkdownScript {
             for (let i = 0; i < kids.length; i++) {
               const item = kids[i];
               if (item.tagName !== 'LI') continue;
-              const head = arenaInline(item).replace(/\n/g, ' ').trim();
+              // Some sites draw the list marker as text (Yuanbao: span.ybc-li-component__dot-wp "•");
+              // Markdown already has its own marker, so skip that decorative leading child.
+              const nodes = Array.from(item.childNodes || []).filter(function(child, index) {
+                return !(index < 2 && child.nodeType === 1 && arenaListGlyph(child));
+              });
+              const head = arenaInline({ childNodes: nodes }).replace(/\n/g, ' ').trim();
               const marker = ordered ? (counter + '. ') : '- ';
               out += arenaIndent(depth) + marker + head + '\n';
-              const inner = item.children || [];
-              for (let j = 0; j < inner.length; j++) {
-                const sub = inner[j].tagName;
-                if (sub === 'UL' || sub === 'OL' || sub === 'PRE' || sub === 'TABLE' || sub === 'BLOCKQUOTE') {
-                  out += arenaSerialize(inner[j], depth + 1);
-                }
-              }
+              // Nested blocks may sit inside wrapper spans/divs (Yuanbao: li > span > pre), not only as
+              // direct children. Take the outermost ones that belong to this item, in document order.
+              const nested = item.querySelectorAll ? Array.from(item.querySelectorAll('ul,ol,pre,table,blockquote')) : [];
+              const own = nested.filter(function(el) {
+                return (el.parentElement && el.parentElement.closest('li')) === item &&
+                  !nested.some(function(other) { return other !== el && other.contains(el); }) && !arenaHidden(el);
+              });
+              for (let j = 0; j < own.length; j++) out += arenaSerialize(own[j], depth + 1);
               counter += 1;
             }
             return out ? (out + '\n') : '';

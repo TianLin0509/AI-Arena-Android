@@ -82,10 +82,21 @@ data class BudgetedPrompt(
 object PromptBudgetPolicy {
     const val DEFAULT_BUDGET = 16_000
     const val QWEN_BUDGET = 8_000
+    /** 智谱手机网页的输入框只收前 2000 字（2026-09-27 实测，多出的部分被网页直接截掉）。 */
+    const val ZHIPU_INPUT_LIMIT = 2_000
     const val MIN_QUOTE_CHARACTERS = 300
 
-    fun budgetFor(service: ArenaService): Int =
-        if (service == ArenaService.QWEN) QWEN_BUDGET else DEFAULT_BUDGET
+    fun budgetFor(service: ArenaService): Int = when (service) {
+        ArenaService.QWEN -> QWEN_BUDGET
+        ArenaService.ZHIPU -> ZHIPU_INPUT_LIMIT
+        else -> DEFAULT_BUDGET
+    }
+
+    /** 这家网页一次根本收不下的问题：直接说明，不送去让网页截断。 */
+    fun inputLimitError(service: ArenaService, prompt: String): String? =
+        if (service == ArenaService.ZHIPU && prompt.length > ZHIPU_INPUT_LIMIT)
+            "智谱手机网页一次最多接收 $ZHIPU_INPUT_LIMIT 字，本轮内容有 ${prompt.length} 字，没有发给智谱；请缩短问题或换一家"
+        else null
 
     fun fit(
         service: ArenaService,
@@ -137,6 +148,9 @@ object QuestionLengthPolicy {
     fun advisory(question: String, services: List<ArenaService>): String? {
         if (exceedsHardLimit(question)) {
             return "问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字，请缩短后再发送。"
+        }
+        if (ArenaService.ZHIPU in services && question.length > PromptBudgetPolicy.ZHIPU_INPUT_LIMIT) {
+            return "智谱手机网页一次最多接收 ${PromptBudgetPolicy.ZHIPU_INPUT_LIMIT} 字，这个问题发不给智谱；请缩短，或换一家 AI。"
         }
         val limit = advisoryLimit(services)
         if (question.length <= limit) return null

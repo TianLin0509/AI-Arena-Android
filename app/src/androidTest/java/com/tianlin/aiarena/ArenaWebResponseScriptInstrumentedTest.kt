@@ -391,6 +391,79 @@ class ArenaWebResponseScriptInstrumentedTest {
     }
 
     @Test
+    fun wrappedListItemKeepsNestedCodeAndDropsDrawnBullet() {
+        // 2026-09-27 Yuanbao real page: li > span.dot "•" + span.content > (div.ybc-p, pre > ... > pre > code).
+        val result = evaluateMarkdown("""<ul><li class="ybc-li-component"><span class="ybc-li-component__dot-wp"><span class="ybc-li-component_dot">•</span></span><span class="ybc-li-component_content"><div class="ybc-p"><strong>去重</strong>：先去重再推导：</div>
+            <pre class="ybc-pre-component"><div class="hyc-common-markdown__code__hd"><span>python</span></div><pre class="hyc-common-markdown__code-lan"><div><pre><code class="language-python">return {y: f(y) for y in dict.fromkeys(years)}</code></pre></div></pre></pre></span></li>
+            <li class="ybc-li-component"><span class="ybc-li-component__dot-wp"><span class="ybc-li-component_dot">•</span></span><span class="ybc-li-component_content"><div class="ybc-p">只要闰年：<code>[y for y in r]</code></div></span></li></ul>""")
+        assertEquals("- **去重**：先去重再推导：\n```python\nreturn {y: f(y) for y in dict.fromkeys(years)}\n```\n\n- 只要闰年：`[y for y in r]`", result)
+    }
+
+    @Test
+    fun qwenFinishedStreamCompletesAnAnswerThePageDrewOnlyPartly() {
+        // 2026-09-27 real account: a hidden WebView marked the answer complete after drawing only a prefix.
+        val old = """<div class="message-card-wrap question" data-message-id="qwen-old"><div class="question-text-card">讨论题</div></div><div class="qk-markdown qk-markdown-react qk-markdown-complete">上一轮答案</div>"""
+        fun current(shown: String) = """<div class="message-card-wrap question" data-message-id="qwen-now"><div class="question-text-card">讨论题</div></div>
+            <div data-chat-answers-wrap="a"><div class="answer-common-card"><div class="qk-markdown qk-markdown-react qk-markdown-complete">$shown</div></div></div>"""
+        fun read(label: String, shown: String, fetched: String, ageMillis: Long): JSONObject {
+            val record = "window.__aiArenaQwenResponses = window.__aiArenaQwenResponses || {};" +
+                "window.__aiArenaQwenResponses[${JSONObject.quote("qwen_fetch_$label")}] = {done: true, answer: '', fetchDone: true," +
+                " fetchAnswer: ${JSONObject.quote(fetched)}, fetchCalledAt: Date.now() - $ageMillis};"
+            return evaluate(ArenaService.QWEN, "qwen_fetch_$label", old, strictPrompt = "讨论题",
+                afterPrepareHtml = current(shown), afterPrepareScript = record)
+        }
+        val full = "**认同**：甲说得对。\n\n**不认同**：\n\n- 乙的数字有误\n- 丙漏了一点\n\n[[inline_action_reply_1]]"
+        val expected = "**认同**：甲说得对。\n\n**不认同**：\n\n- 乙的数字有误\n- 丙漏了一点"
+        val partial = read("partial", "<p><strong>认同</strong>：甲说得对。</p><p><strong>不认同</strong>：</p><ul><li>乙的</li></ul>", full, 0)
+        assertEquals(expected, partial.getString("text"))
+        assertEquals(expected, partial.getString("finalText"))
+        assertFalse(partial.getBoolean("streaming"))
+        val empty = read("empty", "", full, 0)
+        assertEquals(expected, empty.getString("text"))
+        val stale = read("stale", "<p><strong>认同</strong>：甲说得对。</p>", full, 60_000)
+        assertEquals("A stream from before this round's send never replaces the page", "**认同**：甲说得对。", stale.getString("text"))
+        // Formulas arrive as TeX in the stream but are readable on the page; code keeps its dollar signs.
+        val tex = "由 \$a^2+b^2=c^2\$ 可得：\n\$\$b = \\sqrt{144} = 12\$\$\n\n```sh\necho \$HOME \$PATH\n```\n\n[[inline_action_reply_1]]"
+        val formula = read("formula", """<p>由 <span class="katex"><span class="katex-mathml"><math><semantics><annotation encoding="application/x-tex">a^2+b^2=c^2</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">a2+b2=c2</span></span> 可得：</p>""", tex, 0)
+        assertEquals("由 a²+b²=c² 可得：\n\nb = √144 = 12\n\n```sh\necho \$HOME \$PATH\n```", formula.getString("text"))
+        val mismatch = read("mismatch", "<p>页面上的另一段回答</p>", "完全不同的一段回答", 0)
+        assertEquals("A stream that does not continue the drawn text is ignored", "页面上的另一段回答", mismatch.getString("text"))
+    }
+
+    @Test
+    fun renderedFormulasKeepTheirMeaning() {
+        // 2026-09-27 Doubao: KaTeX's visible layer is aria-hidden, so "把 2^8 写成" became "把、、写成".
+        val doubao = { tex: String, shown: String ->
+            """<span class="container-wTfUs6 math-inline" copy-text="$tex"><span class="katex"><span aria-hidden="true" class="katex-html">$shown</span></span></span>"""
+        }
+        val standard = """<span class="katex"><span class="katex-mathml"><math><semantics><mrow><mi>x</mi></mrow><annotation encoding="application/x-tex">x_1 \times y^{2}</annotation></semantics></math></span><span class="katex-html" aria-hidden="true">x1×y2</span></span>"""
+        val result = evaluateMarkdown("<p>把${doubao("\\(2^8\\)", "28")}和${doubao("\\(2^{n}-1\\)", "2n−1")}写成；另有$standard。</p>" +
+            "<table><tr><th>式</th></tr><tr><td>${doubao("\\(2^{16}\\)", "216")}</td></tr></table>" +
+            "<div class=\"math-block\" copy-text=\"\\[\\frac{a}{b} \\le 1\\]\"><span class=\"katex-display\"><span class=\"katex\"><span aria-hidden=\"true\" class=\"katex-html\">ab≤1</span></span></span></div>")
+        assertEquals("把2⁸和2ⁿ-1写成；另有x₁ × y²。\n\n| 式 |\n| --- |\n| 2¹⁶ |\n\na/b ≤ 1", result)
+        // Nested groups and layout commands seen on DeepSeek / Doubao answers the same day.
+        val nested = evaluateMarkdown("<p>${doubao("\\(x=\\frac{-b\\pm\\sqrt{b^2-4ac}}{2a}\\)", "x")}，${doubao("\\(\\boxed{x_1=3,\\ x_2=2}\\)", "x")}，" +
+            "${doubao("\\(1+2+\\cdots+2^{10}\\)", "x")}，${doubao("\\(S=\\dfrac12\\times3\\times4\\)", "x")}</p>")
+        assertEquals("x=(-b±√(b²-4ac))/(2a)，x₁=3, x₂=2，1+2+⋯+2¹⁰，S=1/2×3×4", nested)
+        // Yuanbao: data-latex spans; display formulas sit in a PRE without code.
+        val yuanbao = evaluateMarkdown("""<pre class="ybc-pre-component"><span class="ybc-markdown-katex ybc-markdown-katex--d" data-latex="ax^2 + bx + c = 0 \quad (a \neq 0)"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true">ax2+bx+c=0(a=0)</span></span></span></span></pre>""" +
+            """<p>两边同除以 <span class="ybc-markdown-katex" data-latex="a"><span class="katex"><span class="katex-html" aria-hidden="true">a</span></span></span>：<span class="ybc-markdown-katex" data-latex="x^2 + \frac{b}{a}x = 0"><span class="katex"><span class="katex-html" aria-hidden="true">x</span></span></span></p>""")
+        assertEquals("ax² + bx + c = 0 (a ≠ 0)\n\n两边同除以 a：x² + b/a·x = 0", yuanbao)
+        // Qwen: role=math aria-label carries the TeX; a KaTeX with no source keeps its visible text.
+        val qwen = evaluateMarkdown("""<div class="qk-md-paragraph">方程 <span class="qk-md-katext qk-md-katext-inline" role="math" aria-label="x^2+2x+5=0"><span class="katex"><span class="katex-html" aria-hidden="true">x2+2x+5=0</span></span></span> 无实根；<span class="katex"><span class="katex-html" aria-hidden="true">y=1</span></span></div>""")
+        assertEquals("方程 x²+2x+5=0 无实根；y=1", qwen)
+    }
+
+    @Test
+    fun providerToolbarsAroundTablesAndToolRunsAreNotAnswerText() {
+        // 2026-09-27 real pages: Qwen table toolbar and Zhipu code-interpreter status.
+        val result = evaluateMarkdown("""<div class="qk-md-table-wrapper"><div class="qk-md-table-action"><span class="qk-md-table-action-title">表格</span><div class="qk-md-table-download-menu"><div>下载为表格</div><div>导出为图片</div></div></div><div class="qk-md-table-container"><table><thead><tr><th>输入</th><th>输出</th></tr></thead><tbody><tr><td>[1]</td><td>{1: 1}</td></tr></tbody></table></div></div>
+            <div class="tool-template-container"><div class="tool-finished-container"><div class="tool-finished-status"><div><span>python运行：已完成</span></div></div></div></div>
+            <p>表格之后的正文</p><div class="qk-md-table-action">不是表格旁的工具栏</div>""")
+        assertEquals("| 输入 | 输出 |\n| --- | --- |\n| \\[1\\] | {1: 1} |\n\n表格之后的正文\n\n不是表格旁的工具栏", result)
+    }
+
+    @Test
     fun codeBlockRetainsInternalBlankLinesSpacesAndBackticks() {
         val code = "def f():\n    text = \"\"\"a  \n\n\nb\"\"\"\n    return text\n# ```literal```"
         val result = evaluateMarkdown("<div>前<pre><code class='language-python'>$code</code></pre>后</div>")
@@ -478,7 +551,7 @@ class ArenaWebResponseScriptInstrumentedTest {
     ).getString("text")
 
     private fun evaluate(service: ArenaService, requestId: String, bodyHtml: String,
-                         strictPrompt: String = "", afterPrepareHtml: String? = null): JSONObject {
+                         strictPrompt: String = "", afterPrepareHtml: String? = null, afterPrepareScript: String = ""): JSONObject {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val result = AtomicReference<JSONObject>()
         val failure = AtomicReference<Throwable>()
@@ -503,6 +576,7 @@ class ArenaWebResponseScriptInstrumentedTest {
                                   if (state && ${strictPrompt.isEmpty()}) state.assistantBaseline = 0;
                                   if (state && ${strictPrompt.isNotEmpty()}) state.submittedAt = Date.now();
                                   ${afterPrepareHtml?.let { "document.body.insertAdjacentHTML('beforeend', ${JSONObject.quote(it)});" } ?: ""}
+                                  $afterPrepareScript
                                   return true;
                                 })();
                             """.trimIndent()

@@ -42,6 +42,21 @@ object ArenaErrorHelp {
                 next = "请打开网页确认，换用可用模型后再试。",
                 primary = Action.OPEN_PAGE,
             )
+            d.contains("最多接收") -> Advice(
+                what = "$serviceName 的网页一次收不下这么长的内容，这一轮没有发给它。",
+                next = "请把问题缩短一些，或换一家 AI；其他成员不受影响。",
+                primary = Action.NONE,
+            )
+            d.contains("额度已用完") -> Advice(
+                what = "$serviceName 账号的额度用完了，网页拒收了问题，没有发出。",
+                next = "请打开网页查看额度；恢复前重发也会被拒收，可以先不选它。",
+                primary = Action.OPEN_PAGE,
+            )
+            d.contains("草稿") -> Advice(
+                what = "$serviceName 的网页输入框里留着一段没发出的文字，为免和新问题混在一起，这一轮没有发送。",
+                next = "请核对这段文字：不需要就清空后重发，也可以打开网页自己处理。",
+                primary = Action.OPEN_PAGE,
+            )
             d.contains("不会自动重复发送") || d.contains("未确认送达") || d.contains("勿重复发送") -> Advice(
                 what = "无法确认 $serviceName 本轮问题的送达或回答状态。",
                 next = "请先打开网页核对是否已经收到或仍在排队，勿直接重复发送。",

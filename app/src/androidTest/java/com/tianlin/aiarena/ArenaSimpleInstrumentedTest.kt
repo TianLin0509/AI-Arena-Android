@@ -80,6 +80,79 @@ class ArenaSimpleInstrumentedTest {
         } finally { inst.runOnMainSync { controller?.destroy() } }
     }
 
+    @Test fun timelineReplaysEarlierRoundAndArchivedSummaryAfterFollowUp() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val repository = FixtureRepository(DiscussionSummary(phase = ParticipantPhase.COMPLETE, judge = ArenaService.DEEPSEEK,
+            text = "第一轮综合正文", detail = "总结完成", roundNumber = 1))
+        val pending = mutableListOf<Pair<String, (SendOutcome) -> Unit>>()
+        val gateway = object : ArenaGateway {
+            override fun sendPrompt(service: ArenaService, prompt: String, requestId: String, callback: (SendOutcome) -> Unit) {
+                pending += requestId to callback
+            }
+            override fun readResponse(service: ArenaService, requestId: String, callback: (ResponseSnapshot) -> Unit) =
+                callback(ResponseSnapshot(found = true, text = "第二轮回答正文", streaming = false))
+        }
+        var shared = ""
+        lateinit var controller: ArenaSessionController
+        inst.runOnMainSync {
+            controller = ArenaSessionController(gateway, ControllerTiming(pollIntervalMillis = 15, requiredStablePolls = 1), repository)
+        }
+        compose.setContent { ArenaTheme {
+            var draft by remember { mutableStateOf("") }
+            SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller,
+                draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() },
+                { _, _ -> true }, { _, text -> shared = text; true }, false, ArenaCaptainPreferences(LocalContext.current))
+        } }
+        try {
+            compose.onNodeWithTag("timeline-DEEPSEEK").assertDoesNotExist()
+            compose.onNodeWithTag("simple-composer").performTextInput("换个角度：只说最关键的一条")
+            compose.onNodeWithTag("simple-send").performClick()
+            compose.runOnIdle { pending.toList().forEach { (id, callback) -> callback(SendOutcome(true, id, "fixture receipt")) } }
+            compose.waitUntil(5_000) { !controller.isBusy && controller.completedCount == 3 }
+            compose.onNodeWithTag("current-round-label").assertTextContains("第 2 轮 · 追问", substring = true)
+            compose.onNodeWithText("第二轮回答正文").assertExists()
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasTestTag("timeline-DEEPSEEK"))
+            compose.onNodeWithContentDescription("展开时光机，查看此前 1 轮").performClick()
+            compose.onNodeWithTag("timeline-node-DEEPSEEK-1").performClick()
+            compose.onNodeWithTag("timeline-answer-DEEPSEEK").assertExists()
+            compose.onNodeWithText("把这 30 分钟留给开口", substring = true).assertExists()
+
+            compose.onNodeWithTag("answer-tab-summary").performClick()
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasTestTag("timeline-summary"))
+            compose.onNodeWithContentDescription("展开时光机，查看此前 1 轮").performClick()
+            compose.onNodeWithTag("timeline-node-summary-1").performClick()
+            compose.onNodeWithText("第一轮综合正文").assertExists()
+
+            compose.onNodeWithContentDescription("历史与设置").performClick()
+            compose.onNodeWithTag("menu-version").assertTextContains("v${BuildConfig.VERSION_NAME}", substring = true)
+            compose.onNodeWithTag("share-session").performClick()
+            compose.runOnIdle {
+                assertTrue(shared, shared.contains("第一轮综合正文") && shared.contains("第二轮回答正文") &&
+                    shared.contains("换个角度：只说最关键的一条") && shared.contains("把这 30 分钟留给开口"))
+                assertTrue(shared.indexOf("第一轮综合正文") < shared.indexOf("第二轮回答正文"))
+            }
+        } finally { inst.runOnMainSync { controller.destroy() } }
+    }
+
+    @Test fun blockingDraftIsShownVerbatimAndReplacedOnlyAfterConfirmation() {
+        var replaced: String? = null
+        var sends = 0
+        compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            SimpleAnswer(ArenaService.KIMI,
+                ParticipantRun(phase = ParticipantPhase.ERROR, requestId = "r", detail = "Kimi 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试"),
+                ServiceStatus(), {}, null, null, false, {}, { sends++ }, {},
+                draft = "上次被拒收的问题原文", onReplaceDraft = { replaced = it })
+        } } }
+        compose.onNodeWithTag("blocking-draft-KIMI").assertTextEquals("上次被拒收的问题原文")
+        compose.onNodeWithTag("replace-draft-KIMI").performScrollTo().performClick()
+        compose.onNodeWithText("「上次被拒收的问题原文」", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("取消").performClick()
+        compose.runOnIdle { assertNull(replaced) }
+        compose.onNodeWithTag("replace-draft-KIMI").performScrollTo().performClick()
+        compose.onNodeWithText("清空并重发").performClick()
+        compose.runOnIdle { assertEquals("上次被拒收的问题原文", replaced); assertEquals(0, sends) }
+    }
+
     @Test fun websiteRejectionIsVisibleWithoutOpeningErrorDetailsAndNeverAutoResends() {
         val cases = listOf(
             ArenaKimiRejection.busyDetail to "官网当前繁忙",

@@ -311,6 +311,33 @@ internal object ArenaWebResponseScript {
                     qwModernAnswers.some(node => !node.classList.contains('qk-markdown-complete'));
                   weakDoneSignal = true;
                 }
+                // 2026-09-27 real account: the page marks the answer qk-markdown-complete while its typewriter
+                // has drawn only part of it (or nothing) in a hidden WebView, so the DOM alone saved a cut
+                // answer or waited 5 minutes. The finished stream of the chat fetch that started after this
+                // round's send click holds the whole answer. Use it only when what the page shows so far is
+                // a prefix of it, so a mismatched stream can never replace this round's answer.
+                // The stream carries formulas as TeX; the page (and arenaToMarkdown) shows them readable.
+                // Convert outside code fences so the prefix check and the saved answer match the page.
+                const qwReadableMath = function(value) {
+                  return String(value).split(/(```[\s\S]*?```)/).map(function(part, index) {
+                    if (index % 2 === 1) return part;
+                    return part.replace(/\x24\x24([\s\S]+?)\x24\x24|\\\[([\s\S]+?)\\\]/g, function(m, a, b) { return '\n' + arenaReadableTex(a || b) + '\n'; })
+                      .replace(/\x24([^\x24\n]+?)\x24|\\\(([^\n]+?)\\\)/g, function(m, a, b) { return arenaReadableTex(a || b); })
+                      .replace(/\n{3,}/g, '\n\n');
+                  }).join('');
+                };
+                const qwFetched = networkRecord && networkRecord.fetchDone && typeof networkRecord.fetchAnswer === 'string' &&
+                  state.expectedPrompt && state.submittedAt && tagged &&
+                  Number(networkRecord.fetchCalledAt || 0) >= Number(state.submittedAt) - 1500
+                  ? clean(qwReadableMath(networkRecord.fetchAnswer.replace(/\[\[inline_action_[A-Za-z_]*[0-9]*\]\]/g, ''))) : '';
+                if (qwFetched) {
+                  const squash = function(value) { return String(value || '').replace(/[\s*#>`_~|:\-\\\[\]()]+/g, ''); };
+                  if (squash(qwFetched).startsWith(squash(text))) {
+                    text = qwFetched;
+                    finalText = qwFetched;
+                    streaming = false;
+                  }
+                }
                 if (securityChallenge && !text) {
                   throw new Error('千问触发安全验证，请打开千问网页完成验证后重试');
                 }

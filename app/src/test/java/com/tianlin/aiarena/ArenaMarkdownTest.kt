@@ -178,4 +178,16 @@ class ArenaMarkdownTest {
         assertEquals("保留``abc`未闭合", spans.joinToString("") { it.text })
         assertTrue(spans.none { it.code })
     }
+
+    @Test
+    fun codeBlockNestedInListItemStaysBetweenItems() {
+        // Serializer output for Yuanbao's wrapped list items (2026-09-27 real page).
+        val blocks = ArenaMarkdown.parse(
+            "- **去重**：先去重再推导：\n```python\nreturn {y: f(y) for y in dict.fromkeys(years)}\n```\n\n- 只要闰年：`[y for y in r]`",
+        )
+        assertEquals(3, blocks.size)
+        assertEquals(ArenaMdBlock.Bullet(0, "**去重**：先去重再推导："), blocks[0])
+        assertEquals(ArenaMdBlock.Code("python", "return {y: f(y) for y in dict.fromkeys(years)}"), blocks[1])
+        assertEquals(ArenaMdBlock.Bullet(0, "只要闰年：`[y for y in r]`"), blocks[2])
+    }
 }

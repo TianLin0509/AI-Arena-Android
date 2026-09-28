@@ -328,6 +328,7 @@ class ArenaSessionController(
             depth = depth,
             prompt = prompt,
             attachments = attachments.toList(),
+            roundNumber = history.lastOrNull()?.number ?: roundNumber,
         )
         sessionMessage = "正在请 ${judge.displayName} 做${depth.displayName}总结" +
             if (compressed) " · 已压缩引用回答" else ""
@@ -389,6 +390,37 @@ class ArenaSessionController(
             return false
         }
         return startRecovery(service, prompt, resend = true)
+    }
+
+    /** 新对话因网页输入框里的草稿停下时的草稿原文，供界面原样展示给用户确认。 */
+    fun blockingDraft(service: ArenaService): String? =
+        pool.freshConversationDraft(service)?.takeIf {
+            currentRoundKind == RoundKind.INITIAL && runs[service]?.phase == ParticipantPhase.ERROR
+        }
+
+    /** 用户确认过这段草稿可以被本轮问题替换后重发；网页草稿若已变化，新对话准备仍会停下。 */
+    fun retrySendReplacingDraft(service: ArenaService, draft: String): Boolean {
+        if (draft.isBlank() || blockingDraft(service) != draft) return false
+        if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+        pool.allowFreshDraftReplacement(service, draft)
+        return retrySend(service)
+    }
+
+    /** 当前这一轮是什么时候开始的；时光机给本轮标时间用。 */
+    val currentRoundStartedAtMillis: Long
+        get() = activeExecution?.takeIf { it.number == roundNumber }?.startedAtMillis
+            ?: history.lastOrNull { it.number == roundNumber }?.startedAtMillis ?: 0L
+
+    /**
+     * 开始新一轮前把已完成的综合答案归档到它依据的那一轮，免得追问后就再也看不到。
+     * 老文件的综合没有轮次记录时，归到最近一轮。
+     */
+    private fun archiveSummary() {
+        val done = summary.takeIf { it.phase == ParticipantPhase.COMPLETE && it.text.isNotBlank() } ?: return
+        val index = history.indexOfLast { it.number == done.roundNumber }
+            .takeIf { it >= 0 } ?: history.lastIndex.takeIf { done.roundNumber == 0 } ?: return
+        if (index < 0) return
+        history[index] = history[index].copy(summary = done)
     }
 
     fun retryExtraction(service: ArenaService): Boolean {
@@ -560,6 +592,7 @@ class ArenaSessionController(
         sessionEpoch += 1
         handler.removeCallbacksAndMessages(null)
         pollStates.clear()
+        archiveSummary()
         summary = DiscussionSummary()
         currentRoundContextNotice = ""
         roundNumber += 1

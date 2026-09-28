@@ -345,6 +345,7 @@ internal object ArenaSessionJson {
         .put("finishedAtMillis", round.finishedAtMillis)
         .put("captain", round.captain?.name ?: JSONObject.NULL)
         .put("attachments", encodeAttachments(round.attachments))
+        .put("summary", round.summary?.let(::encodeSummary) ?: JSONObject.NULL)
 
     private fun decodeRound(json: JSONObject): RoundRecord = RoundRecord(
         number = json.optInt("number"),
@@ -358,6 +359,7 @@ internal object ArenaSessionJson {
         finishedAtMillis = json.optLong("finishedAtMillis"),
         captain = json.optString("captain").enumOrNull<ArenaService>(),
         attachments = decodeAttachments(json),
+        summary = json.optJSONObject("summary")?.let(::decodeSummary),
     )
 
     private fun encodeSummary(summary: DiscussionSummary): JSONObject = JSONObject()
@@ -369,6 +371,7 @@ internal object ArenaSessionJson {
         .put("depth", summary.depth.name)
         .put("prompt", summary.prompt)
         .put("attachments", encodeAttachments(summary.attachments))
+        .put("roundNumber", summary.roundNumber)
 
     private fun decodeSummary(json: JSONObject): DiscussionSummary = DiscussionSummary(
         phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
@@ -379,6 +382,7 @@ internal object ArenaSessionJson {
         depth = SummaryDepth.fromName(json.optString("depth")),
         prompt = json.optString("prompt").take(ArenaLimits.MAX_STORED_PROMPT_CHARS),
         attachments = decodeAttachments(json),
+        roundNumber = json.optInt("roundNumber").coerceAtLeast(0),
     )
 
     private inline fun <reified T : Enum<T>> String.enumOrNull(): T? =
