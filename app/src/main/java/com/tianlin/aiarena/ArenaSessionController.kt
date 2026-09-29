@@ -657,7 +657,9 @@ class ArenaSessionController(
         relayOrder: List<ArenaService>? = null,
         style: DebateStyle? = null,
     ): Boolean {
-        if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
+        // 只有独立迭代允许单独一家（其他成员被跳过后的逃生通道）；提问、讨论、工作流都要至少两家。
+        val minimum = if (kind == RoundKind.ITERATION && relayOrder == null) 1 else 2
+        if (isBusy || services.size < minimum || services.any { prompts[it].isNullOrBlank() }) return false
         // 工作流：顺序必须恰好是本轮成员；第 1 位直接收到问题，之后每位轮到时再组装「问题 + 前面各位的回答」。
         val relay = relayOrder != null && relayOrder.size == services.size && relayOrder.toSet() == services.toSet()
         if (relayOrder != null && !relay) {
