@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.18.0`（`versionCode 30`）
+当前版本：`v0.18.1`（`versionCode 31`）
 
 ## 开发入口
 
@@ -28,6 +28,14 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 每次可选择 2-4 家 AI。
 - 聚焦普通用户，尤其是中老年用户的日常提问、群策群力和幻觉风险提示。
 - 登录信息、成员选择和讨论历史只保存在 Android 应用沙箱内。
+
+## 0.18.1 切到别的应用也能等回答、第一轮更快
+
+- 发出问题后可以切到别的应用：进行中的一轮用前台服务保住进程，通知栏显示进度；你不在圆桌界面时，各家答完会弹通知，点一下回来看。问题都送达后，回答页顶部提示「可以切到别的应用」。
+- 在后台期间，还没发出的成员原地等待，回到圆桌后接着发送，不再被判「超时」或「未检测到」；已送达的问题照常在后台收回答。安卓 13 起第一次开始一轮时会请求通知权限，拒绝也不影响使用。
+- 第一轮更快：你在首页写问题时，App 先把各家的新对话页打开并确认是空白的；点发送后直接用，不再等「打开新对话」。
+- 逃生通道：一轮进行中某家明显卡住或出错，在它的等待卡片上点「跳过这家」，只停这一家，其他成员照常答完；只剩一家答完时仍可「独立迭代」继续问。
+- 新 Logo「黏土圆桌」。
 
 ## 0.18.0 四种工作模式、侧栏时光机与新界面
 
@@ -244,7 +252,7 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.18.0`，`versionCode=30`。
+- 当前基线：`versionName=0.18.1`，`versionCode=31`。
 - 下一次小修复示例：`0.18.1 / versionCode 31`。
 - 下一次向后兼容新功能示例：`0.19.0 / versionCode 31`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。

@@ -5,6 +5,8 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -70,6 +72,18 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var skinPreferences: ArenaSkinPreferences
 
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /** 第一次开始一轮时问一次通知权限（答完提醒用）；拒绝后不再追问，功能照常只是没有提醒。 */
+    fun requestNotificationsOnce() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+        val prefs = getSharedPreferences("arena_notifications", MODE_PRIVATE)
+        if (prefs.getBoolean("asked", false)) return
+        prefs.edit().putBoolean("asked", true).apply()
+        runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // 必须在建 WebView / Compose 之前装，才能覆盖启动期的崩溃。
@@ -100,10 +114,23 @@ class MainActivity : ComponentActivity() {
                     shareText = ::shareText,
                     openExternalUrl = ::openExternalUrl,
                     restartApp = { ArenaRestart.trigger(this) },
+                    requestNotifications = ::requestNotificationsOnce,
                     skin = skin,
                 )
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ArenaForeground.setVisible(true)
+        ArenaRoundNotifier.clearDone(this)
+    }
+
+    override fun onStop() {
+        // 真正离开屏幕（切到别的应用、锁屏）才算后台；分屏或弹窗遮挡时页面仍在绘制。
+        if (!isChangingConfigurations) ArenaForeground.setVisible(false)
+        super.onStop()
     }
 
     override fun onResume() {
@@ -125,6 +152,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // 没有界面就没有「前台 / 后台」之分：网页池随 Activity 一起销毁，计时回到真实时间。
+        ArenaForeground.setVisible(true)
         attachmentActivityDestroyed = true
         attachmentPickGeneration++
         attachmentPickCallback = null

@@ -50,6 +50,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -87,6 +88,8 @@ fun ArenaApp(
     openExternalUrl: ((String) -> Boolean)? = null,
     /** 「重启应用」：由 Activity 提供，见 ArenaRestart。为 null 时设置页不显示该项。 */
     restartApp: (() -> Unit)? = null,
+    /** 第一次开始一轮时请求通知权限（切走后答完提醒用）。 */
+    requestNotifications: (() -> Unit)? = null,
     skin: ArenaSkin = ArenaSkin.default,
     onSkinChange: (ArenaSkin) -> Unit = {},
 ) {
@@ -101,6 +104,25 @@ fun ArenaApp(
     val sessionController = remember(pool, sessionRepository) {
         ArenaSessionController(pool = pool, sessionRepository = sessionRepository,
             progressTracker = ArenaProgressTracker(ArenaDurationStore(context)), presets = presetStore)
+    }
+    // 一轮进行中：前台服务 + 通知栏进度；用户不在圆桌界面时答完弹通知。
+    val roundNotifier = remember(context) { ArenaRoundNotifier(context.applicationContext) }
+    LaunchedEffect(sessionController.isBusy) {
+        if (sessionController.isBusy) requestNotifications?.invoke()
+        roundNotifier.update(ArenaRoundNotifier.progressText(sessionController), ArenaRoundNotifier.doneText(sessionController))
+    }
+    DisposableEffect(sessionController, roundNotifier) {
+        // 后台时界面不重组，所以由控制器的状态变化和前后台切换直接驱动，不走 Compose。
+        val refresh = { roundNotifier.update(ArenaRoundNotifier.progressText(sessionController), ArenaRoundNotifier.doneText(sessionController)) }
+        val listener: (Boolean) -> Unit = { refresh() }
+        sessionController.onStateChanged = refresh
+        ArenaForeground.addListener(listener)
+        refresh()
+        onDispose {
+            sessionController.onStateChanged = null
+            ArenaForeground.removeListener(listener)
+            roundNotifier.stop()
+        }
     }
     val questionDraft = rememberSaveable { mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion }) }
     val guidanceDraft = rememberSaveable { mutableStateOf("") }
@@ -688,6 +710,11 @@ private fun DiscussionHome(
             )
 
             RoundtablePage.HOME -> if (sessionStage == SessionStage.IDLE) {
+                // 用户写问题的同时把新对话页准备好，点发送后第一轮少等十来秒。
+                LaunchedEffect(selectedServices) {
+                    delay(1_200L)
+                    pool.prewarmFreshConversations(selectedServices)
+                }
                 SimpleAskHome(
                     attachmentDraft = initialAttachments, onChooseAttachments = { chooseFiles(initialAttachments) },
                     question = question, onQuestionChange = { question = it },
