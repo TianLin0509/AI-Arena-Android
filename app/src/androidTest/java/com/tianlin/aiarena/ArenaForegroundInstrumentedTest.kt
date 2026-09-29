@@ -1,11 +1,13 @@
 package com.tianlin.aiarena
 
 import android.os.Looper
+import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -54,6 +56,20 @@ class ArenaForegroundInstrumentedTest {
         while (kept.get() == 0 && ArenaForeground.elapsed() - back < 3_000L) Thread.sleep(50)
         assertEquals(1, kept.get())
         assertEquals("removeCallbacks cancels work that was waiting for the foreground", 0, cancelled.get())
+    }
+
+    @Test fun aRoundThatEndsAtOnceStopsTheServiceWithoutCrashingTheApp() {
+        // 2026-09-29: stopService before the service reached startForeground crashed the App ~10 s later.
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                val notifier = ArenaRoundNotifier(activity.applicationContext)
+                notifier.update("正在发送问题（0/3）", "")
+                notifier.update(null, "")
+            }
+            Thread.sleep(12_000)
+            assertFalse("The service stopped itself right after entering the foreground", ArenaRoundService.inForeground)
+            assertFalse(ArenaRoundService.stopRequested)
+        }
     }
 
     @Test fun foregroundClockSkipsTimeSpentInTheBackground() {

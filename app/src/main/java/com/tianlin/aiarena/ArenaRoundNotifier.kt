@@ -20,18 +20,39 @@ class ArenaRoundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = ArenaRoundNotifier.progressNotification(this, intent?.getStringExtra(EXTRA_TEXT).orEmpty())
-        runCatching {
+        // startForegroundService 之后必须先 startForeground，哪怕这一轮已经结束，否则系统会让 App 崩溃。
+        val started = runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(ArenaRoundNotifier.PROGRESS_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             } else {
                 startForeground(ArenaRoundNotifier.PROGRESS_ID, notification)
             }
-        }.onFailure { stopSelf() }
+        }.isSuccess
+        inForeground = started
+        if (!started || stopRequested) {
+            stopRequested = false
+            finish()
+        }
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        inForeground = false
+        super.onDestroy()
+    }
+
+    private fun finish() {
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        inForeground = false
+        stopSelf()
     }
 
     companion object {
         const val EXTRA_TEXT = "text"
+        /** 服务已进入前台；之前请求停止只能先记下，等它进入前台后再停（2026-09-29 设备测试发现的崩溃）。 */
+        var inForeground = false
+            private set
+        var stopRequested = false
     }
 }
 
@@ -46,6 +67,7 @@ class ArenaRoundNotifier(private val context: Context) {
             if (!running) {
                 // 前台服务只能在 App 可见时启动；一轮总是用户在前台点发送开始的。
                 if (!ArenaForeground.visible) return
+                ArenaRoundService.stopRequested = false
                 running = runCatching {
                     context.startForegroundService(Intent(context, ArenaRoundService::class.java).putExtra(ArenaRoundService.EXTRA_TEXT, text))
                 }.isSuccess
@@ -67,7 +89,9 @@ class ArenaRoundNotifier(private val context: Context) {
         if (!running) return
         running = false
         lastText = ""
-        runCatching { context.stopService(Intent(context, ArenaRoundService::class.java)) }
+        // 一轮刚开就结束（点发送后马上停止）时，服务可能还没进入前台：记下停止请求，由服务进入前台后自己停。
+        if (ArenaRoundService.inForeground) runCatching { context.stopService(Intent(context, ArenaRoundService::class.java)) }
+        else ArenaRoundService.stopRequested = true
     }
 
     private fun manager() = context.getSystemService(NotificationManager::class.java)
