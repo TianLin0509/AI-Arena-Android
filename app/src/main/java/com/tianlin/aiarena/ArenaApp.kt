@@ -97,9 +97,10 @@ fun ArenaApp(
     val navigationPreferences = remember(context) { ArenaNavigationPreferences(context) }
     val guidePreferences = remember(context) { ArenaGuidePreferences(context) }
     val sessionRepository = remember(context) { ArenaSessionStore(context) }
+    val presetStore = remember(context) { ArenaPresetStore(context) }
     val sessionController = remember(pool, sessionRepository) {
         ArenaSessionController(pool = pool, sessionRepository = sessionRepository,
-            progressTracker = ArenaProgressTracker(ArenaDurationStore(context)))
+            progressTracker = ArenaProgressTracker(ArenaDurationStore(context)), presets = presetStore)
     }
     val questionDraft = rememberSaveable { mutableStateOf(debugInitialQuestion.ifBlank { sessionController.originalQuestion }) }
     val guidanceDraft = rememberSaveable { mutableStateOf("") }
@@ -702,6 +703,11 @@ private fun DiscussionHome(
                     onTooLong = { scope.launch { snackbarHostState.showSnackbar("问题超过 ${ArenaLimits.MAX_QUESTION_CHARS} 字了") } },
                     onStart = {
                         if (!sessionController.startInitial(question, selectedServices, AnswerMode.PARALLEL, initialAttachments.attachments)) {
+                            scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
+                        } else initialAttachments.clear()
+                    },
+                    onStartRelay = { order ->
+                        if (!sessionController.startInitial(question, selectedServices, AnswerMode.SERIAL, initialAttachments.attachments, relayOrder = order)) {
                             scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
                         } else initialAttachments.clear()
                     },

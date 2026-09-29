@@ -149,5 +149,8 @@ class ArenaGuidanceTest {
         val draft = ArenaErrorHelp.explain("Kimi 新对话输入框里有未发出的草稿（常见于上次被网页拒收的问题），本轮未发送；请打开原网页清除草稿后重试", "Kimi")
         assertTrue(draft.what.contains("没发出的文字"))
         assertFalse(draft.what.contains("没有正常响应"))
+        // Doubao's restored old attachment is not a text draft (0.17.0 review note).
+        val attachment = ArenaErrorHelp.explain("豆包出现额外附件或恢复的旧草稿，未发送问题；请打开原网页检查", "豆包")
+        assertFalse(attachment.what.contains("没发出的文字"))
     }
 }

@@ -2,42 +2,40 @@ package com.tianlin.aiarena
 
 import androidx.annotation.DrawableRes
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
-import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
-import android.os.SystemClock
 
-/** A compact header shared by the question and answer pages. */
+/** 顶栏：左侧菜单，中间标题，右侧「时光机」「新提问」带文字小标，长辈一眼知道是什么。 */
 @Composable
 internal fun SimpleHeader(busy: Boolean, onNew: () -> Unit, onNavigate: (RoundtablePage) -> Unit,
-                          onShareSession: (() -> Unit)? = null) {
+                          onShareSession: (() -> Unit)? = null, onTimeMachine: (() -> Unit)? = null) {
     var menu by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf(false) }
+    val colors = ArenaStyle.colors
     if (confirm) ConfirmDialog(
         title = "开始新会话？", text = "将停止等待本轮回答，已收到的内容会保留在历史中。",
         confirmLabel = "开始新会话", onConfirm = { confirm = false; onNew() }, onDismiss = { confirm = false },
     )
-    Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 8.dp),
+    Row(Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.statusBars).padding(horizontal = 6.dp).heightIn(min = 56.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Box {
             SimpleIcon(R.drawable.ic_menu, "历史与设置", { menu = true })
@@ -46,15 +44,30 @@ internal fun SimpleHeader(busy: Boolean, onNew: () -> Unit, onNavigate: (Roundta
                 DropdownMenuItem(text = { Text("设置") }, onClick = { menu = false; onNavigate(RoundtablePage.SETTINGS) })
                 if (onShareSession != null) DropdownMenuItem(text = { Text("分享整场讨论") },
                     onClick = { menu = false; onShareSession() }, modifier = Modifier.testTag("share-session"))
-                HorizontalDivider(color = ArenaStyle.colors.border, thickness = 0.5.dp)
+                HorizontalDivider(color = colors.border, thickness = 0.5.dp)
                 DropdownMenuItem(text = { Text("AI 圆桌 v${BuildConfig.VERSION_NAME}", style = MaterialTheme.typography.labelSmall) },
                     onClick = {}, enabled = false, modifier = Modifier.testTag("menu-version"))
             }
         }
-        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            Text("AI 圆桌", style = MaterialTheme.typography.titleSmall)
+        Row(Modifier.weight(1f).padding(start = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            ArenaIcon(R.drawable.ic_logo, tint = Color.Unspecified, size = 24.dp)
+            Text("AI 圆桌", Modifier.padding(start = 8.dp), style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold, color = colors.ink)
         }
-        SimpleIcon(R.drawable.ic_add, "新提问", { if (busy) confirm = true else onNew() }, Modifier.testTag("new-session"))
+        if (onTimeMachine != null) LabeledIcon(R.drawable.ic_history, "时光机", "打开时光机，回看这场讨论的每一轮", onTimeMachine,
+            Modifier.testTag("open-time-machine"))
+        LabeledIcon(R.drawable.ic_add, "新提问", "新提问", { if (busy) confirm = true else onNew() }, Modifier.testTag("new-session"))
+    }
+}
+
+@Composable
+private fun LabeledIcon(@DrawableRes icon: Int, label: String, description: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val colors = ArenaStyle.colors
+    Column(modifier.widthIn(min = 56.dp).heightIn(min = 52.dp).clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick)
+        .semantics(mergeDescendants = true) { contentDescription = description }.padding(horizontal = 6.dp, vertical = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        ArenaIcon(icon, tint = colors.ink, size = 22.dp)
+        Text(label, style = MaterialTheme.typography.labelSmall, color = colors.muted)
     }
 }
 
@@ -69,73 +82,89 @@ internal fun SimpleIcon(@DrawableRes icon: Int, label: String, onClick: () -> Un
 internal fun SimpleAvatar(service: ArenaService, onOpen: () -> Unit) {
     IconButton(onClick = onOpen, modifier = Modifier.size(48.dp).testTag("avatar-${service.name}")
         .semantics { contentDescription = "打开 ${service.shortName} 网页" }) {
-        BrandAvatar(service = service, size = 32.dp)
+        BrandAvatar(service = service, size = 34.dp)
     }
 }
 
 @Composable
-internal fun SimpleComposer(
-    text: String, onChange: (String) -> Unit, hint: String, scope: String,
-    enabled: Boolean, busy: Boolean = false, onSend: () -> Unit,
-    onStop: () -> Unit = {}, onDiscuss: (() -> Unit)? = null, onSummary: (() -> Unit)? = null,
-    attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
-    attachmentNotice: String? = null,
+internal fun SimpleNotice(text: String) {
+    Text(text, Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
+        style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.warning)
+}
+
+/** 附件列表 + 圆角输入框 + 圆形发送键；首页和回答页共用。 */
+@Composable
+internal fun InputBar(
+    text: String, onChange: (String) -> Unit, hint: String, enabled: Boolean, busy: Boolean, onSend: () -> Unit, onStop: () -> Unit,
+    attachmentDraft: AttachmentDraft?, onChooseAttachments: (() -> Unit)?, attachmentNotice: String?, sendDescription: String = "发送问题",
 ) {
-    var more by remember { mutableStateOf(false) }
     val colors = ArenaStyle.colors
-    Surface(color = colors.page) {
-        Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
-            color = colors.card, shape = RoundedCornerShape(18.dp)) {
-            Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
-                if (attachmentDraft != null && attachmentDraft.attachments.isNotEmpty()) {
-                    Column(Modifier.fillMaxWidth().heightIn(max = 140.dp).verticalScroll(rememberScrollState())) {
-                        attachmentDraft.attachments.forEach { file ->
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(file.name, Modifier.weight(1f).padding(start = 10.dp), maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
-                                SimpleIcon(R.drawable.ic_close, "移除附件 ${file.name}", { attachmentDraft.remove(file.id) },
-                                    enabled = enabled && !busy && !attachmentDraft.picking)
-                            }
-                        }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (attachmentDraft != null && attachmentDraft.attachments.isNotEmpty()) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 140.dp).verticalScroll(rememberScrollState())) {
+                attachmentDraft.attachments.forEach { file ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(file.name, Modifier.weight(1f).padding(start = 10.dp), maxLines = 1,
+                            overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                        SimpleIcon(R.drawable.ic_close, "移除附件 ${file.name}", { attachmentDraft.remove(file.id) },
+                            enabled = enabled && !busy && !attachmentDraft.picking)
                     }
-                    Text(attachmentNotice ?: "文件将自动发给本轮成员；各家确认附件就绪后再提问。",
-                        Modifier.padding(horizontal = 10.dp).testTag("attachment-member-notice"),
-                        style = MaterialTheme.typography.labelSmall, color = if (attachmentNotice == null) colors.muted else colors.warning)
                 }
-                attachmentDraft?.error?.let { SimpleNotice(it) }
-                if (attachmentDraft?.picking == true) Text("正在添加附件…", Modifier.padding(10.dp), style = MaterialTheme.typography.labelSmall)
-                TextField(value = text, onValueChange = onChange, placeholder = { Text(hint) },
-                    modifier = Modifier.fillMaxWidth().testTag("simple-composer"), minLines = 1, maxLines = 3,
-                    textStyle = MaterialTheme.typography.bodyMedium,
-                    colors = TextFieldDefaults.colors(focusedContainerColor = colors.card, unfocusedContainerColor = colors.card,
-                        focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
-                        unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            }
+            Text(attachmentNotice ?: "文件将自动发给本轮成员；各家确认附件就绪后再提问。",
+                Modifier.padding(horizontal = 10.dp).testTag("attachment-member-notice"),
+                style = MaterialTheme.typography.labelSmall, color = if (attachmentNotice == null) colors.muted else colors.warning)
+        }
+        attachmentDraft?.error?.let { SimpleNotice(it) }
+        if (attachmentDraft?.picking == true) Text("正在添加附件…", Modifier.padding(10.dp), style = MaterialTheme.typography.labelSmall)
+        Row(verticalAlignment = Alignment.Bottom) {
+            Surface(Modifier.weight(1f), color = colors.card, shape = RoundedCornerShape(24.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     if (onChooseAttachments != null) SimpleIcon(R.drawable.ic_add, "添加照片或文件", onChooseAttachments,
                         Modifier.testTag("choose-attachments"), enabled = enabled && !busy && attachmentDraft?.picking != true)
-                    Text(scope, Modifier.weight(1f).padding(start = 10.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                    if (onDiscuss != null) Box {
-                        SimpleIcon(R.drawable.ic_more, "更多讨论方式", { more = true })
-                        DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
-                            DropdownMenuItem(text = { Text("让 AI 互相讨论") }, enabled = enabled && !busy && attachmentDraft?.picking != true,
-                                onClick = { more = false; onDiscuss() })
-                            if (onSummary != null) DropdownMenuItem(text = { Text("综合一下") }, onClick = { more = false; onSummary() })
-                        }
-                    }
-                    IconButton(onClick = if (busy) onStop else onSend, enabled = busy || (enabled && attachmentDraft?.picking != true),
-                        modifier = Modifier.size(48.dp).testTag("simple-send")
-                            .semantics { contentDescription = if (busy) "停止等待" else "发送问题" }) {
-                        Box(Modifier.size(34.dp).background(if (busy || enabled) colors.accent else colors.surfaceAlt, CircleShape), contentAlignment = Alignment.Center) {
-                            ArenaIcon(if (busy) R.drawable.ic_close else R.drawable.ic_send,
-                                tint = if (busy || enabled) colors.onAccent else colors.muted, size = 19.dp)
-                        }
-                    }
+                    TextField(value = text, onValueChange = onChange, placeholder = { Text(hint, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                        modifier = Modifier.weight(1f).testTag("simple-composer"), minLines = 1, maxLines = 4,
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                        colors = TextFieldDefaults.colors(focusedContainerColor = colors.card, unfocusedContainerColor = colors.card,
+                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+                }
+            }
+            IconButton(onClick = if (busy) onStop else onSend, enabled = busy || (enabled && attachmentDraft?.picking != true),
+                modifier = Modifier.padding(start = 8.dp).size(56.dp).testTag("simple-send")
+                    .semantics { contentDescription = if (busy) "停止等待" else sendDescription }) {
+                Box(Modifier.size(52.dp).background(if (busy || enabled) colors.accent else colors.surfaceAlt, CircleShape), contentAlignment = Alignment.Center) {
+                    ArenaIcon(if (busy) R.drawable.ic_close else R.drawable.ic_send,
+                        tint = if (busy || enabled) colors.onAccent else colors.muted, size = 22.dp)
                 }
             }
         }
     }
 }
 
+/**
+ * 回答页输入区：四段模式 → 该模式的选项 → 预设卡片 → 输入框。
+ * 「独立迭代」没有预设，原文发给每位成员。
+ */
+@Composable
+internal fun ModeComposer(
+    mode: RoundMode, onMode: (RoundMode) -> Unit, text: String, onText: (String) -> Unit, ready: Boolean, busy: Boolean,
+    attachmentDraft: AttachmentDraft?, onChooseAttachments: (() -> Unit)?, attachmentNotice: String?, scope: String,
+    options: @Composable () -> Unit, preset: (@Composable () -> Unit)?, onStop: () -> Unit, onSend: () -> Unit,
+) {
+    val colors = ArenaStyle.colors
+    Surface(color = colors.page, shadowElevation = 6.dp, shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
+            if (mode != RoundMode.ITERATE) options()
+            preset?.invoke()
+            Text(scope, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
+            InputBar(text, onText, mode.placeholder, ready, busy, onSend, onStop, attachmentDraft, onChooseAttachments,
+                attachmentNotice, sendDescription = mode.sendLabel)
+        }
+    }
+}
+
+/** 首页：新 Logo、成员卡、示例问题，底部「一起回答 / 接力回答」+ 输入框。 */
 @Composable
 internal fun SimpleAskHome(
     question: String, onQuestionChange: (String) -> Unit, selectedServices: List<ArenaService>, usableCount: Int,
@@ -144,406 +173,72 @@ internal fun SimpleAskHome(
     lengthAdvisory: String?, offline: Boolean, crashNotice: ArenaCrashReport?, onCrashDismiss: () -> Unit,
     pendingConnectionCount: Int = 0,
     attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
+    onStartRelay: ((List<ArenaService>) -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
+    var relay by rememberSaveable { mutableStateOf(false) }
+    var orderNames by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    val order = orderNames.mapNotNull(ArenaService::fromName).filter { it in selectedServices }
+        .let { saved -> saved + selectedServices.filterNot { it in saved } }
     Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
         SimpleHeader(false, { onQuestionChange(""); attachmentDraft?.clear() }, onNavigate)
-        Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically)) {
             if (offline) SimpleNotice("网络未连接，请检查 Wi-Fi 或手机流量。")
             if (crashNotice != null) {
                 TextButton(onClick = onCrashDismiss) { Text("上次异常退出，历史已保留 · 知道了", style = MaterialTheme.typography.bodySmall) }
             }
-            ArenaIcon(R.drawable.ic_roundtable, tint = colors.accent, size = 38.dp)
-            Spacer(Modifier.height(16.dp))
-            Text("想听听不同的答案？", style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(8.dp))
-            Text("一个问题，一起问。", color = colors.muted, style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(16.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                selectedServices.forEach { service -> SimpleAvatar(service) { onOpenService(service) } }
-                TextButton(onClick = onMembers) { Text("更换", style = MaterialTheme.typography.bodySmall) }
+            ArenaIcon(R.drawable.ic_logo, tint = Color.Unspecified, size = 96.dp, modifier = Modifier.testTag("home-logo"))
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("想听听不同的答案？", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = colors.ink)
+                Text("一个问题，一起问。", Modifier.padding(top = 6.dp), color = colors.muted, style = MaterialTheme.typography.bodyMedium)
+            }
+            Surface(Modifier.fillMaxWidth(), color = colors.card, shape = RoundedCornerShape(18.dp)) {
+                Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp).horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
+                    selectedServices.forEach { service ->
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            SimpleAvatar(service) { onOpenService(service) }
+                            Text(service.shortName, style = MaterialTheme.typography.labelSmall, color = colors.ink)
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = onMembers) { Text("更换", style = MaterialTheme.typography.titleSmall, color = colors.accent) }
+                }
             }
             if (usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS) TextButton(onClick = onConnections) { Text("先登录至少两家 AI") }
-            if (question.isBlank()) TextButton(onClick = { onQuestionChange("每天只有 30 分钟，怎么把英语口语练起来？") }) {
-                Text("每天 30 分钟，怎么练好口语？", style = MaterialTheme.typography.bodySmall, color = colors.muted)
+            if (question.isBlank()) Surface(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                .clickable { onQuestionChange("每天只有 30 分钟，怎么把英语口语练起来？") }, color = colors.accentSoft, shape = RoundedCornerShape(16.dp)) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("示例问题：", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                    Text("每天只有 30 分钟，怎么把英语口语练起来？", Modifier.padding(top = 4.dp), style = MaterialTheme.typography.bodyMedium,
+                        color = colors.ink, textAlign = TextAlign.Start)
+                }
             }
         }
         if (lengthAdvisory != null) SimpleNotice(lengthAdvisory)
-        SimpleComposer(question, onQuestionChange, "问一个问题…", selectedServices.joinToString(" · ") { it.shortName }, true,
-            onSend = {
-                when {
-                    question.isBlank() && attachmentDraft?.attachments.isNullOrEmpty() -> onNeedQuestion()
-                    question.length > ArenaLimits.MAX_QUESTION_CHARS -> onTooLong()
-                    usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS -> onConnections()
-                    else -> onStart()
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (onStartRelay != null) {
+                ModeSegmented(listOf("together" to "一起回答", "relay" to "接力回答"), if (relay) "relay" else "together", true,
+                    { relay = it == "relay" }, testTagPrefix = "home-mode")
+                if (relay) RelayOrderRow(order, true) { index ->
+                    val list = order.toMutableList(); list[index - 1] = list[index].also { list[index] = list[index - 1] }
+                    orderNames = list.map { it.name }
                 }
-            }, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
-            attachmentNotice = ArenaAttachmentSupport.notice(selectedServices, attachmentDraft?.attachments.orEmpty()))
-    }
-}
-
-@Composable
-private fun SimpleNotice(text: String) {
-    Text(text, Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
-        style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.warning)
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, phases: Map<ArenaService, ParticipantPhase>, onSelect: (String) -> Unit) {
-    val keys = members.map { it.name } + "summary"
-    ScrollableTabRow(selectedTabIndex = keys.indexOf(selected).coerceAtLeast(0), edgePadding = 8.dp,
-        containerColor = ArenaStyle.colors.page, contentColor = ArenaStyle.colors.accent,
-        indicator = { positions ->
-            Box(Modifier.tabIndicatorOffset(positions[keys.indexOf(selected).coerceAtLeast(0)]).height(2.dp), contentAlignment = Alignment.BottomCenter) {
-                Box(Modifier.width(26.dp).fillMaxHeight().background(ArenaStyle.colors.accent, RoundedCornerShape(2.dp)))
+                Text(if (relay) "按顺序接力：第 1 位直接回答，之后每位参考前面各位的回答再补充。" else "原文同时发给每位成员，各自独立回答。",
+                    Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
             }
-        },
-        divider = { HorizontalDivider(color = ArenaStyle.colors.border, thickness = 0.5.dp) }) {
-        keys.forEachIndexed { index, key ->
-            val failed = members.getOrNull(index)?.let { phases[it] == ParticipantPhase.ERROR } == true
-            Tab(selected = selected == key, onClick = { onSelect(key) }, modifier = Modifier.testTag("answer-tab-$key"),
-                text = { Text((members.getOrNull(index)?.shortName ?: "综合") + if (failed) " · !" else "",
-                    style = MaterialTheme.typography.labelMedium, fontWeight = if (selected == key) FontWeight.Medium else FontWeight.Normal,
-                    color = if (selected == key) ArenaStyle.colors.ink else ArenaStyle.colors.muted) })
-        }
-    }
-}
-
-@Composable
-internal fun SimpleAnswer(
-    service: ArenaService, run: ParticipantRun, status: ServiceStatus, onOpen: () -> Unit,
-    onCopy: (() -> Unit)?, onShare: (() -> Unit)?, busy: Boolean,
-    onReextract: () -> Unit, onResend: () -> Unit, onSummary: () -> Unit,
-    draft: String? = null, onReplaceDraft: (String) -> Unit = {},
-) {
-    var confirmResend by remember { mutableStateOf(false) }
-    var confirmDraft by remember { mutableStateOf<String?>(null) }
-    var details by rememberSaveable { mutableStateOf(false) }
-    val colors = ArenaStyle.colors
-    if (confirmResend) ConfirmDialog("重新发送给 ${service.shortName}？", "会再次发送本轮问题。请先打开网页确认是否已收到或仍在排队，避免重复发送。", "确认重发",
-        onConfirm = { confirmResend = false; onResend() }, onDismiss = { confirmResend = false })
-    confirmDraft?.let { text ->
-        ConfirmDialog("清空这段草稿并重发？",
-            "${service.shortName} 输入框里的这段文字会被本轮问题替换：\n\n「${text.take(300)}${if (text.length > 300) "…" else ""}」\n\n只替换这一段；网页里的文字若已改变会停下，不会发送。",
-            "清空并重发", onConfirm = { confirmDraft = null; onReplaceDraft(text) }, onDismiss = { confirmDraft = null })
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        SimpleAvatar(service, onOpen)
-        Text(service.shortName, style = MaterialTheme.typography.labelMedium)
-        Spacer(Modifier.weight(1f))
-        if (run.phase != ParticipantPhase.COMPLETE) Text(if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") "本轮未参与"
-            else runStatusWord(run, status), style = MaterialTheme.typography.labelSmall,
-            color = if (run.phase == ParticipantPhase.ERROR) colors.error else colors.muted)
-    }
-    if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") {
-        // Follow-ups and discussions go only to members that answered the previous round.
-        Text("这一轮没有发给 ${service.shortName}：上一轮它没有成功回答。之前的内容在上方时光机里。",
-            Modifier.padding(vertical = 8.dp).testTag("sat-out-${service.name}"),
-            style = MaterialTheme.typography.bodySmall, color = colors.muted)
-    }
-    if (run.response.isNotBlank()) SelectionContainer(Modifier.testTag("simple-answer-${service.name}")) {
-        MarkdownText(run.response, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
-    }
-    if (run.responseTruncated) {
-        SimpleNotice("原回答约 ${run.originalResponseLength} 字，圆桌仅保留前 ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS} 字；点击头像查看完整原文。")
-    }
-    if (run.phase == ParticipantPhase.WAITING && (run.detail.contains("安全验证") || run.detail.contains("迟迟没有回应"))) {
-        SimpleNotice(run.detail)
-        TextButton(onClick = onOpen) { Text("打开网页处理") }
-    }
-    if (run.phase == ParticipantPhase.ERROR) {
-        val advice = ArenaErrorHelp.explain(run.detail, service.shortName)
-        SimpleNotice(advice.what + " " + advice.next)
-        if (draft != null) {
-            Surface(Modifier.fillMaxWidth().padding(vertical = 4.dp), color = colors.card, shape = RoundedCornerShape(10.dp)) {
-                Column(Modifier.padding(10.dp)) {
-                    Text("网页输入框里没发出的文字", style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                    Text(draft, Modifier.padding(top = 4.dp).testTag("blocking-draft-${service.name}"),
-                        style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            TextButton(onClick = { confirmDraft = draft }, enabled = !busy,
-                modifier = Modifier.testTag("replace-draft-${service.name}")) { Text("清空这段草稿并重发") }
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            TextButton(onClick = onOpen) { Text("打开网页") }
-            TextButton(onClick = onReextract, enabled = !busy && run.requestId.isNotBlank()) { Text("重新读取") }
-        }
-        TextButton(onClick = { confirmResend = true }, enabled = !busy) { Text("重发本轮问题") }
-        TextButton(onClick = { details = !details }) { Text(if (details) "收起详情" else "错误详情", style = MaterialTheme.typography.bodySmall) }
-        if (details) Text(run.detail, style = MaterialTheme.typography.bodySmall, color = colors.muted)
-    }
-    if (run.response.isNotBlank()) Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        if (onCopy != null) SimpleIcon(R.drawable.ic_copy, "复制 ${service.shortName} 的回答", onCopy)
-        if (onShare != null) TextButton(onClick = onShare) { Text("分享", style = MaterialTheme.typography.bodySmall) }
-        TextButton(onClick = onSummary) { Text("综合一下", style = MaterialTheme.typography.bodySmall) }
-    }
-}
-
-@Composable
-internal fun SimpleRoundStage(
-    statuses: Map<ArenaService, ServiceStatus>, sessionController: ArenaSessionController,
-    roundGuidance: String, onRoundGuidanceChange: (String) -> Unit, onNewSession: () -> Unit,
-    onNavigate: (RoundtablePage) -> Unit, onOpenService: (ArenaService) -> Unit,
-    snackbarHostState: SnackbarHostState, copyText: TextCopyRequest?, shareText: TextShareRequest?,
-    offline: Boolean, captainPreferences: ArenaCaptainPreferences,
-    attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
-) {
-    val colors = ArenaStyle.colors
-    val members = sessionController.sessionServices
-    var selected by rememberSaveable(sessionController.askedAtMillis) { mutableStateOf(members.first().name) }
-    val current = selected.takeIf { it == "summary" || members.any { m -> m.name == it } } ?: members.first().name
-    val currentQuestion = sessionController.currentQuestion
-    val busy = sessionController.isBusy
-    val ready = sessionController.stage == SessionStage.READY && sessionController.completedCount >= ArenaService.MIN_MEMBERS && !busy
-    val scope = rememberCoroutineScope()
-    val scrollStates = rememberSaveableStateHolder()
-    fun notifyFailure(success: Boolean) { if (!success) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } }
-    val summarize: () -> Unit = { selected = "summary" }
-    val copyFromTimeline: ((String, String) -> Unit)? = copyText?.let { copy -> { label, text -> scope.launch {
-        snackbarHostState.showSnackbar(if (copy(label, text)) "已复制" else "复制失败")
-    }; Unit } }
-    val shareSession: (() -> Unit)? = shareText?.let { share -> {
-        val prepared = ShareTextPolicy.fullSession(sessionController.originalQuestion, sessionController.askedAtMillis,
-            sessionController.history.toList(), sessionController.summary)
-        scope.launch {
-            if (!share("AI 圆桌整场讨论", prepared.text)) snackbarHostState.showSnackbar("分享失败")
-            else if (prepared.truncated) snackbarHostState.showSnackbar("内容过长，已截取后分享")
-        }; Unit
-    } }
-    Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
-        SimpleHeader(busy, onNewSession, onNavigate, onShareSession = shareSession.takeIf { sessionController.history.isNotEmpty() })
-        SimpleAnswerTabs(members, current, sessionController.runs.mapValues { it.value.phase }) { selected = it }
-        if (offline) SimpleNotice("网络未连接；已收到的回答仍可阅读。")
-        sessionController.storageWarning?.let { SimpleNotice(it) }
-        if (listOf("压缩", "截取", "预算", "上限").any { sessionController.sessionMessage.contains(it) }) {
-            SimpleNotice(sessionController.sessionMessage)
-        }
-        scrollStates.SaveableStateProvider("${sessionController.askedAtMillis}-$current") {
-            LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("answer-scroll"), state = rememberLazyListState(),
-                contentPadding = PaddingValues(horizontal = 18.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                val roundNow = sessionController.roundNumber
-                val pastRounds = if (current == "summary") ArenaTimeline.pastSummaries(sessionController.history, roundNow)
-                    else ArenaTimeline.pastRoundsFor(members.first { it.name == current }, sessionController.history, roundNow)
-                if (pastRounds.isNotEmpty()) item("timeline") {
-                    SimpleTimeline(current, sessionController.askedAtMillis, pastRounds,
-                        question = { ArenaTimeline.roundQuestion(it, sessionController.originalQuestion) }) { round ->
-                        if (current == "summary") round.summary?.let { summary ->
-                            TimelineSummary(summary, copyFromTimeline?.let { copy -> { text -> copy("第 ${round.number} 轮综合答案", text) } })
-                        } else {
-                            val service = members.first { it.name == current }
-                            TimelineAnswer(service, round.results[service],
-                                copyFromTimeline?.let { copy -> { text -> copy("${service.shortName} 第 ${round.number} 轮回答", text) } })
-                        }
+            InputBar(question, onQuestionChange, "问一个问题…", true, false,
+                onSend = {
+                    when {
+                        question.isBlank() && attachmentDraft?.attachments.isNullOrEmpty() -> onNeedQuestion()
+                        question.length > ArenaLimits.MAX_QUESTION_CHARS -> onTooLong()
+                        usableCount + pendingConnectionCount < ArenaService.MIN_MEMBERS -> onConnections()
+                        relay && onStartRelay != null -> onStartRelay(order)
+                        else -> onStart()
                     }
-                }
-                item("question") {
-                    Surface(Modifier.fillMaxWidth().padding(start = 20.dp), color = colors.card, shape = RoundedCornerShape(14.dp)) {
-                        Column(Modifier.padding(13.dp)) {
-                            if (roundNow > 1) {
-                                val basis = sessionController.summary.roundNumber.takeIf { current == "summary" && it > 0 }
-                                Text(when {
-                                    basis != null -> "依据第 $basis 轮回答整理"
-                                    current == "summary" -> "第 $roundNow 轮"
-                                    else -> "第 $roundNow 轮 · " + (sessionController.currentRoundKind?.let(ArenaTimeline::kindLabel) ?: "") +
-                                        (sessionController.currentRoundStartedAtMillis.takeIf { it > 0L }?.let { " · " + formatAskedTime(it) } ?: "")
-                                }.trimEnd(' ', '·'), Modifier.padding(bottom = 4.dp).testTag("current-round-label"),
-                                    style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                            }
-                            SelectionContainer {
-                                Text(if (current == "summary") "讨论主题：${sessionController.originalQuestion}" else currentQuestion,
-                                    Modifier.testTag("current-question"), style = MaterialTheme.typography.bodyMedium)
-                            }
-                            val files = if (current == "summary") sessionController.summary.attachments else sessionController.lastRoundAttachments
-                            if (files.isNotEmpty()) Text("本轮附件：${files.joinToString("、") { it.name }}",
-                                Modifier.padding(top = 6.dp).testTag("round-attachment-names"),
-                                style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                        }
-                    }
-                }
-                if (current == "summary") item("summary") {
-                    SimpleSummary(sessionController, members, captainPreferences, ready, roundGuidance,
-                        onStarted = { onRoundGuidanceChange(""); attachmentDraft?.clear() }, onOpenService, copyText, shareText, snackbarHostState,
-                        attachments = attachmentDraft?.attachments.orEmpty(), pickingAttachments = attachmentDraft?.picking == true)
-                } else item("answer") {
-                    val service = members.first { it.name == current }
-                    val run = sessionController.runs[service] ?: ParticipantRun()
-                    Column {
-                        SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) })
-                        SimpleAnswer(service, run, statuses[service] ?: ServiceStatus(), { onOpenService(service) },
-                            onCopy = copyText?.let { copy -> { scope.launch {
-                                val prepared = ShareTextPolicy.discussionSummary(currentQuestion, run.response)
-                                val ok = copy("${service.shortName} 的回答", prepared.text)
-                                snackbarHostState.showSnackbar(if (!ok) "复制失败" else if (prepared.truncated) "回答过长，已截取后复制" else "已复制")
-                            }; Unit } },
-                            onShare = shareText?.let { share -> { scope.launch {
-                                val prepared = ShareTextPolicy.discussionSummary(currentQuestion, run.response)
-                                if (!share("${service.shortName} 的回答", prepared.text)) snackbarHostState.showSnackbar("分享失败")
-                                else if (prepared.truncated) snackbarHostState.showSnackbar("回答过长，已截取后分享")
-                            }; Unit } }, busy = busy,
-                            onReextract = { notifyFailure(sessionController.retryExtraction(service)) },
-                            onResend = { notifyFailure(sessionController.retrySend(service)) }, onSummary = summarize,
-                            draft = sessionController.blockingDraft(service),
-                            onReplaceDraft = { text -> notifyFailure(sessionController.retrySendReplacingDraft(service, text)) })
-                    }
-                }
-            }
+                }, onStop = {}, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
+                attachmentNotice = ArenaAttachmentSupport.notice(selectedServices, attachmentDraft?.attachments.orEmpty()))
         }
-        SimpleComposer(roundGuidance, onRoundGuidanceChange, "继续追问…",
-            "发给本轮成功的 ${sessionController.completedCount} 家 AI", ready, busy,
-            onSend = {
-                if (roundGuidance.isBlank() && attachmentDraft?.attachments.isNullOrEmpty()) scope.launch { snackbarHostState.showSnackbar("先写下想追问的内容或添加附件") }
-                else if (sessionController.startIteration(AnswerMode.PARALLEL, roundGuidance, attachmentDraft?.attachments.orEmpty())) {
-                    onRoundGuidanceChange(""); attachmentDraft?.clear()
-                }
-                else notifyFailure(false)
-            }, onStop = sessionController::cancelCurrentRound,
-            onDiscuss = {
-                if (roundGuidance.length > ArenaLimits.MAX_GUIDANCE_CHARS) scope.launch {
-                    snackbarHostState.showSnackbar("本轮要求超过 ${ArenaLimits.MAX_GUIDANCE_CHARS} 字，请缩短后重试")
-                }
-                else if (sessionController.startDebate(AnswerMode.PARALLEL, roundGuidance, attachmentDraft?.attachments.orEmpty())) {
-                    onRoundGuidanceChange(""); attachmentDraft?.clear()
-                }
-                else notifyFailure(false)
-            }, onSummary = summarize, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
-            attachmentNotice = ArenaAttachmentSupport.notice(members.filter { sessionController.runs[it]?.phase == ParticipantPhase.COMPLETE },
-                attachmentDraft?.attachments.orEmpty()))
-    }
-}
-
-@Composable
-private fun SimpleWaitProgress(controller: ArenaSessionController, service: ArenaService, run: ParticipantRun,
-                               onOpen: () -> Unit, summary: Boolean = false) {
-    val active = run.phase in setOf(ParticipantPhase.QUEUED, ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING)
-    var now by remember(run.requestId) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    LaunchedEffect(run.requestId, active) {
-        while (active) { now = SystemClock.elapsedRealtime(); delay(1_000L) }
-    }
-    val progress = if (summary) controller.summaryWaitingProgress(now) else controller.waitingProgress(service, now)
-    if (!active || progress == null) return
-    val colors = ArenaStyle.colors
-    Surface(Modifier.fillMaxWidth().testTag("wait-progress-${service.name}"), color = colors.card, shape = RoundedCornerShape(12.dp)) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp)
-                Text(progress.title, Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
-                Text(progress.elapsed, style = MaterialTheme.typography.labelSmall)
-            }
-            Text(progress.expectation, style = MaterialTheme.typography.labelSmall, color = colors.muted)
-            Text(progress.limit, style = MaterialTheme.typography.labelSmall, color = colors.muted)
-            if (progress.needsAttention) TextButton(onClick = onOpen) { Text("等待较久，打开官网核对", style = MaterialTheme.typography.labelSmall) }
-        }
-    }
-}
-
-@Composable
-internal fun SimpleSummary(
-    controller: ArenaSessionController, members: List<ArenaService>, preferences: ArenaCaptainPreferences,
-    ready: Boolean, guidance: String, onStarted: () -> Unit, onOpen: (ArenaService) -> Unit,
-    copy: TextCopyRequest?, share: TextShareRequest?, snackbar: SnackbarHostState,
-    attachments: List<ArenaAttachment> = emptyList(),
-    pickingAttachments: Boolean = false,
-) {
-    var captainName by rememberSaveable { mutableStateOf(preferences.loadCaptain()?.name) }
-    var depthName by rememberSaveable { mutableStateOf(preferences.loadDepth().name) }
-    var options by rememberSaveable { mutableStateOf(false) }
-    val captain = CaptainPolicy.resolve(ArenaService.fromName(captainName), members)
-    val depth = SummaryDepth.fromName(depthName)
-    val scope = rememberCoroutineScope()
-    val summary = controller.summary
-    var confirmOriginalRetry by remember { mutableStateOf(false) }
-    if (confirmOriginalRetry) ConfirmDialog("按原内容重试综合？",
-        "将再次发送上次的完整问题和 ${summary.attachments.size} 个附件。请先打开原网页确认是否已经收到，避免重复发送。",
-        "确认重试", onConfirm = {
-            confirmOriginalRetry = false
-            if (!controller.retrySummary()) scope.launch { snackbar.showSnackbar(controller.sessionMessage) }
-        }, onDismiss = { confirmOriginalRetry = false })
-    val nextJudge = CaptainPolicy.judgePreference(members, captain).firstOrNull {
-        controller.runs[it]?.let { run -> run.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank() } == true
-    }
-    val start = {
-        preferences.saveCaptain(captain); preferences.saveDepth(depth)
-        if (guidance.length > ArenaLimits.MAX_GUIDANCE_CHARS) scope.launch {
-            snackbar.showSnackbar("本轮要求超过 ${ArenaLimits.MAX_GUIDANCE_CHARS} 字，请缩短后重试")
-        }
-        else if (controller.startSummary(CaptainPolicy.judgePreference(members, captain), guidance, depth, attachments = attachments)) onStarted()
-        else scope.launch { snackbar.showSnackbar(controller.sessionMessage) }
-        Unit
-    }
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        if (summary.phase == ParticipantPhase.IDLE) {
-            Spacer(Modifier.height(16.dp))
-            Text("把几家的答案，理成一条", style = MaterialTheme.typography.titleMedium)
-            Text("需要时再生成，保留共识，也留下分歧。", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
-        }
-        TextButton(onClick = { options = !options }, enabled = !controller.isBusy) {
-            Text("下次由 ${nextJudge?.shortName ?: captain?.shortName ?: "AI"} 整理 · ${depth.displayName}", style = MaterialTheme.typography.bodySmall)
-        }
-        if (ready && nextJudge != null && nextJudge != captain) {
-            SimpleNotice("${captain?.shortName} 本轮未完成，将由 ${nextJudge.shortName} 整理。")
-        }
-        if (options) {
-            members.forEach { service ->
-                TextButton(onClick = { captainName = service.name }, enabled = !controller.isBusy) {
-                    Text((if (captain == service) "✓ " else "") + service.shortName)
-                }
-            }
-            SummaryDepth.entries.forEach { item ->
-                TextButton(onClick = { depthName = item.name }, enabled = !controller.isBusy) {
-                    Text((if (depth == item) "✓ " else "") + item.displayName)
-                }
-            }
-        }
-        SimpleSummaryResult(summary, onOpen)
-        if (summary.attachments.isNotEmpty()) {
-            Text("上次综合附件：${summary.attachments.joinToString("、") { it.name }}", style = MaterialTheme.typography.bodySmall)
-            if (attachments.isEmpty()) Text("按当前要求重新生成不会带上次附件；保留原附件请用“按原内容重试”。", style = MaterialTheme.typography.labelSmall)
-        }
-        if (summary.prompt.isNotBlank() && summary.attachments.isNotEmpty()) TextButton(
-            onClick = { confirmOriginalRetry = true }, enabled = ready && !pickingAttachments) { Text("按原内容重试") }
-        summary.judge?.let { judge -> SimpleWaitProgress(controller, judge,
-            ParticipantRun(phase = summary.phase, requestId = summary.requestId, detail = summary.detail), { onOpen(judge) }, summary = true) }
-        if (attachments.isNotEmpty()) Text("这次综合仅向 ${nextJudge?.shortName ?: "整理人"} 发送所选附件。" +
-            ArenaAttachmentSupport.notice(listOfNotNull(nextJudge), attachments).orEmpty(), style = MaterialTheme.typography.bodySmall)
-        Button(onClick = start, enabled = ready && !pickingAttachments) { Text(if (summary.phase == ParticipantPhase.IDLE) "生成综合答案" else "按当前要求重新生成") }
-        if (!ready && !controller.isBusy) Text("至少两家回答完成后可生成。", style = MaterialTheme.typography.bodySmall)
-        if (summary.text.isNotBlank()) Row {
-            if (copy != null) TextButton(onClick = {
-                val prepared = ShareTextPolicy.discussionSummary(controller.originalQuestion, summary.text)
-                val ok = copy("综合答案", prepared.text)
-                scope.launch { snackbar.showSnackbar(if (!ok) "复制失败" else if (prepared.truncated) "内容过长，已截取后复制" else "已复制") }
-            }) { Text("复制") }
-            if (share != null) TextButton(onClick = {
-                val prepared = ShareTextPolicy.discussionSummary(controller.originalQuestion, summary.text)
-                val ok = share("综合答案", prepared.text)
-                if (!ok || prepared.truncated) scope.launch { snackbar.showSnackbar(if (!ok) "分享失败" else "内容过长，已截取后分享") }
-            }) { Text("分享") }
-        }
-    }
-}
-
-@Composable
-internal fun SimpleSummaryResult(summary: DiscussionSummary, onOpen: (ArenaService) -> Unit) {
-    if (summary.phase == ParticipantPhase.IDLE) return
-    summary.judge?.let { judge ->
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            SimpleAvatar(judge) { onOpen(judge) }
-            Text("由 ${judge.shortName} 整理 · ${summary.depth.displayName}", style = MaterialTheme.typography.bodySmall)
-        }
-    }
-    if (summary.text.isNotBlank()) SelectionContainer { MarkdownText(summary.text) }
-    val needsHelp = summary.detail.contains("安全验证") || summary.detail.contains("迟迟没有回应")
-    val placeholder = summary.phase == ParticipantPhase.COMPLETE && SummarySanityPolicy.looksLikePlaceholder(summary.text)
-    when {
-        summary.phase == ParticipantPhase.ERROR || needsHelp -> SimpleNotice(summary.detail)
-        placeholder -> SimpleNotice("总结好像没有正文，请打开原网页查看，或换一家 AI 重新生成。")
-        summary.phase != ParticipantPhase.COMPLETE -> Text("正在整理…", style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
-    }
-    if (summary.phase == ParticipantPhase.ERROR || needsHelp || placeholder) summary.judge?.let { judge ->
-        TextButton(onClick = { onOpen(judge) }) { Text("打开 ${judge.shortName} 网页") }
     }
 }
 

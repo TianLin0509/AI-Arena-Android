@@ -52,7 +52,7 @@ object ArenaErrorHelp {
                 next = "请打开网页查看额度；恢复前重发也会被拒收，可以先不选它。",
                 primary = Action.OPEN_PAGE,
             )
-            d.contains("草稿") -> Advice(
+            d.contains("输入框里有未发出的草稿") -> Advice(
                 what = "$serviceName 的网页输入框里留着一段没发出的文字，为免和新问题混在一起，这一轮没有发送。",
                 next = "请核对这段文字：不需要就清空后重发，也可以打开网页自己处理。",
                 primary = Action.OPEN_PAGE,

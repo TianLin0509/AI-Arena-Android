@@ -104,24 +104,25 @@ class ArenaSimpleInstrumentedTest {
                 { _, _ -> true }, { _, text -> shared = text; true }, false, ArenaCaptainPreferences(LocalContext.current))
         } }
         try {
-            compose.onNodeWithTag("timeline-DEEPSEEK").assertDoesNotExist()
             compose.onNodeWithTag("simple-composer").performTextInput("换个角度：只说最关键的一条")
             compose.onNodeWithTag("simple-send").performClick()
             compose.runOnIdle { pending.toList().forEach { (id, callback) -> callback(SendOutcome(true, id, "fixture receipt")) } }
             compose.waitUntil(5_000) { !controller.isBusy && controller.completedCount == 3 }
-            compose.onNodeWithTag("current-round-label").assertTextContains("第 2 轮 · 追问", substring = true)
+            compose.onNodeWithTag("current-round-label").assertTextContains("第 2 轮 · 独立迭代", substring = true)
             compose.onNodeWithText("第二轮回答正文").assertExists()
-            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasTestTag("timeline-DEEPSEEK"))
-            compose.onNodeWithContentDescription("展开时光机，查看此前 1 轮").performClick()
-            compose.onNodeWithTag("timeline-node-DEEPSEEK-1").performClick()
-            compose.onNodeWithTag("timeline-answer-DEEPSEEK").assertExists()
-            compose.onNodeWithText("把这 30 分钟留给开口", substring = true).assertExists()
 
-            compose.onNodeWithTag("answer-tab-summary").performClick()
-            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasTestTag("timeline-summary"))
-            compose.onNodeWithContentDescription("展开时光机，查看此前 1 轮").performClick()
-            compose.onNodeWithTag("timeline-node-summary-1").performClick()
+            compose.onNodeWithTag("open-time-machine").performClick()
+            compose.onNodeWithTag("time-machine").assertIsDisplayed()
+            compose.onNodeWithTag("time-entry-1-round").performClick()
+            compose.onNodeWithTag("reviewing-banner").assertIsDisplayed()
+            compose.onNodeWithText("把这 30 分钟留给开口", substring = true).assertExists()
+            compose.onNodeWithTag("simple-composer").assertDoesNotExist()
+
+            compose.onNodeWithTag("open-time-machine").performClick()
+            compose.onNodeWithTag("time-entry-1-summary").performClick()
             compose.onNodeWithText("第一轮综合正文").assertExists()
+            compose.onNodeWithTag("back-to-latest").performClick()
+            compose.onNodeWithTag("simple-composer").assertExists()
 
             compose.onNodeWithContentDescription("历史与设置").performClick()
             compose.onNodeWithTag("menu-version").assertTextContains("v${BuildConfig.VERSION_NAME}", substring = true)
@@ -132,6 +133,57 @@ class ArenaSimpleInstrumentedTest {
                 assertTrue(shared.indexOf("第一轮综合正文") < shared.indexOf("第二轮回答正文"))
             }
         } finally { inst.runOnMainSync { controller.destroy() } }
+    }
+
+    @Test fun fourModesShowTheirPresetAndWorkflowOrder() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        lateinit var controller: ArenaSessionController
+        inst.runOnMainSync { controller = ArenaSessionController(FixtureGateway(), sessionRepository = FixtureRepository()) }
+        compose.setContent { ArenaTheme {
+            var draft by remember { mutableStateOf("") }
+            SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller,
+                draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() }, null, null, false, ArenaCaptainPreferences(LocalContext.current))
+        } }
+        try {
+            compose.onNodeWithTag("preset-card").assertDoesNotExist()
+            compose.onNodeWithTag("mode-DISCUSS").performClick()
+            compose.onNodeWithText("预设 · 观点讨论 · 互挑错").assertIsDisplayed()
+            compose.onNodeWithText("队友1的回答").assertExists()
+            compose.onNodeWithTag("choice-COLLAB").performClick()
+            compose.onNodeWithText("预设 · 观点讨论 · 取长补短").assertIsDisplayed()
+            compose.onNodeWithTag("mode-RELAY").performClick()
+            compose.onNodeWithTag("relay-order").assertIsDisplayed()
+            compose.onNodeWithContentDescription("把 豆包 提前一位").performClick()
+            compose.onNodeWithText("第1位的回答").assertExists()
+            compose.onNodeWithTag("mode-SUMMARY").performClick()
+            compose.onNodeWithText("预设 · 队长总结").assertIsDisplayed()
+            compose.onNodeWithText("只发给队长", substring = true).assertIsDisplayed()
+        } finally { inst.runOnMainSync { controller.destroy() } }
+    }
+
+    @Test fun presetEditorKeepsRequiredSlotsAndCanRestoreDefault() {
+        val inst = InstrumentationRegistry.getInstrumentation()
+        val store = ArenaPresetStore(inst.targetContext)
+        val before = store.custom(PresetKey.DEBATE)
+        var message = ""
+        try {
+            compose.setContent { ArenaTheme { PresetEditorDialog(PresetKey.DEBATE, store, { message = it }, {}) } }
+            compose.onNodeWithTag("preset-editor").performTextClearance()
+            compose.onNodeWithTag("preset-editor").performTextInput("只保留一句话，没有占位")
+            compose.onNodeWithTag("preset-save").performClick()
+            compose.onNodeWithText("必须保留 {队友回答}", substring = true).assertIsDisplayed()
+            compose.onNodeWithTag("preset-editor").performTextClearance()
+            compose.onNodeWithTag("preset-editor").performTextInput("请逐条反驳：{队友回答}")
+            compose.onNodeWithTag("preset-save").performClick()
+            compose.runOnIdle {
+                assertEquals("请逐条反驳：{队友回答}", store.template(PresetKey.DEBATE))
+                assertTrue(message.contains("已保存"))
+                assertTrue(DebatePromptBuilder.build("问", ArenaService.DEEPSEEK, mapOf(ArenaService.DOUBAO to "豆包答"), presets = store)
+                    .startsWith("请逐条反驳：【豆包 的回答】"))
+                assertNull(store.save(PresetKey.DEBATE, null))
+                assertEquals(DefaultPresets.template(PresetKey.DEBATE), store.template(PresetKey.DEBATE))
+            }
+        } finally { inst.runOnMainSync { store.save(PresetKey.DEBATE, before) } }
     }
 
     @Test fun blockingDraftIsShownVerbatimAndReplacedOnlyAfterConfirmation() {
@@ -218,7 +270,7 @@ class ArenaSimpleInstrumentedTest {
     @Test fun busyComposerStopsAndNeverDispatchesANewPrompt() {
         var sends = 0; var stops = 0
         compose.setContent { ArenaTheme {
-            SimpleComposer("已输入草稿", {}, "继续追问…", "3 家 AI", false, true, { sends++ }, { stops++ })
+            InputBar("已输入草稿", {}, "继续追问…", false, true, { sends++ }, { stops++ }, null, null, null)
         } }
         compose.onNodeWithContentDescription("停止等待").performClick()
         compose.runOnIdle { assertEquals(0, sends); assertEquals(1, stops) }
@@ -295,7 +347,7 @@ class ArenaSimpleInstrumentedTest {
             compose.onNodeWithTag("answer-tab-KIMI").assertIsSelected()
             compose.onNodeWithText("我的追问草稿").assertIsDisplayed()
             compose.onNodeWithTag("answer-tab-summary").performClick()
-            compose.onNodeWithText("生成综合答案").performScrollTo().assertIsDisplayed()
+            compose.onNodeWithText("选择队长总结").performScrollTo().assertIsDisplayed()
             capture("summary")
         } finally { instrumentation.runOnMainSync { controller!!.destroy() } }
     }
@@ -311,12 +363,17 @@ class ArenaSimpleInstrumentedTest {
                 savedSummary = DiscussionSummary(ParticipantPhase.COMPLETE, ArenaService.KIMI, text = "历史综合正文".repeat(20), depth = SummaryDepth.DEEP)))
         }
         try {
-            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
-                SimpleSummary(controller, ArenaService.defaultMembers, prefs, true, "", {}, {}, null, null, remember { SnackbarHostState() })
-            } } }
-            compose.onNodeWithText("由 Kimi 整理 · 深入").assertIsDisplayed()
-            compose.onNodeWithText("下次由 DeepSeek 整理 · 标准").assertIsDisplayed()
-            compose.onNodeWithContentDescription("打开 Kimi 网页").assertIsDisplayed()
+            compose.setContent { ArenaTheme {
+                var draft by remember { mutableStateOf("") }
+                SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller,
+                    draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() }, null, null, false, prefs)
+            } }
+            compose.onNodeWithTag("answer-tab-summary").performClick()
+            compose.onNodeWithText("由 Kimi 整理").assertIsDisplayed()
+            compose.onNodeWithText("队长总结 · 深入").assertIsDisplayed()
+            compose.onNodeWithTag("mode-SUMMARY").performClick()
+            compose.onNodeWithTag("choice-DEEPSEEK").assertIsSelected()
+            compose.onNodeWithTag("choice-STANDARD").assertIsSelected()
         } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
     }
 
@@ -337,13 +394,17 @@ class ArenaSimpleInstrumentedTest {
             controller = ArenaSessionController(gateway, sessionRepository = FixtureRepository(failedMember = ArenaService.DEEPSEEK))
         }
         try {
-            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
-                SimpleSummary(controller, ArenaService.defaultMembers, prefs, true, "", {}, {}, null, null, remember { SnackbarHostState() })
-            } } }
-            compose.onNodeWithText("DeepSeek 本轮未完成，将由 豆包 整理。").assertIsDisplayed()
-            compose.onNodeWithText("生成综合答案").performClick()
+            compose.setContent { ArenaTheme {
+                var draft by remember { mutableStateOf("") }
+                SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller,
+                    draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() }, null, null, false, prefs)
+            } }
+            compose.onNodeWithTag("mode-SUMMARY").performClick()
+            compose.onNodeWithText("DeepSeek 本轮未完成，将由 豆包 整理").assertIsDisplayed()
+            compose.onNodeWithTag("simple-send").performClick()
             compose.runOnIdle { assertEquals(ArenaService.DOUBAO, sentTo) }
-            compose.onNodeWithText("由 豆包 整理 · 标准").assertIsDisplayed()
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasText("由 豆包 整理"))
+            compose.onNodeWithText("由 豆包 整理").assertIsDisplayed()
         } finally { inst.runOnMainSync { controller.destroy(); prefs.saveCaptain(oldCaptain); prefs.saveDepth(oldDepth) } }
     }
 
@@ -367,12 +428,15 @@ class ArenaSimpleInstrumentedTest {
             }, sessionRepository = FixtureRepository(savedSummary = original))
         }
         try {
-            compose.setContent { ArenaTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
-                SimpleSummary(controller, ArenaService.defaultMembers, ArenaCaptainPreferences(inst.targetContext),
-                    true, "", {}, {}, null, null, remember { SnackbarHostState() }, attachments = emptyList())
-            } } }
-            compose.onNodeWithText("上次综合附件：保留.txt").performScrollTo().assertIsDisplayed()
-            compose.onNodeWithText("按原内容重试", substring = false).performScrollTo().performClick()
+            compose.setContent { ArenaTheme {
+                var draft by remember { mutableStateOf("") }
+                SimpleRoundStage(ArenaService.defaultMembers.associateWith { ServiceStatus(ConnectionState.SIGNED_IN) }, controller,
+                    draft, { draft = it }, {}, {}, {}, remember { SnackbarHostState() }, null, null, false, ArenaCaptainPreferences(inst.targetContext))
+            } }
+            compose.onNodeWithTag("answer-tab-summary").performClick()
+            compose.onNodeWithText("本轮附件：保留.txt").assertIsDisplayed()
+            compose.onNodeWithTag("answer-scroll").performScrollToNode(hasText("按原内容重试"))
+            compose.onNodeWithText("按原内容重试", substring = false).performClick()
             compose.onNodeWithText("确认重试", substring = false).performClick()
             compose.runOnIdle { assertEquals(listOf(file), sent); assertEquals(original.prompt, deliveredPrompt) }
         } finally { inst.runOnMainSync { controller.destroy() } }

@@ -28,6 +28,8 @@ class ArenaSessionController(
     private val timing: ControllerTiming = ControllerTiming(),
     private val sessionRepository: ArenaSessionRepository? = null,
     private val progressTracker: ArenaProgressTracker = ArenaProgressTracker(),
+    /** 观点讨论、工作流、队长总结用的预设提示词；界面编辑后由 [ArenaPresetStore] 提供。 */
+    private val presets: PresetSource = DefaultPresets,
 ) {
     private val runStates = mutableStateMapOf<ArenaService, ParticipantRun>().apply {
         ArenaService.entries.forEach { service -> put(service, ParticipantRun()) }
@@ -64,6 +66,15 @@ class ArenaSessionController(
 
     var currentRoundKind by mutableStateOf<RoundKind?>(null)
         private set
+
+    /** 当前轮是不是工作流（按顺序接力），以及观点讨论用的方式；标签与时光机据此显示。 */
+    var currentRoundRelay by mutableStateOf(false)
+        private set
+    var currentRoundStyle by mutableStateOf<DebateStyle?>(null)
+        private set
+
+    /** 本轮工作流的接力顺序；重发还没轮到或被跳过的成员时，据此重新组装「问题 + 前面各位的回答」。 */
+    private var relayOrder: List<ArenaService> = emptyList()
 
     var currentAnswerMode by mutableStateOf(AnswerMode.PARALLEL)
         private set
@@ -167,6 +178,7 @@ class ArenaSessionController(
         services: List<ArenaService>,
         answerMode: AnswerMode = AnswerMode.PARALLEL,
         attachments: List<ArenaAttachment> = emptyList(),
+        relayOrder: List<ArenaService>? = null,
     ): Boolean {
         ArenaAttachmentPolicy.validate(attachments)?.let { sessionMessage = it; return false }
         val normalizedQuestion = AttachmentPromptPolicy.withDefault(question, attachments).trim()
@@ -201,6 +213,7 @@ class ArenaSessionController(
             answerMode = answerMode,
             guidance = "",
             attachments = attachments,
+            relayOrder = relayOrder,
         )
     }
 
@@ -208,6 +221,7 @@ class ArenaSessionController(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
         attachments: List<ArenaAttachment> = emptyList(),
+        relayOrder: List<ArenaService>? = null,
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val newPrompt = AttachmentPromptPolicy.withDefault(guidance, attachments).trim()
@@ -223,7 +237,8 @@ class ArenaSessionController(
         val services = ArenaService.entries.filter { it in completed.keys }
         if (services.size < ArenaService.MIN_MEMBERS) return false
         val prompts = services.associateWith { newPrompt }
-        return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt, attachments)
+        return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt, attachments,
+            relayOrder = relayOrder?.filter { it in services })
     }
 
     /** 观点讨论：把其他 AI 的回答转给每一家让它们互相评论。各家平等；把大家收拢成一条的活交给「队长总结」。 */
@@ -231,11 +246,12 @@ class ArenaSessionController(
         answerMode: AnswerMode = currentAnswerMode,
         guidance: String = "",
         attachments: List<ArenaAttachment> = emptyList(),
+        style: DebateStyle = DebateStyle.DEBATE,
     ): Boolean {
         if (isBusy || stage != SessionStage.READY) return false
         val responses = completedResponses()
         if (responses.size < 2) return false
-        val debateIndex = history.count { it.kind == RoundKind.DEBATE } + 1
+        val debateIndex = history.count { it.kind == RoundKind.DEBATE && (it.style ?: DebateStyle.DEBATE) == style } + 1
         val instruction = AttachmentPromptPolicy.withDefault(guidance, attachments).take(ArenaLimits.MAX_GUIDANCE_CHARS)
         val services = ArenaService.entries.filter { it in responses.keys }
         val prompts = linkedMapOf<ArenaService, String>()
@@ -249,6 +265,8 @@ class ArenaSessionController(
                     debateIndex = debateIndex,
                     guidance = instruction,
                     quoteLimit = quoteLimit,
+                    style = style,
+                    presets = presets,
                 )
             } ?: run {
                 sessionMessage = "${target.displayName} 上下文超过 ${PromptBudgetPolicy.budgetFor(target)} 字，请缩短原问题或开始新问题"
@@ -257,7 +275,7 @@ class ArenaSessionController(
             prompts[target] = budgeted.text
             if (budgeted.compressed) compressedCount += 1
         }
-        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, instruction, attachments)
+        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, instruction, attachments, style = style)
         if (started && compressedCount > 0) {
             currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
             sessionMessage += " · $currentRoundContextNotice"
@@ -293,6 +311,7 @@ class ArenaSessionController(
                 customInstruction = AttachmentPromptPolicy.withDefault(customInstruction, attachments),
                 quoteLimit = quoteLimit,
                 depth = depth,
+                presets = presets,
             )
         } ?: run {
             sessionMessage = "总结上下文超过 ${PromptBudgetPolicy.budgetFor(judge)} 字，请缩短原问题"
@@ -384,6 +403,23 @@ class ArenaSessionController(
 
     fun retrySend(service: ArenaService): Boolean {
         if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+        if (currentRoundRelay && service in relayOrder && service != relayOrder.first()) {
+            // A member stopped or skipped before its turn still gets the question plus the earlier answers.
+            val question = lastRoundPrompts[relayOrder.first()]
+            if (!question.isNullOrBlank()) {
+                val earlier = LinkedHashMap<ArenaService, String>()
+                relayOrder.takeWhile { it != service }.forEach { previous ->
+                    runs[previous]?.takeIf { it.phase == ParticipantPhase.COMPLETE && it.response.isNotBlank() }?.let { earlier[previous] = it.response }
+                }
+                val budgeted = PromptBudgetPolicy.fit(service, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
+                    RelayPromptBuilder.build(question, earlier, limit, presets)
+                } ?: run {
+                    sessionMessage = "工作流材料超过 ${service.displayName} 的上下文预算（${PromptBudgetPolicy.budgetFor(service)} 字），没有发送"
+                    return false
+                }
+                lastRoundPrompts = lastRoundPrompts + (service to budgeted.text.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+            }
+        }
         val prompt = lastRoundPrompts[service]
         if (prompt.isNullOrBlank()) {
             sessionMessage = "缺少 ${service.displayName} 的原始发送内容，可重新开始问题"
@@ -402,6 +438,8 @@ class ArenaSessionController(
     fun retrySendReplacingDraft(service: ArenaService, draft: String): Boolean {
         if (draft.isBlank() || blockingDraft(service) != draft) return false
         if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+        // Grant the one-shot permission only when the resend can actually start.
+        if (lastRoundPrompts[service].isNullOrBlank()) return retrySend(service)
         pool.allowFreshDraftReplacement(service, draft)
         return retrySend(service)
     }
@@ -585,8 +623,18 @@ class ArenaSessionController(
         answerMode: AnswerMode,
         guidance: String,
         attachments: List<ArenaAttachment> = emptyList(),
+        relayOrder: List<ArenaService>? = null,
+        style: DebateStyle? = null,
     ): Boolean {
         if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
+        // 工作流：顺序必须恰好是本轮成员；第 1 位直接收到问题，之后每位轮到时再组装「问题 + 前面各位的回答」。
+        val relay = relayOrder != null && relayOrder.size == services.size && relayOrder.toSet() == services.toSet()
+        if (relayOrder != null && !relay) {
+            sessionMessage = "工作流顺序与本轮成员不一致，请重新排序"
+            return false
+        }
+        @Suppress("NAME_SHADOWING")
+        val answerMode = if (relay) AnswerMode.SERIAL else answerMode
         ArenaAttachmentPolicy.validate(attachments)?.let { sessionMessage = it; return false }
 
         sessionEpoch += 1
@@ -597,18 +645,22 @@ class ArenaSessionController(
         currentRoundContextNotice = ""
         roundNumber += 1
         currentRoundKind = kind
+        currentRoundRelay = relay
+        currentRoundStyle = style
+        this.relayOrder = if (relay) relayOrder!!.toList() else emptyList()
         currentAnswerMode = answerMode
         stage = when (kind) {
             RoundKind.INITIAL -> SessionStage.INITIAL
             RoundKind.ITERATION -> SessionStage.ITERATION
             RoundKind.DEBATE -> SessionStage.DEBATE
         }
-        sessionMessage = when (answerMode) {
-            AnswerMode.PARALLEL -> "第 $roundNumber 轮：${services.size} 家正在独立发送和回答"
-            AnswerMode.SERIAL -> "正在串行执行第 $roundNumber 轮"
+        sessionMessage = when {
+            relay -> "第 $roundNumber 轮工作流：${services.size} 家按顺序接力回答"
+            answerMode == AnswerMode.PARALLEL -> "第 $roundNumber 轮：${services.size} 家正在独立发送和回答"
+            else -> "正在串行执行第 $roundNumber 轮"
         }
 
-        val dispatchOrder = services
+        val dispatchOrder = if (relay) relayOrder!! else services
         val execution = RoundExecution(
             epoch = sessionEpoch,
             number = roundNumber,
@@ -616,9 +668,11 @@ class ArenaSessionController(
             answerMode = answerMode,
             services = services,
             dispatchOrder = dispatchOrder,
-            prompts = prompts,
+            prompts = prompts.toMutableMap(),
             attachments = attachments.toList(),
             guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
+            relay = relay,
+            style = style,
             startedAtMillis = System.currentTimeMillis(),
             requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
         )
@@ -967,15 +1021,45 @@ class ArenaSessionController(
         }
         if (execution.kind == RoundKind.INITIAL && service !in execution.freshReadiness) return
         execution.nextDispatchIndex += 1
-        sessionMessage = "串行模式：正在发送给 ${service.displayName}"
+        if (execution.relay && !composeRelayPrompt(execution, service)) return dispatchSerialNext(execution)
+        sessionMessage = if (execution.relay) "工作流：轮到 ${service.displayName}" else "串行模式：正在发送给 ${service.displayName}"
         sendService(execution, service) { sent ->
             if (!isActive(execution)) return@sendService
             if (sent) {
-                sessionMessage = "串行模式：等待 ${service.displayName} 回答后再发送下一家"
+                sessionMessage = if (execution.relay) "工作流：等待 ${service.displayName} 回答后接力给下一位" else "串行模式：等待 ${service.displayName} 回答后再发送下一家"
             } else {
                 dispatchSerialNext(execution)
             }
         }
+    }
+
+    /**
+     * 工作流轮到某位时组装它的提示：第 1 位原样收到问题；之后每位收到「问题 + 前面各位已完成的完整回答」。
+     * 前面没成功的成员不提供材料。超出这家网页的上下文预算时逐步压缩引用，仍放不下就标明失败并跳到下一位。
+     */
+    private fun composeRelayPrompt(execution: RoundExecution, service: ArenaService): Boolean {
+        val first = execution.dispatchOrder.first()
+        if (service == first) return true
+        val question = execution.prompts.getValue(first)
+        val earlier = LinkedHashMap<ArenaService, String>()
+        execution.dispatchOrder.takeWhile { it != service }.forEach { previous ->
+            runs[previous]?.takeIf { it.phase == ParticipantPhase.COMPLETE && it.response.isNotBlank() }?.let { earlier[previous] = it.response }
+        }
+        val budgeted = PromptBudgetPolicy.fit(service, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
+            RelayPromptBuilder.build(question, earlier, limit, presets)
+        }
+        if (budgeted == null) {
+            runs[service] = runs.getValue(service).copy(
+                phase = ParticipantPhase.ERROR,
+                detail = "工作流材料超过 ${service.displayName} 的上下文预算（${PromptBudgetPolicy.budgetFor(service)} 字），没有发送",
+            )
+            schedulePersist()
+            return false
+        }
+        execution.prompts[service] = budgeted.text
+        lastRoundPrompts = lastRoundPrompts + (service to budgeted.text.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+        if (budgeted.compressed) currentRoundContextNotice = "已压缩部分接力材料"
+        return true
     }
 
     private fun sendService(
@@ -1235,6 +1319,8 @@ class ArenaSessionController(
             startedAtMillis = execution.startedAtMillis,
             finishedAtMillis = System.currentTimeMillis(),
             attachments = execution.attachments,
+            relay = execution.relay,
+            style = execution.style,
         )
         while (history.size > ArenaLimits.MAX_HISTORY_ROUNDS) history.removeAt(0)
         val completed = results.values.count { it.phase == ParticipantPhase.COMPLETE }
@@ -1363,6 +1449,9 @@ class ArenaSessionController(
             askedAtMillis = askedAtMillis,
             roundNumber = roundNumber,
             currentRoundKind = currentRoundKind,
+            currentRoundRelay = currentRoundRelay,
+            currentRoundStyle = currentRoundStyle,
+            currentRelayOrder = relayOrder,
             currentAnswerMode = currentAnswerMode,
             services = sessionServices,
             runs = runs.toMap(),
@@ -1443,6 +1532,9 @@ class ArenaSessionController(
         askedAtMillis = snapshot.askedAtMillis
         roundNumber = maxOf(snapshot.roundNumber, snapshot.history.maxOfOrNull { it.number } ?: 0)
         currentRoundKind = snapshot.currentRoundKind ?: snapshot.history.lastOrNull()?.kind
+        currentRoundRelay = snapshot.currentRoundRelay || snapshot.history.lastOrNull { it.number == snapshot.roundNumber }?.relay == true
+        currentRoundStyle = snapshot.currentRoundStyle ?: snapshot.history.lastOrNull { it.number == snapshot.roundNumber }?.style
+        relayOrder = snapshot.currentRelayOrder.takeIf { currentRoundRelay }.orEmpty()
         currentAnswerMode = snapshot.currentAnswerMode
         sessionServices = snapshot.services.distinct().let { services ->
             if (services.size in ArenaService.MIN_MEMBERS..ArenaService.MAX_MEMBERS) services else ArenaService.defaultMembers
@@ -1543,7 +1635,7 @@ class ArenaSessionController(
         val answerMode: AnswerMode,
         val services: List<ArenaService>,
         val dispatchOrder: List<ArenaService>,
-        val prompts: Map<ArenaService, String>,
+        val prompts: MutableMap<ArenaService, String>,
         val attachments: List<ArenaAttachment>,
         val guidance: String,
         val startedAtMillis: Long,
@@ -1553,6 +1645,8 @@ class ArenaSessionController(
         val dispatchedServices: MutableSet<ArenaService> = mutableSetOf(),
         var nextDispatchIndex: Int = 0,
         var dispatchComplete: Boolean = false,
+        val relay: Boolean = false,
+        val style: DebateStyle? = null,
     )
 
     private data class PollState(
@@ -1612,126 +1706,4 @@ private fun ResponseSnapshot.isAwaitingSecurityChallenge(): Boolean =
 object QuestionPolicy {
     fun isValid(question: String): Boolean =
         question.isNotBlank() && question.length <= ArenaLimits.MAX_QUESTION_CHARS
-}
-
-object DebatePromptBuilder {
-    /**
-     * 观点讨论的 prompt：把其他 AI 的回答转给它，让它逐条评论。
-     * 各家平等（0.11 起不再有"队长版"——把大家收拢成一条的活交给了「队长总结」）。
-     */
-    fun build(
-        originalQuestion: String,
-        target: ArenaService,
-        responses: Map<ArenaService, String>,
-        debateIndex: Int = 1,
-        guidance: String = "",
-        quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
-    ): String {
-        val others = PromptSections.otherResponses(target, responses, quoteLimit)
-        val guidanceSection = guidance.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
-            if (it.isBlank()) "" else "\n\n用户本轮补充要求：\n$it"
-        }
-        val opening = "这是观点讨论第 $debateIndex 轮。"
-        val closing = "请逐一讨论这些观点：明确指出你认同和不认同的部分，给出理由，修正可能的错误或遗漏，并形成你这一轮更可靠的结论。不要只复述其他回答。总长度控制在 200 个汉字以内，最后单独给出一句综合结论。请直接写在这条对话里，不要生成文档或文件。"
-        // 不能用 """…""".trimIndent()：$others / $guidanceSection 是顶格的多行文本，
-        // trimIndent 取的是所有行的公共最小缩进，被这些顶格行拉成 0，模板自己那 12 个空格
-        // 一个都去不掉，最后发出去的 prompt 每行都带前导空白（4 空格以上不少模型会当代码块）。
-        // 直接拼接，所见即所得。
-        return buildString {
-            append(opening)
-            append("\n\n原始问题：\n")
-            append(originalQuestion)
-            append("\n\n以下是其他 AI 的最新回答：\n")
-            append(others)
-            append(guidanceSection)
-            append("\n\n")
-            append(closing)
-        }
-    }
-}
-
-object DiscussionSummaryPromptBuilder {
-    /**
-     * 「队长总结」的 prompt。三档深度只换"怎么写"那一段，其余（原问题、轮次、完整回答、白话要求）相同。
-     * 篇幅上限跟 [SummaryDepth.maxChars] 走；喂进来的回答由控制器按完整长度给，只在超预算时压缩。
-     */
-    fun build(
-        originalQuestion: String,
-        history: List<RoundRecord>,
-        responses: Map<ArenaService, String>,
-        customInstruction: String = "",
-        quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
-        depth: SummaryDepth = SummaryDepth.STANDARD,
-    ): String {
-        val names = responses.keys.joinToString("、") { it.displayName }
-        val viewpoints = responses.entries.joinToString("\n\n") { (service, response) ->
-            "【${service.displayName} 的完整回答】\n${response.take(quoteLimit.coerceAtLeast(0))}"
-        }
-        val roundOutline = history.joinToString("\n") { round ->
-            buildString {
-                append("- 第 ${round.number} 轮：${round.kind.displayName}")
-                if (round.guidance.isNotBlank()) {
-                    val label = if (round.kind == RoundKind.ITERATION) "本轮问题" else "用户补充"
-                    append("；$label：${round.guidance.take(240)}")
-                }
-            }
-        }
-        val extra = customInstruction.trim().take(ArenaLimits.MAX_GUIDANCE_CHARS).let {
-            if (it.isBlank()) "" else "\n\n用户对总结的额外要求：\n$it"
-        }
-        val structure = when (depth) {
-            SummaryDepth.BRIEF ->
-                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
-                    "1. 一句话结论。\n" +
-                    "2. ${responses.size} 家各一句话点评：谁说得最靠谱、谁有明显漏洞。\n" +
-                    "3. 最该做的一件事。"
-            SummaryDepth.STANDARD ->
-                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
-                    "1. 结论：用 2-3 句话给出最终答案。\n" +
-                    "2. 共识：几家都同意的要点。\n" +
-                    "3. 分歧：写明谁说了什么、你更倾向哪个、为什么。\n" +
-                    "4. 建议：给用户的 2-4 条可执行建议，以及哪些地方需要再核实。"
-            SummaryDepth.DEEP ->
-                "请按这个顺序写，总长不超过 ${depth.maxChars} 字：\n" +
-                    "1. 事实核对：把几份回答里出现的关键事实（数字、时间、政策、名称、药物剂量）列出来，" +
-                    "逐条标注「几家一致 / 有分歧 / 只有一家提到」，分歧处写明各自怎么说、你更相信哪个、为什么。\n" +
-                    "2. 结论：用 2-3 句话给出你的最终答案。\n" +
-                    "3. 依据与风险：结论依据什么；哪些地方可能因人而异、可能过时、或需要向医生 / 官方核实。\n" +
-                    "4. 怎么做：分步骤的行动清单，每步一行。"
-        }
-        // 同 DebatePromptBuilder：插值进来的 $roundOutline / $viewpoints 顶格，
-        // trimIndent() 会失效，必须手拼。
-        return buildString {
-            append("你是这次多 AI 讨论的队长，请替一位普通家庭用户做一份${depth.displayName}总结。")
-            append("下面是同一个问题的 ${responses.size} 份完整回答（来自 $names）。")
-            append("\n\n原始问题：\n")
-            append(originalQuestion)
-            append("\n\n讨论轮次：\n")
-            append(roundOutline)
-            append("\n\n各 AI 的完整回答：\n")
-            append(viewpoints)
-            append(extra)
-            append("\n\n")
-            append(structure)
-            append("\n要求：用长辈也能懂的白话，不用术语；不要照抄任何一家的原文；")
-            append("只依据上面真实出现的内容，不要声称材料里没有的事实；不确定就明确说「不确定」，不要编。")
-            // 用户手机上实测：豆包把总结写成了"文档"卡片，对话里只留一句"我将结合三份回答……需要我压缩成 300 字吗？"，
-            // App 读不到文档正文，看上去像没总结。明说"写在对话里、不要生成文件、不要反问"。
-            append("请直接把总结写在这条对话里（普通文字 + 小标题即可），不要生成文档、文件、附件或表格，")
-            append("写完就结束，不要再反问「需要我……吗」。")
-        }
-    }
-}
-
-private object PromptSections {
-    fun otherResponses(
-        target: ArenaService,
-        responses: Map<ArenaService, String>,
-        quoteLimit: Int = ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
-    ): String = responses
-        .filterKeys { it != target }
-        .entries
-        .joinToString("\n\n") { (service, response) ->
-            "【${service.displayName} 的回答】\n${response.take(quoteLimit.coerceAtLeast(0))}"
-        }
 }
