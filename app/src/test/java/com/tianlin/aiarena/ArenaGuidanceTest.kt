@@ -153,4 +153,24 @@ class ArenaGuidanceTest {
         val attachment = ArenaErrorHelp.explain("豆包出现额外附件或恢复的旧草稿，未发送问题；请打开原网页检查", "豆包")
         assertFalse(attachment.what.contains("没发出的文字"))
     }
+
+    @Test
+    fun onlyFailuresThatMayHaveBeenAnsweredAreVerifiedAfterTheRound() {
+        listOf(
+            "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送",
+            "豆包已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送",
+            "网页发送确认超时，请检查原网页；不会自动重复发送",
+            "等待回答超时，已保留 120 字",
+            "连续读取失败：网页无响应",
+        ).forEach { assertTrue(it, ArenaErrorHelp.mayHaveAnswered(it)) }
+        listOf(
+            "豆包 新对话的输入框迟迟没有加载完成，本轮未发送；请稍后重试",
+            "已跳过本轮；网页可能仍在生成，可稍后重新读取",
+            "已停止等待；网页可能仍在生成",
+            "千问安全验证等待超时，请完成验证后再次点击重新提取",
+            "Kimi 账号额度已用完，网页拒收了问题",
+            "豆包 新对话输入框里有未发出的草稿，本轮未发送",
+            "登录状态尚未确认",
+        ).forEach { assertFalse(it, ArenaErrorHelp.mayHaveAnswered(it)) }
+    }
 }

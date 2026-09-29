@@ -24,6 +24,17 @@ object ArenaErrorHelp {
 
     enum class Action { RESEND, REEXTRACT, OPEN_PAGE, LOGIN, SKIP, RETRY_SUMMARY, NONE }
 
+    /**
+     * 这类失败时问题可能已经送达、网页上可能已有回答（送达没确认到、等回答超时、读取失败），
+     * 值得在本轮结束后只读核实一次。明确没发出去、用户自己停止或跳过的不在此列。
+     */
+    fun mayHaveAnswered(detail: String): Boolean {
+        val d = detail
+        if (listOf("已跳过", "已停止", "安全验证", "未发送", "没有发出", "没有发送", "未能就绪", "登录", "额度", "会员", "草稿", "最多接收", "上下文").any { d.contains(it) }) return false
+        return d.contains("不会自动重复发送") || d.contains("未确认送达") || d.contains("未检测到") ||
+            d.contains("等待回答超时") || d.contains("迟迟没有回应") || d.contains("读取") || d.contains("提取")
+    }
+
     fun explain(detail: String, serviceName: String): Advice {
         val d = detail
         return when {

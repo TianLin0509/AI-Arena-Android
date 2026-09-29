@@ -24,7 +24,7 @@ internal class ArenaAttachmentTransport(
     ) {
         val originalUrl = webView.url
         val generation = fileBroker.generation(webView)
-        val deadline = SystemClock.elapsedRealtime() + 120_000L
+        val deadline = ArenaForeground.elapsed() + 120_000L
         var delivered = false
         var settled = false
         var geometryFailures = 0
@@ -51,14 +51,14 @@ internal class ArenaAttachmentTransport(
             if (!sameDocument()) {
                 return finish("网页已切换，附件上传已取消，请重新发送")
             }
-            if (!delivered && geometryDeadline > 0L && SystemClock.elapsedRealtime() >= geometryDeadline) return finish(geometryError)
-            if (SystemClock.elapsedRealtime() >= deadline) return finish(
+            if (!delivered && geometryDeadline > 0L && ArenaForeground.elapsed() >= geometryDeadline) return finish(geometryError)
+            if (ArenaForeground.elapsed() >= deadline) return finish(
                 if (delivered) "${service.displayName} 附件上传或解析未确认完成，未发送问题；请到原网页查看后重试"
                 else "${service.displayName} 未提供可用的附件上传入口，未发送问题；请打开原网页检查上传入口后重试",
             )
             fun inspect(release: () -> Unit) {
                 if (!current()) { release(); return }
-                if (!delivered && geometryDeadline > 0L && SystemClock.elapsedRealtime() >= geometryDeadline) { release(); return finish(geometryError) }
+                if (!delivered && geometryDeadline > 0L && ArenaForeground.elapsed() >= geometryDeadline) { release(); return finish(geometryError) }
                 val script = if (delivered) ArenaAttachmentScript.readiness(requestId, service) else ArenaAttachmentScript.nextControl(requestId, service)
                 webView.evaluateJavascript(script) { raw ->
                     if (!current()) { release(); return@evaluateJavascript }
@@ -75,9 +75,9 @@ internal class ArenaAttachmentTransport(
                         val y = (result.optDouble("y", Double.NaN) * ratio).toFloat()
                         if (!cssWidth.isFinite() || !cssHeight.isFinite() || cssWidth <= 0 || cssHeight <= 0 || !ratio.isFinite() || !x.isFinite() || !y.isFinite() || nativeWidth <= 0 || nativeHeight <= 0 || x < 0 || y < 0 || x > nativeWidth || y > nativeHeight) {
                             if (BuildConfig.DEBUG) android.util.Log.i("ArenaAttachmentGeometry", "nativeWidth=$nativeWidth nativeHeight=$nativeHeight cssWidth=$cssWidth cssHeight=$cssHeight x=$x y=$y scale=$ratio")
-                            if (geometryDeadline == 0L) geometryDeadline = SystemClock.elapsedRealtime() + 4_000L
+                            if (geometryDeadline == 0L) geometryDeadline = ArenaForeground.elapsed() + 4_000L
                             geometryFailures++
-                            if (geometryFailures >= 3 || SystemClock.elapsedRealtime() >= geometryDeadline) { release(); return@evaluateJavascript finish(geometryError) }
+                            if (geometryFailures >= 3 || ArenaForeground.elapsed() >= geometryDeadline) { release(); return@evaluateJavascript finish(geometryError) }
                             val controlId = result.optLong("controlId", 0L)
                             if (controlId <= 0L || !sameDocument() || !fileBroker.canDeliver(webView, requestId)) { release(); return@evaluateJavascript finish("附件入口状态已变化，未发送问题") }
                             // No DOWN has occurred. Return only this reservation, then remeasure and hit-test.

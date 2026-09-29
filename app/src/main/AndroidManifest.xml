@@ -1,6 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 一轮进行中切到别的应用：前台服务保住进程，答完用通知提醒回来看。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 只用来判断"有没有网"并给出一句话提示；普通权限，无需用户授权。 -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
@@ -42,6 +46,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <service
+            android:name=".ArenaRoundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
         <!--
             「重启应用」用的透明中转页，跑在独立进程里：由它杀掉主进程再拉起启动页。
             见 ArenaRestart.kt。不导出、不进最近任务。

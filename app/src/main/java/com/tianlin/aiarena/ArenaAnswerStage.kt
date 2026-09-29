@@ -191,7 +191,9 @@ internal fun SimpleRoundStage(
     }
     val current = selected.takeIf { it == "summary" || members.any { m -> m.name == it } } ?: members.first().name
     val busy = sessionController.isBusy
-    val ready = sessionController.stage == SessionStage.READY && sessionController.completedCount >= ArenaService.MIN_MEMBERS && !busy
+    // 独立迭代只剩一家也能继续问（逃生通道）；工作流、讨论、总结需要至少两家的回答。
+    val needed = if (mode == RoundMode.ITERATE) 1 else ArenaService.MIN_MEMBERS
+    val ready = sessionController.stage == SessionStage.READY && sessionController.completedCount >= needed && !busy
     val completedMembers = sessionController.sessionServices.filter { sessionController.runs[it]?.phase == ParticipantPhase.COMPLETE }
     var orderNames by rememberSaveable(sessionKey) { mutableStateOf(emptyList<String>()) }
     val relayOrder = orderNames.mapNotNull(ArenaService::fromName).filter { it in completedMembers }
@@ -243,6 +245,12 @@ internal fun SimpleRoundStage(
             }
             if (offline) SimpleNotice("网络未连接；已收到的回答仍可阅读。")
             sessionController.storageWarning?.let { SimpleNotice(it) }
+            if (!reviewing && busy && ArenaRoundNotifier.delivered(sessionController)) Surface(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp).testTag("free-to-leave"),
+                color = colors.accentSoft, shape = RoundedCornerShape(12.dp)) {
+                Text("问题都已送达，可以切到别的应用，答完会通知你。", Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    style = MaterialTheme.typography.labelLarge, color = colors.accent)
+            }
             if (!reviewing && listOf("压缩", "截取", "预算", "上限").any { sessionController.sessionMessage.contains(it) }) {
                 SimpleNotice(sessionController.sessionMessage)
             }
@@ -281,7 +289,8 @@ internal fun SimpleRoundStage(
                         val service = members.first { it.name == current }
                         val run = (pastRound?.results ?: sessionController.runs)[service] ?: ParticipantRun()
                         Column {
-                            if (!reviewing) SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) })
+                            if (!reviewing) SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) },
+                                onSkip = { if (sessionController.skipRunning(service)) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } })
                             if (reviewing) {
                                 ReadOnlyAnswer(service, run, onOpen = { onOpenService(service) },
                                     onCopy = copyFrom?.let { f -> { f("${service.shortName} 第 ${viewing?.round} 轮回答", run.response) } },
@@ -324,7 +333,11 @@ internal fun SimpleRoundStage(
                             else "只发给队长${judge?.let { " ${it.shortName}" }.orEmpty()}"
                         }
                         RoundMode.RELAY -> "按顺序接力，${relayOrder.size} 家"
-                        else -> "发给本轮成功的 ${completedMembers.size} 家 AI"
+                        RoundMode.ITERATE -> if (!busy && completedMembers.isEmpty()) "本轮还没有答完的成员，先在上方重发或重新读取"
+                            else "发给本轮成功的 ${completedMembers.size} 家 AI"
+                        else -> if (!busy && completedMembers.size < ArenaService.MIN_MEMBERS)
+                            "至少 ${ArenaService.MIN_MEMBERS} 家答完才能讨论，先在上方重发失败的成员；只想继续问可用「独立迭代」"
+                        else "发给本轮成功的 ${completedMembers.size} 家 AI"
                     },
                     options = {
                         when (mode) {
@@ -336,7 +349,7 @@ internal fun SimpleRoundStage(
                             RoundMode.SUMMARY -> SummaryOptionsRow(sessionController.sessionServices, captain, depth, !busy,
                                 onCaptain = { captainName = it.name; captainPreferences.saveCaptain(it) },
                                 onDepth = { depthName = it.name; captainPreferences.saveDepth(it) })
-                            RoundMode.ITERATE -> Unit
+                            RoundMode.ITERATE -> if (ready && roundGuidance.isBlank()) QuickFollowUpRow(onRoundGuidanceChange)
                         }
                     },
                     preset = presetParts?.let { (key, parts) -> { PresetCard(key, parts, store.custom(key) != null, !busy) { editing = key } } },
@@ -475,7 +488,7 @@ internal fun SimpleSummaryResult(summary: DiscussionSummary, onOpen: (ArenaServi
 
 @Composable
 internal fun SimpleWaitProgress(controller: ArenaSessionController, service: ArenaService, run: ParticipantRun,
-                                onOpen: () -> Unit, summary: Boolean = false) {
+                                onOpen: () -> Unit, summary: Boolean = false, onSkip: (() -> Unit)? = null) {
     val active = run.phase in setOf(ParticipantPhase.QUEUED, ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING)
     var now by remember(run.requestId) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     LaunchedEffect(run.requestId, active) {
@@ -493,7 +506,14 @@ internal fun SimpleWaitProgress(controller: ArenaSessionController, service: Are
             }
             Text(progress.expectation, style = MaterialTheme.typography.labelSmall, color = colors.muted)
             Text(progress.limit, style = MaterialTheme.typography.labelSmall, color = colors.muted)
-            if (progress.needsAttention) TextButton(onClick = onOpen) { Text("等待较久，打开官网核对", style = MaterialTheme.typography.labelSmall) }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (progress.needsAttention) TextButton(onClick = onOpen) { Text("等待较久，打开官网核对", style = MaterialTheme.typography.labelSmall) }
+                Spacer(Modifier.weight(1f))
+                // 逃生通道：这一家明显卡住时只停它，其他成员照常答完。
+                if (onSkip != null) TextButton(onClick = onSkip, modifier = Modifier.heightIn(min = 48.dp).testTag("skip-${service.name}")) {
+                    Text("跳过这家", style = MaterialTheme.typography.labelMedium, color = colors.muted)
+                }
+            }
         }
     }
 }

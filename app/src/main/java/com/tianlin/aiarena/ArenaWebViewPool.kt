@@ -54,7 +54,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         isFocusable = false
     }
 
-    private val handler = Handler(Looper.getMainLooper())
+    /** 后台期间页面自动化原地等待，期限按前台时间计（见 ArenaForegroundHandler）。 */
+    private val handler: Handler = ArenaForegroundHandler(Looper.getMainLooper(), freezeAll = true)
     private val webViews = linkedMapOf<ArenaService, WebView>()
     private val pendingBackgroundProbes = linkedSetOf<ArenaService>()
     private val confirmedSignedIn = mutableSetOf<ArenaService>()
@@ -170,7 +171,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val live = ArenaService.entries.filter { candidate ->
             candidate == front || candidate == uiSelectedService || candidate in automations ||
                 candidate == backgroundProbeService || candidate in pendingFreshPages ||
-                (candidate in FRAME_DRIVEN_SERVICES && (candidate in protectedServices || (readingUntil[candidate] ?: 0L) > SystemClock.elapsedRealtime()))
+                (candidate in FRAME_DRIVEN_SERVICES && (candidate in protectedServices || (readingUntil[candidate] ?: 0L) > ArenaForeground.elapsed()))
         }.toSet()
         val hidden = focusAction != null || uiSelectedService == null
         blockUserTouches = hidden
@@ -248,7 +249,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     /** 由控制器在开轮/收轮时告知，哪些成员的 WebView 现在不能回收。 */
     override fun setProtectedServices(services: Set<ArenaService>) {
+        val released = protectedServices - services
         protectedServices = services
+        // 一轮在后台结束：刚才为了收回答而保持运行的页面，现在按普通后台页面挂起。
+        if (!ArenaForeground.visible) released.forEach { webViews[it]?.onPause() }
         refreshVisibility()
     }
 
@@ -293,39 +297,64 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     override fun conversationUrl(service: ArenaService): String =
         webViews[service]?.url.orEmpty().takeIf { it.startsWith("https://") }.orEmpty()
 
-    override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) {
+    override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) =
+        openFreshConversation(service, prewarm = false, callback)
+
+    private fun openFreshConversation(service: ArenaService, prewarm: Boolean, callback: (Boolean) -> Unit) {
         if (destroyed) return callback(false)
         val webView = ensureWebView(service) ?: return callback(false)
         if (ArenaWebMessageIdentity.supported(service)) {
+            // A prewarm still in flight is adopted, not restarted: the page keeps loading while the user types.
+            // Only a recent one: an old prewarm could use up the round's 90 s budget before a fallback page loads.
+            val prewarmAge = ArenaForeground.elapsed() - (prewarmStarted[service] ?: Long.MIN_VALUE / 2)
+            if (!prewarm && allowedFreshDrafts[service].isNullOrEmpty() && prewarmAge <= PREWARM_ADOPT_MS) prewarmWaiters[service]?.let { waiters ->
+                waiters += callback
+                return
+            }
+            // Not adopting an older prewarm: it is superseded (its late result changes nothing).
+            if (!prewarm) prewarmWaiters.remove(service)?.forEach { stale -> handler.post { stale(false) } }
+            val warm = warmFresh.remove(service)
+            if (warm != null && warm == navigationGenerations[service] && service !in sentSinceLoad && service !in automations &&
+                pendingFreshPages[service] == null && allowedFreshDrafts[service].isNullOrEmpty()) {
+                // Prewarmed while the user was writing: our own navigation, verified empty, untouched since.
+                // Re-run the same emptiness check on that page; anything off falls back to a new navigation.
+                val recheckDeadline = ArenaForeground.elapsed() + WARM_RECHECK_MS
+                waitForFreshPage(service, webView, warm, recheckDeadline, "") { ok ->
+                    if (ok && !destroyed && webViews[service] === webView) callback(true)
+                    else if (!destroyed) openFreshConversation(service, callback)
+                }
+                return
+            }
             // A restored root URL is not evidence of an empty conversation. Start a navigation
             // owned by this request, then require an empty, hydrated editor on the root page.
             pendingFreshPages.remove(service)?.invoke(false)
             freshReasons.remove(service)
             freshDrafts.remove(service)
-            val allowedDraft = allowedFreshDrafts.remove(service).orEmpty()
-            val hardDeadline = SystemClock.elapsedRealtime() + 85_000L
+            // A prewarm never consumes the draft the user confirmed for a real round.
+            val allowedDraft = if (prewarm) "" else allowedFreshDrafts.remove(service).orEmpty()
+            val hardDeadline = ArenaForeground.elapsed() + 85_000L
             val deadline = hardDeadline
             var settled = false
             lateinit var complete: (Boolean) -> Unit
             val watchdog = Runnable { complete(false) }
             complete = { ok ->
-                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service complete ok=$ok settled=$settled left=${deadline - SystemClock.elapsedRealtime()} hardLeft=${hardDeadline - SystemClock.elapsedRealtime()}")
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service complete ok=$ok settled=$settled left=${deadline - ArenaForeground.elapsed()} hardLeft=${hardDeadline - ArenaForeground.elapsed()}")
                 if (!settled) {
                     settled = true
                     handler.removeCallbacks(watchdog)
                     if (pendingFreshPages[service] === complete) pendingFreshPages.remove(service)
                     refreshVisibility()
-                    callback(ok && !destroyed && webViews[service] === webView && SystemClock.elapsedRealtime() < deadline)
+                    callback(ok && !destroyed && webViews[service] === webView && ArenaForeground.elapsed() < deadline)
                 }
             }
             pendingFreshPages[service] = complete
             refreshVisibility()
-            handler.postDelayed(watchdog, hardDeadline - SystemClock.elapsedRealtime())
+            handler.postDelayed(watchdog, hardDeadline - ArenaForeground.elapsed())
             navigate(service, webView, service.url, timeoutMillis = 60_000L, freshOwner = complete) { ok ->
-                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service navigated ok=$ok hardLeft=${hardDeadline - SystemClock.elapsedRealtime()} url=${webView.url}")
+                if (BuildConfig.DEBUG) android.util.Log.i("ArenaFresh", "$service navigated ok=$ok hardLeft=${hardDeadline - ArenaForeground.elapsed()} url=${webView.url}")
                 if (!settled) {
                     if (!ok) freshReasons[service] = "navigation"
-                    if (!ok || destroyed || webViews[service] !== webView || SystemClock.elapsedRealtime() >= hardDeadline) complete(false)
+                    if (!ok || destroyed || webViews[service] !== webView || ArenaForeground.elapsed() >= hardDeadline) complete(false)
                     else {
                         // The editor may mount 40+ s after load while other pages occupy the shared renderer
                         // thread (2026-09-23), so it keeps the whole remaining budget. Waiting never sends;
@@ -342,6 +371,69 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         navigate(service, webView, service.url, callback = callback)
     }
 
+    /**
+     * 网页体检结果（只读）：已登录却找不到输入框、或打开后被带到别的页面，多半是网站刚改版。
+     * 首页只在有问题时显示一句提示；成功准备好新对话或发出问题后自动清除。
+     */
+    val healthIssues = mutableStateMapOf<ArenaService, String>()
+
+    /** 预热成功的新对话页：记录当时的导航代号；发送时代号没变、也没发过消息，才直接复用。 */
+    private val warmFresh = mutableMapOf<ArenaService, Long>()
+    /** 发送时预热还没做完：先排在这里，预热一结束就接着用（成功走复用，失败照常重开）。 */
+    private val prewarmWaiters = mutableMapOf<ArenaService, MutableList<(Boolean) -> Unit>>()
+    private val prewarmStarted = mutableMapOf<ArenaService, Long>()
+    /** 由 App 自己发起的加载（建页时的首次加载或 navigate）对应的导航代号。 */
+    private val ownedLoads = mutableMapOf<ArenaService, Long>()
+
+    /**
+     * 用户还在首页写问题时，先把各家的新对话页准备好并确认是空白的。
+     * 点发送后就不用再等「打开新对话」这一步（它是第一轮里最慢的部分，豆包常要十几秒）。
+     * 刚建好的页面本来就停在首页，只做检查不重新加载；其余情况走一次正常的开新对话。
+     * 只读检查和页面跳转，不输入、不发送。
+     */
+    fun prewarmFreshConversations(services: List<ArenaService>) {
+        if (destroyed) return
+        services.forEach { service ->
+            if (!ArenaWebMessageIdentity.supported(service) || service in automations || pendingFreshPages[service] != null) return@forEach
+            val generation = navigationGenerations[service]
+            if (warmFresh[service] == generation && service !in sentSinceLoad) return@forEach
+            if (prewarmWaiters.containsKey(service)) return@forEach
+            val webView = ensureWebView(service) ?: return@forEach
+            warmFresh.remove(service)
+            val waiting = mutableListOf<(Boolean) -> Unit>()
+            prewarmWaiters[service] = waiting
+            prewarmStarted[service] = ArenaForeground.elapsed()
+            fun remember(ok: Boolean) {
+                // Superseded by a real request that opened its own page: that page decides, not this prewarm.
+                if (prewarmWaiters[service] !== waiting) return
+                prewarmWaiters.remove(service)
+                // Every adopted request goes through the normal entry again: warm → quick recheck, otherwise a new page.
+                if (!destroyed) handler.post { waiting.forEach { openFreshConversation(service, it) } }
+                if (destroyed || webViews[service] !== webView) return
+                if (ok) {
+                    warmFresh[service] = navigationGenerations[service] ?: 0L
+                    healthIssues.remove(service)
+                    return
+                }
+                // Only signals that point at the website itself; login, drafts and history have their own messages.
+                val signedIn = statuses[service]?.state == ConnectionState.SIGNED_IN
+                when (freshReasons[service]) {
+                    "no_editor" -> if (signedIn) healthIssues[service] = "${service.displayName} 的网页里没找到输入框，可能刚改版；这次可以先不选它"
+                    "not_root" -> if (signedIn) healthIssues[service] = "${service.displayName} 打开后跳到了别的页面，可能刚改版或需要验证；可以先打开网页看看"
+                }
+            }
+            val untouchedFirstLoad = generation != null && ownedLoads[service] == generation && service !in sentSinceLoad &&
+                isRootUrl(service, webView.url.orEmpty())
+            if (untouchedFirstLoad) {
+                waitForFreshPage(service, webView, generation, ArenaForeground.elapsed() + 60_000L, "") { ok ->
+                    remember(ok)
+                }
+            } else {
+                openFreshConversation(service, prewarm = true) { ok -> remember(ok) }
+            }
+        }
+    }
+
     override fun openConversation(service: ArenaService, url: String, callback: (Boolean) -> Unit) {
         if (destroyed || !url.startsWith("https://")) return callback(false)
         val webView = ensureWebView(service) ?: return callback(false)
@@ -356,6 +448,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (pendingFreshPages[service] !== freshOwner) pendingFreshPages.remove(service)?.invoke(false)
         pendingLoads.remove(service)?.invoke(false)
         navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
+        ownedLoads[service] = navigationGenerations.getValue(service)
         navigationTargets[service] = url
         var settled = false
         val timeout = Runnable {
@@ -415,7 +508,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (Boolean) -> Unit,
     ) {
         if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
-            SystemClock.elapsedRealtime() >= deadline) return callback(false)
+            ArenaForeground.elapsed() >= deadline) return callback(false)
         // Fresh-page history is broader than accepted-user identity: failed user placeholders
         // and assistant-only restored history must also prevent starting a new conversation.
         val historySelector = when (service) {
@@ -473,7 +566,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
         webView.evaluateJavascript(probe) { raw ->
             if (BuildConfig.DEBUG) webView.evaluateJavascript("window.__aiArenaFreshDiag") { diag ->
-                android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - SystemClock.elapsedRealtime()} raw=$raw diag=${decodeJsValue(diag)}")
+                android.util.Log.i("ArenaFresh", "$service gen=$generation left=${deadline - ArenaForeground.elapsed()} raw=$raw diag=${decodeJsValue(diag)}")
             }
             val reason = decodeJsValue(raw)
             if (navigationGenerations[service] == generation) {
@@ -492,9 +585,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 return@evaluateJavascript
             }
             if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
-                SystemClock.elapsedRealtime() >= deadline) callback(false)
+                ArenaForeground.elapsed() >= deadline) callback(false)
             else if (raw == "true") callback(true)
-            else if (SystemClock.elapsedRealtime() < deadline) handler.postDelayed({
+            else if (ArenaForeground.elapsed() < deadline) handler.postDelayed({
                 waitForFreshPage(service, webView, generation, deadline, allowedDraft, callback)
             }, 400L)
             else callback(false)
@@ -506,10 +599,13 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         webViews.keys.toList().forEach(::probe)
     }
 
-    /** App 退到后台时挂起全部 WebView，避免 3-4 个聊天页在后台继续跑定时器和动画。 */
+    /**
+     * App 退到后台时挂起 WebView，避免 3-4 个聊天页在后台继续跑定时器和动画。
+     * 本轮正在收发的页面除外：用户切走等回答时，它们还要继续接收。
+     */
     fun pauseAll() {
         if (destroyed) return
-        webViews.values.forEach { webView -> webView.onPause() }
+        webViews.forEach { (service, webView) -> if (service !in protectedServices) webView.onPause() }
     }
 
     fun resumeAll() {
@@ -667,11 +763,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     /** A streaming answer advances on animation frames; polling it keeps the page drawn for [READING_LIVE_MS]. */
     private fun keepDrawnWhileReading(service: ArenaService) {
-        val wasLive = (readingUntil[service] ?: 0L) > SystemClock.elapsedRealtime()
-        readingUntil[service] = SystemClock.elapsedRealtime() + READING_LIVE_MS
+        val wasLive = (readingUntil[service] ?: 0L) > ArenaForeground.elapsed()
+        readingUntil[service] = ArenaForeground.elapsed() + READING_LIVE_MS
         if (!wasLive) refreshVisibility()
         handler.postDelayed({
-            if (!destroyed && (readingUntil[service] ?: 0L) <= SystemClock.elapsedRealtime()) {
+            if (!destroyed && (readingUntil[service] ?: 0L) <= ArenaForeground.elapsed()) {
                 readingUntil.remove(service)
                 refreshVisibility()
             }
@@ -730,7 +826,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         val webView = ensureWebView(service) ?: return onTimeout()
         val token = Automation(requestId, onTimeout, onInterrupted, strictReceipt)
         token.deadlineWallMillis = System.currentTimeMillis() + timeoutMillis
-        token.deadlineElapsedMillis = SystemClock.elapsedRealtime() + timeoutMillis
+        token.deadlineElapsedMillis = ArenaForeground.elapsed() + timeoutMillis
         automations[service] = token
         val watchdog = Runnable {
             if (!isCurrent(service, token)) return@Runnable
@@ -894,6 +990,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // verifySendScript already verified and bound in one synchronous DOM read.
             if (!isCurrent(service, token)) return
             sentSinceLoad += service
+            healthIssues.remove(service)
             finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
             return
         }
@@ -1096,7 +1193,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             webView.evaluateJavascript(verifySendScript(service, requestId)) { raw ->
                 if (!current()) return@evaluateJavascript
                 if (raw == "true") finishSuccessfulSend(webView, service, requestId, callback)
-                else if (SystemClock.elapsedRealtime() >= deadline) fail("豆包发送后未检测到新消息，请查看原网页；未重复点击发送")
+                else if (ArenaForeground.elapsed() >= deadline) fail("豆包发送后未检测到新消息，请查看原网页；未重复点击发送")
                 else handler.postDelayed({ verify(deadline) }, 250L)
             }
         }
@@ -1114,7 +1211,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     // Use the existing request watchdog, exactly as strict text sends do;
                     // acknowledgement polling never takes focus or clicks a second time.
                     val deadline = if (token.strictReceipt) token.deadlineElapsedMillis
-                        else SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                        else ArenaForeground.elapsed() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
                     token.timeoutDetail = DOUBAO_UNCONFIRMED_DETAIL
                     if (!token.strictReceipt) handler.postDelayed({ fail("豆包发送确认响应超时，请查看原网页；未重复点击发送") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                     verify(deadline)
@@ -1136,7 +1233,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         fun prepareTouch() {
             if (!current() || issued) return
             if (!sameDocument()) return fail("豆包网页已切换，未发送问题")
-            if (SystemClock.elapsedRealtime() >= preparationDeadline) return fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送按钮或当前正文尚未就绪，未发送问题")
+            if (ArenaForeground.elapsed() >= preparationDeadline) return fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送按钮或当前正文尚未就绪，未发送问题")
             webView.evaluateJavascript(nativeDoubaoControlScript(requestId, arm = false)) probe@{ raw ->
                 if (!current() || issued) return@probe
                 val ready = read(raw) ?: return@probe fail("豆包发送控件状态无法读取，未发送问题")
@@ -1204,7 +1301,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 handler.removeCallbacks(injectionTimeout)
                 val result = decodeJsValue(raw)
                 if (!result.startsWith("sent")) return@evaluateJavascript fail(result.ifBlank { "豆包正文注入失败，未发送问题" })
-                preparationDeadline = SystemClock.elapsedRealtime() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
+                preparationDeadline = ArenaForeground.elapsed() + SEND_VERIFY_CALLBACK_TIMEOUT_MS
                 token.progressDescription = "等待官网发送按钮就绪"
                 handler.postDelayed({ if (!issued) fail(if (busySeen) DOUBAO_BUSY_DETAIL else "豆包发送控件响应超时，未发送问题") }, SEND_VERIFY_CALLBACK_TIMEOUT_MS)
                 handler.postDelayed({ prepareTouch() }, 220L)
@@ -1489,7 +1586,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                                     if (destroyed || generation != fileBroker.generation(webView) || origin != webView.url) {
                                         deliver(null)
                                     } else checked.fold(onSuccess = { verified ->
-                                        fileBroker.prepare(webView, service, "manual-${SystemClock.elapsedRealtime()}", verified) { error ->
+                                        fileBroker.prepare(webView, service, "manual-${ArenaForeground.elapsed()}", verified) { error ->
                                             if (error != null) android.widget.Toast.makeText(activity, error, android.widget.Toast.LENGTH_LONG).show()
                                         }
                                         fileBroker.handle(webView, ValueCallback(::deliver), fileChooserParams)
@@ -1593,6 +1690,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         updateWebViewInteraction(service, webView, webView.visibility == View.VISIBLE)
         webViews[service] = webView
         container.addView(webView)
+        navigationGenerations[service] = (navigationGenerations[service] ?: 0L) + 1L
+        ownedLoads[service] = navigationGenerations.getValue(service)
+        sentSinceLoad.remove(service)
         webView.loadUrl(service.url)
         return webView
     }
@@ -2569,6 +2669,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
+        /** 复用预热页时重新确认一次的时限；过了就改走正常的开新对话。 */
+        private const val WARM_RECHECK_MS = 8_000L
+        /** 发送时只接手 45 秒内开始的预热；更早的预热照常作废重开。 */
+        private const val PREWARM_ADOPT_MS = 45_000L
         private const val KIMI_FOCUS_ACTION_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
         private const val MODE_PROBE_TIMEOUT_MS = 4_000L

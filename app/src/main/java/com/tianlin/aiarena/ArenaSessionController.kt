@@ -103,7 +103,8 @@ class ArenaSessionController(
     var storageWarning by mutableStateOf<String?>(null)
         private set
 
-    private val handler = Handler(Looper.getMainLooper())
+    /** 发送与开新对话的期限（ArenaDeadline）只按前台时间计；读回答的轮询在后台照常进行。 */
+    private val handler: Handler = ArenaForegroundHandler(Looper.getMainLooper(), freezeAll = false)
     private val persistenceHandler = Handler(Looper.getMainLooper())
 
     /**
@@ -235,7 +236,12 @@ class ArenaSessionController(
         }
         val completed = completedResponses()
         val services = ArenaService.entries.filter { it in completed.keys }
-        if (services.size < ArenaService.MIN_MEMBERS) return false
+        // 逃生通道：其他几家都被跳过时，剩下的一家仍可继续独立追问；接力至少要两家。
+        val needed = if (relayOrder != null) ArenaService.MIN_MEMBERS else 1
+        if (services.size < needed) {
+            sessionMessage = if (services.isEmpty()) "本轮没有答完的成员，请先重发或重新读取" else "工作流至少需要 ${ArenaService.MIN_MEMBERS} 家答完"
+            return false
+        }
         val prompts = services.associateWith { newPrompt }
         return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt, attachments,
             relayOrder = relayOrder?.filter { it in services })
@@ -352,7 +358,7 @@ class ArenaSessionController(
         sessionMessage = "正在请 ${judge.displayName} 做${depth.displayName}总结" +
             if (compressed) " · 已压缩引用回答" else ""
         schedulePersist()
-        val sendTimeout = Runnable {
+        val sendTimeout = ArenaDeadline {
             if (isSummaryActive(execution) && summary.phase == ParticipantPhase.SENDING) {
                 pool.cancelAutomation(judge)
                 summary = summary.copy(phase = ParticipantPhase.ERROR, detail = "总结发送超时，已停止；可打开原网页确认")
@@ -479,6 +485,31 @@ class ArenaSessionController(
         updateLatestRoundResult(service, skipped)
         sessionMessage = "已跳过 ${service.displayName}，其他结果仍保留"
         schedulePersist(immediate = true)
+        return true
+    }
+
+    /**
+     * 逃生通道：本轮进行中某一家明显卡住或出错时，只停掉这一家，其他成员照常进行、照常收尾。
+     * 停掉的是 App 这边的等待和网页自动化；网页里可能仍在生成，本轮结束后可「重新读取」或「重发」把它拉回来。
+     * 跳过的成员不参加之后基于本轮的讨论、工作流和总结（这些只发给本轮答完的成员）。
+     */
+    fun skipRunning(service: ArenaService): Boolean {
+        val execution = activeExecution?.takeIf { isActive(it) } ?: return false
+        if (service !in execution.services || service in execution.skipped) return false
+        val run = runs.getValue(service)
+        if (run.phase.isTerminal()) return false
+        execution.skipped += service
+        pool.cancelAutomation(service)
+        if (execution.answerMode == AnswerMode.PARALLEL) {
+            execution.dispatchedServices += service
+            execution.dispatchComplete = execution.dispatchedServices.size == execution.services.size
+        }
+        sessionMessage = "已跳过 ${service.displayName}，其他成员照常进行"
+        markTerminal(execution, service, run.copy(
+            phase = ParticipantPhase.ERROR,
+            detail = if (run.phase == ParticipantPhase.QUEUED) "已跳过，这一家本轮没有发送"
+            else "已跳过本轮；网页可能仍在生成，可稍后重新读取",
+        ))
         return true
     }
 
@@ -626,7 +657,9 @@ class ArenaSessionController(
         relayOrder: List<ArenaService>? = null,
         style: DebateStyle? = null,
     ): Boolean {
-        if (isBusy || services.size < 2 || services.any { prompts[it].isNullOrBlank() }) return false
+        // 只有独立迭代允许单独一家（其他成员被跳过后的逃生通道）；提问、讨论、工作流都要至少两家。
+        val minimum = if (kind == RoundKind.ITERATION && relayOrder == null) 1 else 2
+        if (isBusy || services.size < minimum || services.any { prompts[it].isNullOrBlank() }) return false
         // 工作流：顺序必须恰好是本轮成员；第 1 位直接收到问题，之后每位轮到时再组装「问题 + 前面各位的回答」。
         val relay = relayOrder != null && relayOrder.size == services.size && relayOrder.toSet() == services.toSet()
         if (relayOrder != null && !relay) {
@@ -727,6 +760,8 @@ class ArenaSessionController(
                 if (settled || !isActive(execution)) return
                 settled = true
                 execution.freshReadiness[service] = ok
+                // Skipping already moved the round on (markTerminal); a late page result changes nothing.
+                if (service in execution.skipped) return
                 when (execution.answerMode) {
                     AnswerMode.PARALLEL -> dispatchParallelService(execution, service)
                     AnswerMode.SERIAL -> {
@@ -735,7 +770,7 @@ class ArenaSessionController(
                     }
                 }
             }
-            val timeout = Runnable { ready(false) }
+            val timeout = ArenaDeadline { ready(false) }
             handler.postDelayed(timeout, timing.freshConversationTimeoutMillis)
             pool.openFreshConversation(service) { ok ->
                 handler.removeCallbacks(timeout)
@@ -797,7 +832,7 @@ class ArenaSessionController(
             return true
         }
         var sendSettled = false
-        val sendTimeout = Runnable {
+        val sendTimeout = ArenaDeadline {
             if (isRecoveryActive(execution) && runs[service]?.phase == ParticipantPhase.SENDING) {
                 sendSettled = true
                 pool.cancelAutomation(service)
@@ -845,7 +880,7 @@ class ArenaSessionController(
                     ))
                 }
             }
-            val freshTimeout = Runnable { ready(false) }
+            val freshTimeout = ArenaDeadline { ready(false) }
             handler.postDelayed(freshTimeout, timing.freshConversationTimeoutMillis)
             pool.openFreshConversation(service) { ok ->
                 handler.removeCallbacks(freshTimeout)
@@ -1019,6 +1054,10 @@ class ArenaSessionController(
             maybeFinishRound(execution)
             return
         }
+        if (service in execution.skipped) {
+            execution.nextDispatchIndex += 1
+            return dispatchSerialNext(execution)
+        }
         if (execution.kind == RoundKind.INITIAL && service !in execution.freshReadiness) return
         execution.nextDispatchIndex += 1
         if (execution.relay && !composeRelayPrompt(execution, service)) return dispatchSerialNext(execution)
@@ -1088,11 +1127,11 @@ class ArenaSessionController(
         schedulePersist()
         // 每家独立兜底，不能因一家丢失回调而取消其他成员的在途上传和发送。
         var sendSettled = false
-        val sendTimeout = Runnable {
-            if (sendSettled) return@Runnable
+        val sendTimeout = ArenaDeadline {
+            if (sendSettled) return@ArenaDeadline
             sendSettled = true
-            if (!isActive(execution) || runs[service]?.requestId != requestId) return@Runnable
-            if (runs[service]?.phase != ParticipantPhase.SENDING) return@Runnable
+            if (!isActive(execution) || runs[service]?.requestId != requestId) return@ArenaDeadline
+            if (runs[service]?.phase != ParticipantPhase.SENDING) return@ArenaDeadline
             runs[service] = ParticipantRun(
                 phase = ParticipantPhase.ERROR,
                 requestId = requestId,
@@ -1113,7 +1152,7 @@ class ArenaSessionController(
             if (sendSettled) return@sendPromptWithAttachments
             sendSettled = true
             handler.removeCallbacks(sendTimeout)
-            if (!isActive(execution) || runs[service]?.requestId != requestId) return@sendPromptWithAttachments
+            if (!isActive(execution) || runs[service]?.requestId != requestId || service in execution.skipped) return@sendPromptWithAttachments
             if (outcome.success) {
                 runs[service] = ParticipantRun(
                     phase = ParticipantPhase.WAITING,
@@ -1334,6 +1373,52 @@ class ArenaSessionController(
         }
         activeExecution = null
         schedulePersist(immediate = true)
+        // 被停止的一轮不核实：那是用户自己的决定。
+        if (forcedMessage == null) verifyUncertainFailures()
+    }
+
+    /**
+     * 本轮结束后，对「问题可能已经送达、只是没确认到」的失败悄悄核实一次（2026-09-29 实测：
+     * DeepSeek 网页上已有 618 字回答，App 却显示「未检测到」）。只读网页、不重发、不占用界面；
+     * 读到稳定的回答就改为完成，读不到就原样保留失败说明。用户开始下一步操作即放弃核实。
+     */
+    private fun verifyUncertainFailures() {
+        val epoch = sessionEpoch
+        sessionServices.forEach { service ->
+            val run = runs[service] ?: return@forEach
+            if (run.phase == ParticipantPhase.ERROR && run.requestId.isNotBlank() && ArenaErrorHelp.mayHaveAnswered(run.detail)) {
+                autoVerify(service, run, epoch, attempt = 0, lastText = "", stable = 0)
+            }
+        }
+    }
+
+    private fun autoVerify(service: ArenaService, original: ParticipantRun, epoch: Long, attempt: Int, lastText: String, stable: Int) {
+        fun untouched() = epoch == sessionEpoch && !isBusy && stage == SessionStage.READY && runs[service] == original
+        if (!untouched() || attempt >= timing.autoVerifyReads) return
+        pool.readResponse(service, original.requestId) { snapshot ->
+            if (!untouched()) return@readResponse
+            val text = if (snapshot.found && snapshot.detail.isBlank() && !snapshot.isAwaitingSecurityChallenge()) {
+                if (snapshot.streaming) snapshot.text else snapshot.settledText
+            } else ""
+            val nextStable = if (text.isNotBlank() && text == lastText && !snapshot.streaming) stable + 1 else 0
+            if (text.isNotBlank() && nextStable >= requiredStablePolls(snapshot)) {
+                val verified = original.copy(
+                    phase = ParticipantPhase.COMPLETE,
+                    response = text,
+                    responseTruncated = snapshot.truncated,
+                    originalResponseLength = snapshot.originalLength,
+                    modeLabel = snapshot.modeLabel.ifBlank { original.modeLabel },
+                    thinkingUsed = original.thinkingUsed || snapshot.thinkingUsed,
+                    detail = "回答完成 · ${text.length} 字（已从网页核实）",
+                )
+                runs[service] = verified
+                updateLatestRoundResult(service, verified)
+                sessionMessage = "${service.displayName} 其实已经回答，已从网页补上"
+                schedulePersist(immediate = true)
+                return@readResponse
+            }
+            handler.postDelayed({ autoVerify(service, original, epoch, attempt + 1, text, nextStable) }, timing.autoVerifyIntervalMillis)
+        }
     }
 
     private fun pollSummary(execution: SummaryExecution) {
@@ -1434,7 +1519,14 @@ class ArenaSessionController(
         }
     }
 
+    /**
+     * 每次会话状态变化都会通知（与落盘同一个时机）。App 在后台时界面不重组，
+     * 通知栏进度和「答完了」提醒靠它驱动。
+     */
+    var onStateChanged: (() -> Unit)? = null
+
     private fun schedulePersist(immediate: Boolean = false) {
+        onStateChanged?.invoke()
         if (sessionRepository == null || sessionId.isBlank() || originalQuestion.isBlank()) return
         persistenceHandler.removeCallbacks(persistRunnable)
         if (immediate) persistNow() else persistenceHandler.postDelayed(persistRunnable, PERSIST_DEBOUNCE_MILLIS)
@@ -1647,6 +1739,8 @@ class ArenaSessionController(
         var dispatchComplete: Boolean = false,
         val relay: Boolean = false,
         val style: DebateStyle? = null,
+        /** 用户在本轮中途跳过的成员：迟到的回调一律不再改动它们。 */
+        val skipped: MutableSet<ArenaService> = mutableSetOf(),
     )
 
     private data class PollState(

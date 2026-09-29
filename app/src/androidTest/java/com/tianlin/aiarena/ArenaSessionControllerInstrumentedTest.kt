@@ -1483,6 +1483,107 @@ class ArenaSessionControllerInstrumentedTest {
         }
     }
 
+    @Test
+    fun sendAndFreshDeadlinesPauseWhileTheAppIsInTheBackgroundAndAnswersStillArrive() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.DEEPSEEK))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(
+            freshConversationTimeoutMillis = 400, sendTimeoutMillis = 400, responseTimeoutMillis = 5_000)) }
+        try {
+            onMain {
+                controller.startInitial("leave right after sending", ArenaService.defaultMembers)
+                ArenaForeground.setVisible(false)
+            }
+            Thread.sleep(1_200)
+            onMain {
+                assertEquals("The new-conversation deadline does not run out in the background",
+                    ParticipantPhase.QUEUED, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals("The send deadline does not run out in the background",
+                    ParticipantPhase.SENDING, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            // A question already delivered keeps being read while the user is away.
+            awaitProviderPhase(controller, ArenaService.KIMI, ParticipantPhase.COMPLETE)
+            onMain {
+                assertEquals("还有 2 家没发出，回到圆桌后继续发送", ArenaRoundNotifier.progressText(controller))
+                assertFalse("Unsent members mean it is not yet safe to leave", ArenaRoundNotifier.delivered(controller))
+                ArenaForeground.setVisible(true)
+            }
+            Thread.sleep(1_800)
+            onMain {
+                assertEquals("Back in front, the remaining deadline runs out as before",
+                    ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DEEPSEEK).phase)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                assertEquals(null, ArenaRoundNotifier.progressText(controller))
+                assertEquals("1/3 家答完，点开查看", ArenaRoundNotifier.doneText(controller))
+            }
+        } finally { onMain { ArenaForeground.setVisible(true); controller.destroy() } }
+    }
+
+    @Test
+    fun uncertainFailureIsQuietlyVerifiedFromThePageAfterTheRound() {
+        val gateway = ControlledGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(autoVerifyIntervalMillis = 40)) }
+        try {
+            onMain {
+                controller.startInitial("was it really lost", ArenaService.defaultMembers)
+                // DeepSeek on 2026-09-29: the answer was on the page, the App had reported this.
+                gateway.completeSend(ArenaService.DEEPSEEK, ok = false, detail = "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送")
+                gateway.completeSend(ArenaService.DOUBAO, ok = false, detail = "豆包 新对话的输入框迟迟没有加载完成，本轮未发送；请稍后重试")
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+            onMain {
+                assertEquals("DEEPSEEK independent answer", controller.runs.getValue(ArenaService.DEEPSEEK).response)
+                assertTrue(controller.runs.getValue(ArenaService.DEEPSEEK).detail.contains("已从网页核实"))
+                assertEquals("The finished round record is corrected too", ParticipantPhase.COMPLETE,
+                    controller.history.last().results.getValue(ArenaService.DEEPSEEK).phase)
+                assertFalse("Verification is read-only and never occupies the screen", controller.isBusy)
+                assertEquals("Never resent", 1, gateway.sentServices.count { it == ArenaService.DEEPSEEK })
+            }
+            Thread.sleep(600)
+            onMain {
+                assertEquals("A question that was clearly not sent stays a failure",
+                    ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+            }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
+    fun skippingAStuckMemberLetsTheOthersFinishAndTheLastOneCanStillBeAskedAlone() {
+        val gateway = ControlledGateway(heldFresh = setOf(ArenaService.KIMI))
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(sendTimeoutMillis = 60_000, freshConversationTimeoutMillis = 60_000)) }
+        try {
+            onMain {
+                controller.startInitial("one member is stuck", ArenaService.defaultMembers)
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+            onMain {
+                assertTrue("Doubao is still sending and Kimi still opening a page, so the round is busy", controller.isBusy)
+                assertTrue(controller.skipRunning(ArenaService.DOUBAO))
+                assertTrue(controller.isBusy)
+                assertTrue(controller.skipRunning(ArenaService.KIMI))
+                assertFalse("Skipping the stuck members ends the round with what the others answered", controller.isBusy)
+                assertEquals(1, controller.history.size)
+                assertTrue(controller.runs.getValue(ArenaService.DOUBAO).detail.startsWith("已跳过"))
+                assertEquals("已跳过，这一家本轮没有发送", controller.runs.getValue(ArenaService.KIMI).detail)
+                assertTrue(ArenaService.DOUBAO in gateway.cancelledServices)
+                // Late page results never bring a skipped member back into the finished round.
+                gateway.completeSend(ArenaService.DOUBAO)
+                gateway.completeFresh(ArenaService.KIMI, true)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+                assertEquals(ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.KIMI).phase)
+                assertFalse(ArenaService.KIMI in gateway.sentServices)
+                assertFalse("Discussion needs two answers", controller.startDebate())
+                assertTrue("The one member that answered can still be asked a follow-up", controller.startIteration(guidance = "请再补充一点"))
+                gateway.completeSend(ArenaService.DEEPSEEK)
+            }
+            awaitHistorySize(controller, 2)
+            onMain { assertEquals(setOf(ArenaService.DEEPSEEK), controller.history.last().results.keys) }
+        } finally { onMain { controller.destroy() } }
+    }
+
     private class ControlledGateway(private val heldFresh: Set<ArenaService> = emptySet()) : ArenaGateway {
         val pendingSends = mutableMapOf<ArenaService, Pair<String, (SendOutcome) -> Unit>>()
         val freshCallbacks = mutableMapOf<ArenaService, (Boolean) -> Unit>()
@@ -1501,9 +1602,9 @@ class ArenaSessionControllerInstrumentedTest {
         fun completeFresh(service: ArenaService, ok: Boolean) = freshCallbacks.getValue(service)(ok)
         val freshFailures = mutableMapOf<ArenaService, String>()
         override fun freshConversationFailure(service: ArenaService): String? = freshFailures[service]
-        fun completeSend(service: ArenaService, ok: Boolean = true) {
+        fun completeSend(service: ArenaService, ok: Boolean = true, detail: String? = null) {
             val (id, callback) = pendingSends.getValue(service)
-            callback(SendOutcome(ok, id, if (ok) "acknowledged" else "upload rejected"))
+            callback(SendOutcome(ok, id, detail ?: if (ok) "acknowledged" else "upload rejected"))
         }
 
         override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,

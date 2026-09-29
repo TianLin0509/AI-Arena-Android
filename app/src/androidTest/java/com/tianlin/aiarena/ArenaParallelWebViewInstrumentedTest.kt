@@ -782,6 +782,50 @@ class ArenaParallelWebViewInstrumentedTest {
         }
     }
 
+    @Test fun prewarmedFreshPageIsReusedOnceAndRecheckedBeforeUse() {
+        withPool(emptyMap()) { pool, views, _ ->
+            val service = ArenaService.DOUBAO
+            val view = views.getValue(service)
+            interceptFreshPage(view, "<textarea></textarea>")
+            @Suppress("UNCHECKED_CAST")
+            fun generation(): Long? { var value: Long? = null; onMain { value = (field(pool, "navigationGenerations") as Map<ArenaService, Long>)[service] }; return value }
+            @Suppress("UNCHECKED_CAST")
+            fun warm(): Boolean { var value = false; onMain { value = (field(pool, "warmFresh") as Map<ArenaService, Long>).containsKey(service) }; return value }
+            fun open(): Boolean {
+                val done = CountDownLatch(1)
+                val ready = AtomicBoolean(false)
+                onMain { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
+                assertTrue(done.await(92, TimeUnit.SECONDS))
+                return ready.get()
+            }
+            assertTrue("A normal new conversation still works", open())
+
+            onMain { pool.prewarmFreshConversations(listOf(service)) }
+            waitUntil("prewarm verified the empty page", 40_000L) { warm() }
+            val before = generation()
+            val started = android.os.SystemClock.elapsedRealtime()
+            assertTrue(open())
+            assertEquals("A prewarmed page is used as is, without loading it again", before, generation())
+            assertTrue("Reusing it is quick", android.os.SystemClock.elapsedRealtime() - started < 5_000L)
+            assertFalse("The warm page is used once", warm())
+
+            onMain { pool.prewarmFreshConversations(listOf(service)) }
+            waitUntil("prewarm verified the empty page again", 40_000L) { warm() }
+            val warmGeneration = generation()
+            evaluate(view, "document.body.insertAdjacentHTML('beforeend', \"<div data-target-id='message-box-target-id'>old</div>\"); true")
+            assertTrue("History appearing on the warm page is caught, and a new page is opened instead", open())
+            assertTrue("It navigated again rather than trusting the warm page", (generation() ?: 0L) > (warmGeneration ?: 0L))
+
+            // Sending while the prewarm is still loading adopts it instead of loading the page a second time.
+            @Suppress("UNCHECKED_CAST")
+            onMain { (field(pool, "sentSinceLoad") as MutableSet<ArenaService>) += service }
+            val beforeAdopt = generation() ?: 0L
+            onMain { pool.prewarmFreshConversations(listOf(service)) }
+            assertTrue("An in-flight prewarm is adopted and succeeds", open())
+            assertEquals("Only the prewarm's own navigation happened", beforeAdopt + 1, generation())
+        }
+    }
+
     @Test fun freshEditorRejectsRestoredDraftWithoutChangingIt() {
         withPool(emptyMap()) { pool, views, _ ->
             val view = views.getValue(ArenaService.DOUBAO)
