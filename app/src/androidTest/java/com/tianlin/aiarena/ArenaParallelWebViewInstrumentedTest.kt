@@ -815,6 +815,14 @@ class ArenaParallelWebViewInstrumentedTest {
             evaluate(view, "document.body.insertAdjacentHTML('beforeend', \"<div data-target-id='message-box-target-id'>old</div>\"); true")
             assertTrue("History appearing on the warm page is caught, and a new page is opened instead", open())
             assertTrue("It navigated again rather than trusting the warm page", (generation() ?: 0L) > (warmGeneration ?: 0L))
+
+            // Sending while the prewarm is still loading adopts it instead of loading the page a second time.
+            @Suppress("UNCHECKED_CAST")
+            onMain { (field(pool, "sentSinceLoad") as MutableSet<ArenaService>) += service }
+            val beforeAdopt = generation() ?: 0L
+            onMain { pool.prewarmFreshConversations(listOf(service)) }
+            assertTrue("An in-flight prewarm is adopted and succeeds", open())
+            assertEquals("Only the prewarm's own navigation happened", beforeAdopt + 1, generation())
         }
     }
 

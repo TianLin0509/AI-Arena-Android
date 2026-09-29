@@ -304,6 +304,15 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (destroyed) return callback(false)
         val webView = ensureWebView(service) ?: return callback(false)
         if (ArenaWebMessageIdentity.supported(service)) {
+            // A prewarm still in flight is adopted, not restarted: the page keeps loading while the user types.
+            // Only a recent one: an old prewarm could use up the round's 90 s budget before a fallback page loads.
+            val prewarmAge = ArenaForeground.elapsed() - (prewarmStarted[service] ?: Long.MIN_VALUE / 2)
+            if (!prewarm && allowedFreshDrafts[service].isNullOrEmpty() && prewarmAge <= PREWARM_ADOPT_MS) prewarmWaiters[service]?.let { waiters ->
+                waiters += callback
+                return
+            }
+            // Not adopting an older prewarm: it is superseded (its late result changes nothing).
+            if (!prewarm) prewarmWaiters.remove(service)?.forEach { stale -> handler.post { stale(false) } }
             val warm = warmFresh.remove(service)
             if (warm != null && warm == navigationGenerations[service] && service !in sentSinceLoad && service !in automations &&
                 pendingFreshPages[service] == null && allowedFreshDrafts[service].isNullOrEmpty()) {
@@ -370,6 +379,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     /** 预热成功的新对话页：记录当时的导航代号；发送时代号没变、也没发过消息，才直接复用。 */
     private val warmFresh = mutableMapOf<ArenaService, Long>()
+    /** 发送时预热还没做完：先排在这里，预热一结束就接着用（成功走复用，失败照常重开）。 */
+    private val prewarmWaiters = mutableMapOf<ArenaService, MutableList<(Boolean) -> Unit>>()
+    private val prewarmStarted = mutableMapOf<ArenaService, Long>()
     /** 由 App 自己发起的加载（建页时的首次加载或 navigate）对应的导航代号。 */
     private val ownedLoads = mutableMapOf<ArenaService, Long>()
 
@@ -385,9 +397,18 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             if (!ArenaWebMessageIdentity.supported(service) || service in automations || pendingFreshPages[service] != null) return@forEach
             val generation = navigationGenerations[service]
             if (warmFresh[service] == generation && service !in sentSinceLoad) return@forEach
+            if (prewarmWaiters.containsKey(service)) return@forEach
             val webView = ensureWebView(service) ?: return@forEach
             warmFresh.remove(service)
+            val waiting = mutableListOf<(Boolean) -> Unit>()
+            prewarmWaiters[service] = waiting
+            prewarmStarted[service] = ArenaForeground.elapsed()
             fun remember(ok: Boolean) {
+                // Superseded by a real request that opened its own page: that page decides, not this prewarm.
+                if (prewarmWaiters[service] !== waiting) return
+                prewarmWaiters.remove(service)
+                // Every adopted request goes through the normal entry again: warm → quick recheck, otherwise a new page.
+                if (!destroyed) handler.post { waiting.forEach { openFreshConversation(service, it) } }
                 if (destroyed || webViews[service] !== webView) return
                 if (ok) {
                     warmFresh[service] = navigationGenerations[service] ?: 0L
@@ -2650,6 +2671,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
         /** 复用预热页时重新确认一次的时限；过了就改走正常的开新对话。 */
         private const val WARM_RECHECK_MS = 8_000L
+        /** 发送时只接手 45 秒内开始的预热；更早的预热照常作废重开。 */
+        private const val PREWARM_ADOPT_MS = 45_000L
         private const val KIMI_FOCUS_ACTION_TIMEOUT_MS = 20_000L
         private const val LOGIN_PROBE_TIMEOUT_MS = 8_000L
         private const val MODE_PROBE_TIMEOUT_MS = 4_000L
