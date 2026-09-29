@@ -349,7 +349,7 @@ internal fun SimpleRoundStage(
                             RoundMode.SUMMARY -> SummaryOptionsRow(sessionController.sessionServices, captain, depth, !busy,
                                 onCaptain = { captainName = it.name; captainPreferences.saveCaptain(it) },
                                 onDepth = { depthName = it.name; captainPreferences.saveDepth(it) })
-                            RoundMode.ITERATE -> Unit
+                            RoundMode.ITERATE -> if (ready && roundGuidance.isBlank()) QuickFollowUpRow(onRoundGuidanceChange)
                         }
                     },
                     preset = presetParts?.let { (key, parts) -> { PresetCard(key, parts, store.custom(key) != null, !busy) { editing = key } } },

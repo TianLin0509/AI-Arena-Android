@@ -362,6 +362,12 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         navigate(service, webView, service.url, callback = callback)
     }
 
+    /**
+     * 网页体检结果（只读）：已登录却找不到输入框、或打开后被带到别的页面，多半是网站刚改版。
+     * 首页只在有问题时显示一句提示；成功准备好新对话或发出问题后自动清除。
+     */
+    val healthIssues = mutableStateMapOf<ArenaService, String>()
+
     /** 预热成功的新对话页：记录当时的导航代号；发送时代号没变、也没发过消息，才直接复用。 */
     private val warmFresh = mutableMapOf<ArenaService, Long>()
     /** 由 App 自己发起的加载（建页时的首次加载或 navigate）对应的导航代号。 */
@@ -382,7 +388,18 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             val webView = ensureWebView(service) ?: return@forEach
             warmFresh.remove(service)
             fun remember(ok: Boolean) {
-                if (ok && !destroyed && webViews[service] === webView) warmFresh[service] = navigationGenerations[service] ?: 0L
+                if (destroyed || webViews[service] !== webView) return
+                if (ok) {
+                    warmFresh[service] = navigationGenerations[service] ?: 0L
+                    healthIssues.remove(service)
+                    return
+                }
+                // Only signals that point at the website itself; login, drafts and history have their own messages.
+                val signedIn = statuses[service]?.state == ConnectionState.SIGNED_IN
+                when (freshReasons[service]) {
+                    "no_editor" -> if (signedIn) healthIssues[service] = "${service.displayName} 的网页里没找到输入框，可能刚改版；这次可以先不选它"
+                    "not_root" -> if (signedIn) healthIssues[service] = "${service.displayName} 打开后跳到了别的页面，可能刚改版或需要验证；可以先打开网页看看"
+                }
             }
             val untouchedFirstLoad = generation != null && ownedLoads[service] == generation && service !in sentSinceLoad &&
                 isRootUrl(service, webView.url.orEmpty())
@@ -952,6 +969,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             // verifySendScript already verified and bound in one synchronous DOM read.
             if (!isCurrent(service, token)) return
             sentSinceLoad += service
+            healthIssues.remove(service)
             finishSend(service, SendOutcome(true, requestId, "已发送"), callback)
             return
         }

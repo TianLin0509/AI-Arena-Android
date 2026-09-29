@@ -1371,6 +1371,52 @@ class ArenaSessionController(
         }
         activeExecution = null
         schedulePersist(immediate = true)
+        // 被停止的一轮不核实：那是用户自己的决定。
+        if (forcedMessage == null) verifyUncertainFailures()
+    }
+
+    /**
+     * 本轮结束后，对「问题可能已经送达、只是没确认到」的失败悄悄核实一次（2026-09-29 实测：
+     * DeepSeek 网页上已有 618 字回答，App 却显示「未检测到」）。只读网页、不重发、不占用界面；
+     * 读到稳定的回答就改为完成，读不到就原样保留失败说明。用户开始下一步操作即放弃核实。
+     */
+    private fun verifyUncertainFailures() {
+        val epoch = sessionEpoch
+        sessionServices.forEach { service ->
+            val run = runs[service] ?: return@forEach
+            if (run.phase == ParticipantPhase.ERROR && run.requestId.isNotBlank() && ArenaErrorHelp.mayHaveAnswered(run.detail)) {
+                autoVerify(service, run, epoch, attempt = 0, lastText = "", stable = 0)
+            }
+        }
+    }
+
+    private fun autoVerify(service: ArenaService, original: ParticipantRun, epoch: Long, attempt: Int, lastText: String, stable: Int) {
+        fun untouched() = epoch == sessionEpoch && !isBusy && stage == SessionStage.READY && runs[service] == original
+        if (!untouched() || attempt >= timing.autoVerifyReads) return
+        pool.readResponse(service, original.requestId) { snapshot ->
+            if (!untouched()) return@readResponse
+            val text = if (snapshot.found && snapshot.detail.isBlank() && !snapshot.isAwaitingSecurityChallenge()) {
+                if (snapshot.streaming) snapshot.text else snapshot.settledText
+            } else ""
+            val nextStable = if (text.isNotBlank() && text == lastText && !snapshot.streaming) stable + 1 else 0
+            if (text.isNotBlank() && nextStable >= requiredStablePolls(snapshot)) {
+                val verified = original.copy(
+                    phase = ParticipantPhase.COMPLETE,
+                    response = text,
+                    responseTruncated = snapshot.truncated,
+                    originalResponseLength = snapshot.originalLength,
+                    modeLabel = snapshot.modeLabel.ifBlank { original.modeLabel },
+                    thinkingUsed = original.thinkingUsed || snapshot.thinkingUsed,
+                    detail = "回答完成 · ${text.length} 字（已从网页核实）",
+                )
+                runs[service] = verified
+                updateLatestRoundResult(service, verified)
+                sessionMessage = "${service.displayName} 其实已经回答，已从网页补上"
+                schedulePersist(immediate = true)
+                return@readResponse
+            }
+            handler.postDelayed({ autoVerify(service, original, epoch, attempt + 1, text, nextStable) }, timing.autoVerifyIntervalMillis)
+        }
     }
 
     private fun pollSummary(execution: SummaryExecution) {

@@ -429,6 +429,9 @@ data class ControllerTiming(
     val attachmentSendTimeoutMillis: Long = 200_000L,
     /** Covers the pool's bounded 85s fresh-page preparation plus callback margin. */
     val freshConversationTimeoutMillis: Long = 90_000L,
+    /** 一轮结束后对「可能已回答」的失败只读核实：最多读几次、间隔多久（约 20 秒）。 */
+    val autoVerifyReads: Int = 8,
+    val autoVerifyIntervalMillis: Long = 2_500L,
 )
 
 object ArenaLimits {

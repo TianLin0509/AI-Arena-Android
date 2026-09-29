@@ -303,6 +303,36 @@ class ArenaSimpleInstrumentedTest {
         capture("settings")
     }
 
+    @Test fun quickFollowUpFillsTheComposerWithEditableText() {
+        var text = ""
+        compose.setContent { ArenaTheme { QuickFollowUpRow { text = it } } }
+        compose.onNodeWithContentDescription("追问：说简单点").assertIsDisplayed().performClick()
+        compose.runOnIdle { assertEquals("请用更简单易懂的话再说一遍，少用术语。", text) }
+    }
+
+    @Test fun homeShowsAHealthNoticeOnlyWhenACheckFoundAProblem() {
+        var notice by mutableStateOf<String?>(null)
+        compose.setContent { ArenaTheme {
+            SimpleAskHome("", {}, ArenaService.defaultMembers, 3, {}, {}, {}, {}, {}, {}, {}, null, false, null, {}, healthNotice = notice)
+        } }
+        compose.onNodeWithText("可能刚改版", substring = true).assertDoesNotExist()
+        notice = "豆包 的网页里没找到输入框，可能刚改版；这次可以先不选它"
+        compose.onNodeWithText("可能刚改版", substring = true).assertIsDisplayed()
+    }
+
+    @Test fun diagnosticsExportSitsInHelpAndSharesOnTap() {
+        var exported = 0
+        compose.setContent { ArenaTheme {
+            SimpleSettingsPage(ArenaService.defaultMembers, false, {}, {}, {}, {}, {}, {}, null, {},
+                null, false, {}, {}, null, {}, null, onExportDiagnostics = { exported++ })
+        } }
+        compose.onNodeWithText("导出诊断信息").assertDoesNotExist()
+        compose.onNodeWithText("更多设置").performClick()
+        compose.onNodeWithText("帮助与故障处理").performScrollTo().performClick()
+        compose.onNodeWithText("导出诊断信息").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, exported) }
+    }
+
     @Test fun questionPageCanSendAttachmentOnlyAndNewQuestionClearsDraft() {
         var opened: ArenaService? = null
         var sends = 0

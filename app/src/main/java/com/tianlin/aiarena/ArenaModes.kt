@@ -116,6 +116,32 @@ internal fun ChipChoice(label: String, options: List<Pair<String, String>>, sele
     }
 }
 
+/** 独立迭代时的常用追问：点一下填进输入框，仍可改了再发；输入框有字就不显示。 */
+internal val QUICK_FOLLOW_UPS = listOf(
+    "说简单点" to "请用更简单易懂的话再说一遍，少用术语。",
+    "举个例子" to "请举一两个具体的例子说明。",
+    "再具体点" to "请说得更具体一些，给出可以直接照做的步骤。",
+    "有什么风险" to "这样做有什么风险或需要注意的地方？",
+    "给出处" to "请给出主要结论的依据或出处。",
+)
+
+@Composable
+internal fun QuickFollowUpRow(onPick: (String) -> Unit) {
+    val colors = ArenaStyle.colors
+    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).testTag("quick-follow-ups"),
+        horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        QUICK_FOLLOW_UPS.forEach { (label, text) ->
+            Surface(Modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(22.dp)).clickable { onPick(text) }
+                .semantics { contentDescription = "追问：$label" }, shape = RoundedCornerShape(22.dp),
+                color = colors.card, border = BorderStroke(1.dp, colors.border)) {
+                Box(Modifier.heightIn(min = 44.dp).padding(horizontal = 14.dp), contentAlignment = Alignment.Center) {
+                    Text(label, style = MaterialTheme.typography.labelMedium, color = colors.ink)
+                }
+            }
+        }
+    }
+}
+
 /** 队长总结的两个选项：谁来整理、写多深。 */
 @Composable
 internal fun SummaryOptionsRow(members: List<ArenaService>, captain: ArenaService?, depth: SummaryDepth, enabled: Boolean,

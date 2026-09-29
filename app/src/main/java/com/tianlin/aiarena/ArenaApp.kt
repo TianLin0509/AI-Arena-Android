@@ -658,6 +658,13 @@ private fun DiscussionHome(
                         }
                     }
                 },
+                onExportDiagnostics = shareText?.let { share ->
+                    {
+                        if (!share("AI 圆桌诊断信息", ArenaDiagnostics.report(context, pool, sessionController))) {
+                            scope.launch { snackbarHostState.showSnackbar("当前设备没有可用的分享方式") }
+                        }
+                    }
+                },
                 updateResult = updateResult,
                 updateChecking = updateChecking,
                 onCheckUpdate = onCheckUpdate,
@@ -733,6 +740,7 @@ private fun DiscussionHome(
                             scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
                         } else initialAttachments.clear()
                     },
+                    healthNotice = pool.healthIssues.filterKeys { it in selectedServices }.values.firstOrNull(),
                     onStartRelay = { order ->
                         if (!sessionController.startInitial(question, selectedServices, AnswerMode.SERIAL, initialAttachments.attachments, relayOrder = order)) {
                             scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }

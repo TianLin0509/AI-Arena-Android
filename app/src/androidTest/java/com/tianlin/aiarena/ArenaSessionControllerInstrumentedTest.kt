@@ -1520,6 +1520,36 @@ class ArenaSessionControllerInstrumentedTest {
     }
 
     @Test
+    fun uncertainFailureIsQuietlyVerifiedFromThePageAfterTheRound() {
+        val gateway = ControlledGateway()
+        val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(autoVerifyIntervalMillis = 40)) }
+        try {
+            onMain {
+                controller.startInitial("was it really lost", ArenaService.defaultMembers)
+                // DeepSeek on 2026-09-29: the answer was on the page, the App had reported this.
+                gateway.completeSend(ArenaService.DEEPSEEK, ok = false, detail = "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送")
+                gateway.completeSend(ArenaService.DOUBAO, ok = false, detail = "豆包 新对话的输入框迟迟没有加载完成，本轮未发送；请稍后重试")
+                gateway.completeSend(ArenaService.KIMI)
+            }
+            awaitHistorySize(controller, 1)
+            awaitProviderPhase(controller, ArenaService.DEEPSEEK, ParticipantPhase.COMPLETE)
+            onMain {
+                assertEquals("DEEPSEEK independent answer", controller.runs.getValue(ArenaService.DEEPSEEK).response)
+                assertTrue(controller.runs.getValue(ArenaService.DEEPSEEK).detail.contains("已从网页核实"))
+                assertEquals("The finished round record is corrected too", ParticipantPhase.COMPLETE,
+                    controller.history.last().results.getValue(ArenaService.DEEPSEEK).phase)
+                assertFalse("Verification is read-only and never occupies the screen", controller.isBusy)
+                assertEquals("Never resent", 1, gateway.sentServices.count { it == ArenaService.DEEPSEEK })
+            }
+            Thread.sleep(600)
+            onMain {
+                assertEquals("A question that was clearly not sent stays a failure",
+                    ParticipantPhase.ERROR, controller.runs.getValue(ArenaService.DOUBAO).phase)
+            }
+        } finally { onMain { controller.destroy() } }
+    }
+
+    @Test
     fun skippingAStuckMemberLetsTheOthersFinishAndTheLastOneCanStillBeAskedAlone() {
         val gateway = ControlledGateway(heldFresh = setOf(ArenaService.KIMI))
         val controller = onMain { ArenaSessionController(gateway, fastTiming.copy(sendTimeoutMillis = 60_000, freshConversationTimeoutMillis = 60_000)) }
@@ -1572,9 +1602,9 @@ class ArenaSessionControllerInstrumentedTest {
         fun completeFresh(service: ArenaService, ok: Boolean) = freshCallbacks.getValue(service)(ok)
         val freshFailures = mutableMapOf<ArenaService, String>()
         override fun freshConversationFailure(service: ArenaService): String? = freshFailures[service]
-        fun completeSend(service: ArenaService, ok: Boolean = true) {
+        fun completeSend(service: ArenaService, ok: Boolean = true, detail: String? = null) {
             val (id, callback) = pendingSends.getValue(service)
-            callback(SendOutcome(ok, id, if (ok) "acknowledged" else "upload rejected"))
+            callback(SendOutcome(ok, id, detail ?: if (ok) "acknowledged" else "upload rejected"))
         }
 
         override fun sendPromptWithAttachments(service: ArenaService, prompt: String, requestId: String,

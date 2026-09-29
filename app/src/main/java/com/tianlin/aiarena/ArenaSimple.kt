@@ -155,7 +155,7 @@ internal fun ModeComposer(
     Surface(color = colors.page, shadowElevation = 6.dp, shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
-            if (mode != RoundMode.ITERATE) options()
+            options()
             preset?.invoke()
             Text(scope, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
             InputBar(text, onText, mode.placeholder, ready, busy, onSend, onStop, attachmentDraft, onChooseAttachments,
@@ -174,6 +174,8 @@ internal fun SimpleAskHome(
     pendingConnectionCount: Int = 0,
     attachmentDraft: AttachmentDraft? = null, onChooseAttachments: (() -> Unit)? = null,
     onStartRelay: ((List<ArenaService>) -> Unit)? = null,
+    /** 网页体检发现的问题（只读检查）；没有问题时为 null，首页不多显示任何东西。 */
+    healthNotice: String? = null,
 ) {
     val colors = ArenaStyle.colors
     var relay by rememberSaveable { mutableStateOf(false) }
@@ -185,6 +187,7 @@ internal fun SimpleAskHome(
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically)) {
             if (offline) SimpleNotice("网络未连接，请检查 Wi-Fi 或手机流量。")
+            else healthNotice?.let { SimpleNotice(it) }
             if (crashNotice != null) {
                 TextButton(onClick = onCrashDismiss) { Text("上次异常退出，历史已保留 · 知道了", style = MaterialTheme.typography.bodySmall) }
             }
@@ -250,6 +253,8 @@ internal fun SimpleSettingsPage(
     updateResult: ArenaUpdateResult?, updateChecking: Boolean, onCheckUpdate: () -> Unit,
     onInstallUpdate: (ArenaUpdateInfo) -> Unit, crashReport: ArenaCrashReport?, onClearCrashReport: () -> Unit,
     onShareCrashReport: ((ArenaCrashReport) -> Unit)?,
+    /** 把各家网页状态和每轮结果（不含问答正文）分享给开发者。 */
+    onExportDiagnostics: (() -> Unit)? = null,
 ) {
     var more by rememberSaveable { mutableStateOf(false) }
     var help by rememberSaveable { mutableStateOf(false) }
@@ -279,6 +284,7 @@ internal fun SimpleSettingsPage(
                     SimpleSettingRow("清除卡住的讨论", "", { confirm = "清除卡住的讨论" })
                     if (onRestartApp != null) SimpleSettingRow("重启应用", "", { confirm = "重启应用" })
                     SimpleSettingRow("使用说明", "", onShowOnboarding)
+                    if (onExportDiagnostics != null) SimpleSettingRow("导出诊断信息", "", onExportDiagnostics)
                     if (crashReport != null) {
                         if (onShareCrashReport != null) SimpleSettingRow("导出崩溃记录", "", { onShareCrashReport(crashReport) })
                         SimpleSettingRow("清除崩溃记录", "", onClearCrashReport)
