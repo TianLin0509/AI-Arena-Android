@@ -108,9 +108,11 @@ fun ArenaApp(
     // 一轮进行中：前台服务 + 通知栏进度；用户不在圆桌界面时答完弹通知。
     val roundNotifier = remember(context) { ArenaRoundNotifier(context.applicationContext) }
     LaunchedEffect(sessionController.isBusy) {
-        if (sessionController.isBusy) requestNotifications?.invoke()
         roundNotifier.update(ArenaRoundNotifier.progressText(sessionController), ArenaRoundNotifier.doneText(sessionController))
     }
+    // 通知权限等问题都送达后再问：开轮时弹系统对话框会挡住发送（2026-09-29 实测豆包因此晚了约 50 秒）。
+    val delivered = sessionController.isBusy && ArenaRoundNotifier.delivered(sessionController)
+    LaunchedEffect(delivered) { if (delivered) requestNotifications?.invoke() }
     DisposableEffect(sessionController, roundNotifier) {
         // 后台时界面不重组，所以由控制器的状态变化和前后台切换直接驱动，不走 Compose。
         val refresh = { roundNotifier.update(ArenaRoundNotifier.progressText(sessionController), ArenaRoundNotifier.doneText(sessionController)) }
