@@ -228,6 +228,37 @@ class ArenaAttachmentInstrumentedTest {
         }
     }
 
+    @Test fun redesignedDoubaoPlusOpensASuggestionPanelWhoseUploadOptionIsUsed() {
+        // 2026-09-29 Doubao: '+' opens an in-composer listbox panel instead of a Radix menu.
+        withView(modernDoubaoFixture()) { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, "document.querySelectorAll('[role=menu]').forEach(n=>n.remove());true")
+            evaluate(view, ArenaAttachmentScript.prepare("panel-menu", listOf(attachment), ArenaService.DOUBAO))
+            val trigger = JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("panel-menu", ArenaService.DOUBAO)))
+            assertTrue("Closed panel: the '+' is tapped", trigger.has("x"))
+            evaluate(view, """
+                const panel=document.createElement('div');panel.setAttribute('data-input-engine-suggestion-panel','true');panel.setAttribute('data-state','active');
+                panel.innerHTML='<div role="listbox"><div role="group"><div role="option" id="panel-upload" style="min-height:40px">上传文件或图片</div><div role="option" style="min-height:40px">选择云盘文件</div></div></div>';
+                document.querySelector('.guidance-input-surface').prepend(panel);true
+            """.trimIndent())
+            val option = JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("panel-menu", ArenaService.DOUBAO)))
+            assertTrue("Open panel: its local upload option is tapped", option.has("x"))
+            assertEquals("panel-upload", evaluate(view, "document.elementFromPoint(${option.getDouble("x")},${option.getDouble("y")}).closest('[role=option]').id"))
+        }
+        withView(modernDoubaoFixture()) { view, _ ->
+            val attachment = ArenaAttachment("fixture", "photo.png", "image/png", 4096, "a".repeat(64))
+            evaluate(view, "document.querySelectorAll('[role=menu]').forEach(n=>n.remove());true")
+            evaluate(view, ArenaAttachmentScript.prepare("panel-ambiguous", listOf(attachment), ArenaService.DOUBAO))
+            evaluate(view, """
+                const panel=document.createElement('div');panel.setAttribute('data-input-engine-suggestion-panel','true');panel.setAttribute('data-state','active');
+                panel.innerHTML='<div role="option" style="min-height:40px">上传文件或图片</div><div role="option" style="min-height:40px">上传文件或图片</div>';
+                document.querySelector('.guidance-input-surface').prepend(panel);true
+            """.trimIndent())
+            assertFalse("Two identical upload options are ambiguous: nothing is tapped",
+                JSONObject(evaluate(view, ArenaAttachmentScript.nextControl("panel-ambiguous", ArenaService.DOUBAO))).has("x"))
+        }
+    }
+
     @Test fun currentTreeRejectsUnmountedCyclesDuplicateHostsAndOversizedTrees() {
         withView("<div class='_77cefa5'><textarea></textarea><div id='cards'></div></div>") { view, _ ->
             val attachment = ArenaAttachment("fixture", "probe.txt", "text/plain", 40, "a".repeat(64))

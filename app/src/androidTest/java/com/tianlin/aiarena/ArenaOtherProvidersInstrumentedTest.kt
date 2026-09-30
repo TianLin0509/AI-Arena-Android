@@ -41,6 +41,31 @@ class ArenaOtherProvidersInstrumentedTest {
         }
     }
 
+    @Test fun geminiScreenReaderLabelIsNotPartOfTheQuestion() = page { view ->
+        // 2026-09-30: Gemini's bubble carries a visually hidden "You said …" heading.
+        val service = ArenaService.GEMINI
+        prepare(view, service)
+        submit(view, service)
+        html(view, "<user-query><div class='query-text'><h5 class='cdk-visually-hidden screen-reader-user-query-label'><span>You said</span> current question</h5>" +
+            "<p class='query-text-line'>current question</p></div></user-query>" + answer(service, "OWN ANSWER"))
+        assertEquals("true", bind(view, service))
+        assertEquals("OWN ANSWER", response(view, service).getString("text"))
+    }
+
+    @Test fun geminiReRenderedChatReadoptsOnlyTheBubbleRightAfterTheEarlierOnes() = page { view ->
+        // 2026-09-30: Gemini re-renders the whole chat once it answers, replacing the bound bubble node.
+        val service = ArenaService.GEMINI
+        html(view, user(service, "", "old question").replace(" data-message-id=''", "") + answer(service, "OLD ANSWER"))
+        prepare(view, service)
+        submit(view, service)
+        js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(user(service, "", "current question").replace(" data-message-id=''", "") + answer(service, "NEW ANSWER"))});true")
+        assertEquals("true", bind(view, service))
+        js(view, "document.body.innerHTML=document.body.innerHTML;true")
+        assertEquals("The re-rendered successor bubble is re-adopted", "NEW ANSWER", response(view, service).getString("text"))
+        js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(user(service, "", "current question").replace(" data-message-id=''", ""))});document.body.innerHTML=document.body.innerHTML;true")
+        assertFalse("With a later same-text bubble after a re-render, nothing is guessed", response(view, service).getBoolean("found"))
+    }
+
     @Test fun qwenAttachmentOnlyAndRemountedOldTextCannotAcknowledgeFollowup() = page { view ->
         val service = ArenaService.QWEN
         val text = user(service, "unused").replace(" data-message-id='unused'", "")
@@ -87,8 +112,10 @@ class ArenaOtherProvidersInstrumentedTest {
         }
     }
 
-    @Test fun yuanbaoLateReadinessCannotOutliveItsOwnerInputPageOrDeadline() {
-        for (change in listOf("cancel", "deadline", "input", "owner", "page", "draft", "ambiguous")) {
+    @Test fun yuanbaoLateReadinessCannotOutliveItsOwnerPageOrCancellation() {
+        // 0.18.2: no wall-clock deadline in the page (it gave up while the user was in another app);
+        // the App's foreground-time watchdog ends the loop through the cancel flag ("cancel").
+        for (change in listOf("cancel", "owner", "page", "draft", "ambiguous")) {
             withPool(ArenaService.YUANBAO, wrongReceipt = false) { pool, view ->
                 js(view, "document.getElementById('yuanbao-send-btn').disabled=true;true")
                 instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) {} }
@@ -96,8 +123,6 @@ class ArenaOtherProvidersInstrumentedTest {
                 Thread.sleep(1800)
                 when (change) {
                     "cancel" -> instrumentation.runOnMainSync { pool.cancelAutomation(ArenaService.YUANBAO) }
-                    "deadline" -> js(view, "window.futureNow=Date.now()+120000;Date.now=()=>futureNow;true")
-                    "input" -> js(view, "const n=document.querySelector('textarea'),copy=n.cloneNode(true);copy.value=n.value;n.replaceWith(copy);true")
                     "owner" -> js(view, "window.__aiArenaRequests['$request']={...window.__aiArenaRequests['$request']};true")
                     "page" -> js(view, "history.replaceState(null,'','/another-conversation');true")
                     "draft" -> js(view, "document.querySelector('textarea').value='user changed the draft';true")
@@ -109,6 +134,26 @@ class ArenaOtherProvidersInstrumentedTest {
                 assertEquals(change, "1", js(view, "inputCount"))
                 assertEquals(change, if (change == "draft") "user changed the draft" else "current question", js(view, "document.querySelector('textarea').value"))
             }
+        }
+    }
+
+    @Test fun yuanbaoRemountedEditorHoldingTheQuestionStillSendsOnce() {
+        // The website re-mounts its editor (same single composer, same text): the question must still go out, once.
+        withPool(ArenaService.YUANBAO, wrongReceipt = false) { pool, view ->
+            js(view, "document.getElementById('yuanbao-send-btn').disabled=true;true")
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.YUANBAO, "current question", request) {} }
+            waitForYuanbaoInput(view)
+            Thread.sleep(1800)
+            js(view, "const n=document.querySelector('textarea'),copy=n.cloneNode(true);copy.value=n.value;n.replaceWith(copy);true")
+            // A passing moment with two composers never stops the loop for good.
+            js(view, "const c=document.querySelector('[data-new-input-card]'),dup=c.cloneNode(true);document.body.appendChild(dup);setTimeout(()=>dup.remove(),600);true")
+            js(view, "document.getElementById('yuanbao-send-btn').disabled=false;true")
+            val deadline = System.currentTimeMillis() + 6000
+            while (js(view, "sendCount") != "1" && System.currentTimeMillis() < deadline) Thread.sleep(100)
+            assertEquals("1", js(view, "sendCount"))
+            Thread.sleep(1500)
+            assertEquals("Never a second click", "1", js(view, "sendCount"))
+            assertEquals("1", js(view, "inputCount"))
         }
     }
 
@@ -467,7 +512,10 @@ class ArenaOtherProvidersInstrumentedTest {
         assertEquals(service.name, "true", bind(view, service))
         assertEquals(service.name, "FIRST", response(view, service).getString("text"))
         js(view, "document.body.innerHTML=document.body.innerHTML;true")
-        assertFalse(service.name, response(view, service).getBoolean("found"))
+        // Gemini always re-renders its chat once it answers (2026-09-30); only the unique successor bubble is
+        // re-adopted there (see geminiReRenderedChatReadoptsOnlyTheBubbleRightAfterTheEarlierOnes). Others never drift.
+        if (service == ArenaService.GEMINI) assertEquals(service.name, "FIRST", response(view, service).getString("text"))
+        else assertFalse(service.name, response(view, service).getBoolean("found"))
     }
 
     @Test fun sameOldQuestionCannotBeReusedAsNewReceipt() = each { view, service ->

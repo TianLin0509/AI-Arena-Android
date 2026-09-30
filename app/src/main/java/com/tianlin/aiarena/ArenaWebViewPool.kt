@@ -297,8 +297,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     override fun conversationUrl(service: ArenaService): String =
         webViews[service]?.url.orEmpty().takeIf { it.startsWith("https://") }.orEmpty()
 
-    override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) =
-        openFreshConversation(service, prewarm = false, callback)
+    override fun openFreshConversation(service: ArenaService, callback: (Boolean) -> Unit) {
+        ArenaTrace.log(service, "fresh request")
+        openFreshConversation(service, prewarm = false) { ok -> ArenaTrace.log(service, "fresh ready=$ok"); callback(ok) }
+    }
 
     private fun openFreshConversation(service: ArenaService, prewarm: Boolean, callback: (Boolean) -> Unit) {
         if (destroyed) return callback(false)
@@ -586,7 +588,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             }
             if (destroyed || webViews[service] !== webView || navigationGenerations[service] != generation ||
                 ArenaForeground.elapsed() >= deadline) callback(false)
-            else if (raw == "true") callback(true)
+            else if (raw == "true") {
+                freshVerifiedAt[service] = (generation ?: 0L) to ArenaForeground.elapsed()
+                callback(true)
+            }
             else if (ArenaForeground.elapsed() < deadline) handler.postDelayed({
                 waitForFreshPage(service, webView, generation, deadline, allowedDraft, callback)
             }, 400L)
@@ -620,7 +625,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         callback: (SendOutcome) -> Unit,
     ) {
         PromptBudgetPolicy.inputLimitError(service, prompt)?.let { return callback(SendOutcome(false, requestId, it)) }
-        sendPromptInternal(service, prompt, requestId, callback, reloadedOnce = false)
+        ArenaTrace.log(service, "send request")
+        sendPromptInternal(service, prompt, requestId, { outcome -> ArenaTrace.log(service, "send outcome ${outcome.success} ${outcome.detail.take(40)}"); callback(outcome) }, reloadedOnce = false)
     }
 
     override fun sendPromptWithAttachments(
@@ -733,7 +739,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             return
         }
         if (service in FRAME_DRIVEN_SERVICES) keepDrawnWhileReading(service)
+        val readStarted = SystemClock.elapsedRealtime()
         webView.evaluateJavascript(ArenaWebResponseScript.build(service, requestId, requireIdentity = ArenaWebMessageIdentity.supported(service))) { raw ->
+            ArenaTrace.log(service, "read ${SystemClock.elapsedRealtime() - readStarted}ms ${raw.length}b")
             try {
                 val payload = JSONObject(decodeJsValue(raw))
                 val rawText = payload.optString("text", "")
@@ -832,25 +840,30 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             if (!isCurrent(service, token)) return@Runnable
             val detail = token.timeoutDetail
             val page = webViews[service]
-            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL)) {
+            val yuanbaoLoop = service == ArenaService.YUANBAO && strictReceipt
+            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL || yuanbaoLoop)) {
                 // The page may have clicked just before this deadline while its callback is still queued.
                 // Never tell the user "not sent" then: a retry would ask the question twice.
                 var reported = false
-                fun report(clicked: Boolean?) {
+                fun report(clicked: Boolean?, waitReason: String = "") {
                     if (reported || !isCurrent(service, token)) return
                     reported = true
                     finishAutomation(service)
-                    when (clicked) {
-                        true -> onInterrupted(DOUBAO_UNCONFIRMED_DETAIL)
-                        false -> onInterrupted(detail)
-                        null -> onTimeout()
+                    when {
+                        clicked == null -> onTimeout()
+                        yuanbaoLoop && detail == null -> onInterrupted(if (clicked) YUANBAO_UNCONFIRMED_DETAIL else yuanbaoNotSentDetail(waitReason))
+                        clicked -> onInterrupted(DOUBAO_UNCONFIRMED_DETAIL)
+                        else -> onInterrupted(detail ?: "")
                     }
                 }
                 // One script cancels first, then reads: every page click path checks the cancel flag
                 // before clicking, so a later click is blocked and an earlier one is seen.
                 val id = ArenaJs.quote(token.requestId)
                 page.evaluateJavascript("(()=>{window.__aiArenaCancelledRequests=window.__aiArenaCancelledRequests||{};window.__aiArenaCancelledRequests[$id]=true;" +
-                    "return !!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[$id]);})()") { raw -> report(raw == "true") }
+                    "return JSON.stringify({clicked:!!(window.__aiArenaSendClicks&&window.__aiArenaSendClicks[$id]),wait:String(window.__aiArenaYuanbaoWait||'')});})()") { raw ->
+                    val result = runCatching { JSONObject(decodeJsValue(raw)) }.getOrNull()
+                    report(result?.optBoolean("clicked"), result?.optString("wait").orEmpty())
+                }
                 handler.postDelayed({ report(null) }, 2_000L)
                 return@Runnable
             }
@@ -861,9 +874,19 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         handler.postDelayed(watchdog, timeoutMillis)
         refreshVisibility()
         webView.onResume()
+        // A new-conversation page verified moments ago already proved one stable, empty editor: skip the settle delay.
         handler.postDelayed({
             if (isCurrent(service, token)) waitForPromptInput(webView, service, token, 0, block)
-        }, 650L)
+        }, if (freshlyVerified(service)) 50L else 650L)
+    }
+
+    /** 新对话页刚通过空白检查（同一次导航、没发过消息、15 秒内）：它已证明只有一个稳定、空白的输入框。 */
+    private val freshVerifiedAt = mutableMapOf<ArenaService, Pair<Long, Long>>()
+
+    private fun freshlyVerified(service: ArenaService): Boolean {
+        val (generation, at) = freshVerifiedAt[service] ?: return false
+        return generation == navigationGenerations[service] && service !in sentSinceLoad &&
+            ArenaForeground.elapsed() - at < FRESH_TRUST_MS
     }
 
     private fun waitForPromptInput(
@@ -882,6 +905,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               if (!${token.strictReceipt}) return !!input;
               const key = ${ArenaJs.quote(token.requestId)};
               const text = input ? (input.value || input.innerText || input.textContent || '') : '';
+              // The fresh-page check held this very element stable and empty for 1.6 s just before.
+              if (${freshlyVerified(service)} && input && !text.trim() && document.readyState === 'complete' &&
+                  window.__aiArenaFreshPage && window.__aiArenaFreshPage.input === input) return true;
               const previous = window.__aiArenaReadyProbe;
               if (!input || document.readyState !== 'complete' || !previous || previous.key !== key || previous.input !== input || previous.text !== text || previous.url !== location.href) {
                 window.__aiArenaReadyProbe = { key, input, text, url: location.href, since: Date.now() };
@@ -906,6 +932,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     /** A lease ends after input injection or one native tap, never after upload/parse/send acknowledgement. */
     private fun withFocus(service: ArenaService, requestId: String, block: (() -> Unit) -> Unit) {
         if (automations[service]?.requestId != requestId || destroyed) return
+        ArenaTrace.log(service, "lease requested, waiting=${focusQueue.size + if (focusAction != null) 1 else 0}")
         focusQueue.addLast(FocusAction(service, requestId, block))
         drainFocusQueue()
     }
@@ -918,6 +945,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             if (token == null || token.requestId != action.requestId) continue
             val webView = webViews[action.service] ?: continue
             focusAction = action
+            ArenaTrace.log(action.service, "lease granted, queue=${focusQueue.size}")
             refreshVisibility()
             webView.requestFocus()
             val watchdog = Runnable {
@@ -945,6 +973,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
     private fun releaseFocus(action: FocusAction) {
         if (focusAction !== action) return
+        ArenaTrace.log(action.service, "lease released")
         focusWatchdog?.let(handler::removeCallbacks)
         focusWatchdog = null
         webViews[action.service]?.let(::hideAutomationKeyboard)
@@ -1395,10 +1424,14 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     ) {
         val service = ArenaService.DOUBAO
         val token = automations[service]
-        val clickDelayMs = if (attempt == 0) 900L else 1_400L
+        // Once the page has clicked, only the website's receipt is awaited: re-check it often. Doubao's
+        // new conversation gets its official message ID ~7 s after the click; slow polling added 4-5 s more.
+        val clicked = token?.timeoutDetail == DOUBAO_UNCONFIRMED_DETAIL
+        val clickDelayMs = if (attempt == 0) 900L else if (clicked) 350L else 1_400L
         handler.postDelayed({
             if (!isCurrent(service, token)) return@postDelayed
             webView.evaluateJavascript(clickSendScript(ArenaService.DOUBAO, requestId)) { clickRaw ->
+                ArenaTrace.log(service, "doubao attempt=$attempt click=${decodeJsValue(clickRaw).take(40)}")
                 if (!isCurrent(service, token)) return@evaluateJavascript
                 when (decodeJsValue(clickRaw)) {
                     // Waiting for idle keeps the question in the input and relies on the request watchdog.
@@ -1411,6 +1444,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 handler.postDelayed({
                     if (!isCurrent(service, token)) return@postDelayed
                     webView.evaluateJavascript(verifySendScript(ArenaService.DOUBAO, requestId)) { raw ->
+                        ArenaTrace.log(service, "doubao attempt=$attempt verify=$raw")
                         if (!isCurrent(service, token)) return@evaluateJavascript
                         if (raw == "true") {
                             finishSuccessfulSend(webView, ArenaService.DOUBAO, requestId, callback)
@@ -1441,7 +1475,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                             else continueOrFail(false)
                         }
                     }
-                }, 600L)
+                }, if (token?.timeoutDetail == DOUBAO_UNCONFIRMED_DETAIL) 250L else 600L)
             }
         }, clickDelayMs)
     }
@@ -2009,35 +2043,36 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             ""
         } else if (service == ArenaService.YUANBAO && automations[service] != null) {
             """
-                // Wait for this composer's FIRST send control, within the existing watchdog.
+                // Wait for this composer's FIRST send control. No deadline of its own: the App's watchdog
+                // counts foreground time and ends this loop through the cancel flag, then reads whether
+                // it clicked (a wall-clock deadline here gave up while the user was in another app).
+                // A passing re-layout never stops the loop; the click still needs one exact, enabled control.
                 // Never rewrite/refocus the draft, fall back to Enter, or retry a claimed click.
-                const readyDeadline = ${automations[service]?.deadlineWallMillis ?: 0L};
                 const readyUrl = location.href;
-                const composer = input.closest('[data-new-input-card]');
+                let target = input, box = input.closest('[data-new-input-card]');
                 const visibleMatches = (root, selectors) => Array.from(new Set(selectors.flatMap(selector =>
                   Array.from(root.querySelectorAll(selector))))).filter(node => {
                     const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
                     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
                   });
                 const awaitFirstSend = function() {
-                  if (cancelled() || Date.now() >= readyDeadline || location.href !== readyUrl ||
+                  if (cancelled() || location.href !== readyUrl ||
                       window.__aiArenaRequests?.[requestId] !== state || !arenaRequestScopeValid()) return;
                   if (state.submittedAt || window.__aiArenaSendClicks?.[requestId] ||
                       window.__aiArenaNativeSendRequests?.[requestId] || $conversationAdvanced) return;
-                  if (!input.isConnected || !composer?.isConnected || input.closest('[data-new-input-card]') !== composer) return;
+                  const retry = reason => { window.__aiArenaYuanbaoWait = reason; setTimeout(awaitFirstSend, 250); };
                   const inputs = visibleMatches(document, $inputSelectors);
                   const composers = visibleMatches(document, ['[data-new-input-card]']);
-                  if (inputs.length !== 1 || inputs[0] !== input || composers.length !== 1 || composers[0] !== composer) return;
-                  const current = arenaNormalize(currentInputText());
-                  if (current && current !== (state.expectedPrompt || arenaNormalize(text))) return;
-                  const controls = visibleMatches(composer, $sendSelectors);
-                  if (controls.length > 1) return;
-                  if (current && document.visibilityState === 'visible' && controls.length === 1 && arenaSendEnabled(controls[0])) {
-                    arenaRecordSubmission();
-                    controls[0].click();
-                    return;
-                  }
-                  setTimeout(awaitFirstSend, 250);
+                  if (inputs.length !== 1 || composers.length !== 1 || inputs[0].closest('[data-new-input-card]') !== composers[0]) return retry('layout');
+                  // The website may re-mount its editor; only a single visible one holding exactly this question is adopted.
+                  target = inputs[0]; box = composers[0];
+                  const current = arenaNormalize(target.value || target.innerText || target.textContent || '');
+                  if (current !== (state.expectedPrompt || arenaNormalize(text))) return retry(current ? 'text' : 'empty');
+                  const controls = visibleMatches(box, $sendSelectors);
+                  if (controls.length !== 1) return retry('control');
+                  if (document.visibilityState !== 'visible' || !arenaSendEnabled(controls[0])) return retry('disabled');
+                  arenaRecordSubmission();
+                  controls[0].click();
                 };
                 if (!delayedInput) setTimeout(awaitFirstSend, $firstClickDelayMs);
             """.trimIndent()
@@ -2652,9 +2687,18 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         """.trimIndent()
 
         private const val DOUBAO_SEND_ATTEMPTS = 7
+        private const val YUANBAO_UNCONFIRMED_DETAIL = "元宝已点击发送，但网页尚未确认收到本轮问题；请打开原网页核对，不会自动重复发送"
+
+        /** 元宝一直没点下发送：问题还留在网页输入框里，所以明确说「未发送」，重发前会让用户确认清空它。 */
+        private fun yuanbaoNotSentDetail(reason: String) = when (reason) {
+            "disabled" -> "元宝的发送按钮一直不可用，本轮未发送（问题留在网页输入框里）；请点「重发」或打开网页处理"
+            "text", "empty" -> "元宝输入框里的内容和本轮问题对不上，本轮未发送；请打开网页核对后重发"
+            else -> "元宝网页的输入区一直没准备好，本轮未发送（问题可能留在输入框里）；请点「重发」或打开网页处理"
+        }
         private const val READING_LIVE_MS = 5_000L
         /** Sites whose round work advances on animation frames; only these stay drawn for a whole round. */
-        private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO)
+        // Gemini (2026-09-30) types its answer with a frame-driven animation; aria-busy only clears once it has drawn.
+        private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO, ArenaService.GEMINI)
         /** Longer drafts are never offered for replacement: the user must see the exact full text. */
         private const val MAX_FRESH_DRAFT_CHARS = 2_000
         private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
@@ -2671,6 +2715,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
         /** 复用预热页时重新确认一次的时限；过了就改走正常的开新对话。 */
         private const val WARM_RECHECK_MS = 8_000L
+        /** 新对话页通过检查后，这么久之内发送不再重复等输入框稳定。 */
+        private const val FRESH_TRUST_MS = 15_000L
         /** 发送时只接手 45 秒内开始的预热；更早的预热照常作废重开。 */
         private const val PREWARM_ADOPT_MS = 45_000L
         private const val KIMI_FOCUS_ACTION_TIMEOUT_MS = 20_000L

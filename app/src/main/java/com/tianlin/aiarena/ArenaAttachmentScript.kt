@@ -192,10 +192,16 @@ internal object ArenaAttachmentScript {
                     if(inner.length===1){
                       menuTriggerEl=trigger;menuTargetEl=inner[0];
                       const menus=Array.from(document.querySelectorAll('[role=menu][data-slot=dropdown-menu-content]')).filter(e=>visible(e)&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).includes(trigger.id));
+                      // 2026-09-29 redesign: '+' opens an in-composer suggestion panel (listbox of options), not a Radix menu.
+                      const panels=Array.from(scope.querySelectorAll('[data-input-engine-suggestion-panel][data-state=active]')).filter(visible);
+                      const panelOptions=panels.length===1?Array.from(panels[0].querySelectorAll('[role=option]')).filter(e=>visible(e)&&(e.textContent||'').replace(/\s+/g,'')==='上传文件或图片'):[];
                       if(menus.length===1){
                         const local=Array.from(menus[0].querySelectorAll('[role=menuitem][data-slot=dropdown-menu-item]')).filter(e=>e.closest('[role=menu]')===menus[0]&&(e.textContent||'').replace(/\s+/g,'')==='上传文件或图片');
                         if(local.length===1)candidates.push(local[0]);
-                      }else if(menus.length===0)candidates.push(menuTargetEl);
+                      }else if(panels.length===1){
+                        // Exactly one local-upload option in exactly one open panel; anything else waits.
+                        if(panelOptions.length===1){menuItemEl=panelOptions[0];candidates.push(panelOptions[0]);}
+                      }else if(menus.length===0&&panels.length===0)candidates.push(menuTargetEl);
                     }
                   }
                 }else if(surfaces.length===0){
