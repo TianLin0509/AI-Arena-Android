@@ -326,7 +326,7 @@ internal fun SimpleRoundStage(
                     attachmentNotice = ArenaAttachmentSupport.notice(
                         if (mode == RoundMode.SUMMARY) listOfNotNull(CaptainPolicy.judgePreference(sessionController.sessionServices, captain).firstOrNull { it in completedMembers })
                         else completedMembers, attachmentDraft?.attachments.orEmpty()),
-                    scope = when (mode) {
+                    scope = if (busy) "本轮进行中，答完后再继续" else when (mode) {
                         RoundMode.SUMMARY -> {
                             val judge = CaptainPolicy.judgePreference(sessionController.sessionServices, captain).firstOrNull { it in completedMembers }
                             if (judge != null && captain != null && judge != captain) "${captain.shortName} 本轮未完成，将由 ${judge.shortName} 整理"

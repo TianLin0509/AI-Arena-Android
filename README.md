@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.18.1`（`versionCode 31`）
+当前版本：`v0.18.2`（`versionCode 32`）
 
 ## 开发入口
 
@@ -28,6 +28,14 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 每次可选择 2-4 家 AI。
 - 聚焦普通用户，尤其是中老年用户的日常提问、群策群力和幻觉风险提示。
 - 登录信息、成员选择和讨论历史只保存在 Android 应用沙箱内。
+
+## 0.18.2 发送更快、修复元宝不发送与豆包附件、Gemini 可用
+
+- 第一轮更快：DeepSeek 约 1.7 秒开始回答、千问约 6 秒送达（此前约 5 秒 / 10 秒）；豆包确认送达从约 27 秒缩到约 12 秒（剩余约 7–10 秒是豆包网页新建对话本身的时间）。
+- 修复元宝偶发「问题填进输入框却没发出去」：切到别的应用再回来、或网页重新挂载输入框时都会接着发送，且只发一次；确实没发出时明确说「本轮未发送」。
+- 修复豆包 9 月 29 日改版后附件上传失败（「+」改成了输入框内的选项面板）。
+- Gemini 在当前网页版上可正常提问和追问（问题气泡里的隐藏读屏文字、对话重绘、打字动画三处适配）。
+- 进行中输入区改为「本轮进行中，答完后再继续」。
 
 ## 0.18.1 切到别的应用也能等回答、第一轮更快
 
@@ -255,7 +263,7 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.18.1`，`versionCode=31`。
+- 当前基线：`versionName=0.18.2`，`versionCode=32`。
 - 下一次小修复示例：`0.18.1 / versionCode 31`。
 - 下一次向后兼容新功能示例：`0.19.0 / versionCode 31`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。

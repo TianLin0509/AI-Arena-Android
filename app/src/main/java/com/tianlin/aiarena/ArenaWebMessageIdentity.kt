@@ -40,7 +40,8 @@ internal object ArenaWebMessageIdentity {
           ${if (service == ArenaService.DOUBAO) "const raw = arenaDoubaoRawText(row); if (raw.present) return raw.valid ? arenaNormalize(raw.text) : '';" else ""}
           const body = row.querySelector('${userBodySelector(service)}') || row;
           const copy = body.cloneNode(true);
-          copy.querySelectorAll('button, [role=button], [class*=actions], [class*=action-bar], img').forEach(n => n.remove());
+          // Screen-reader-only labels (Gemini's hidden "You said …" heading, 2026-09-30) are not the question.
+          copy.querySelectorAll('button, [role=button], [class*=actions], [class*=action-bar], img, .cdk-visually-hidden, .sr-only, [class*=screen-reader]').forEach(n => n.remove());
           copy.querySelectorAll('br').forEach(n => n.replaceWith(document.createTextNode('\n')));
           copy.querySelectorAll('p, div, li, pre, blockquote').forEach(n => n.appendChild(document.createTextNode('\n')));
           return arenaNormalize(copy.textContent);
@@ -67,8 +68,31 @@ internal object ArenaWebMessageIdentity {
             const initial = new URL(state.initialUrl);
             const initialUrl = initial.origin + initial.pathname + initial.search + initial.hash;
             const currentUrl = location.origin + location.pathname + location.search + location.hash;
-            const allowed = state.boundConversationUrl ? state.boundConversationUrl === currentUrl :
+            let allowed = state.boundConversationUrl ? state.boundConversationUrl === currentUrl :
               currentUrl === initialUrl;
+            ${if (service == ArenaService.GEMINI) """
+            // Gemini can move /app -> /app/<id> without our history hook seeing it, and then re-renders the
+            // chat, replacing the bound bubble (2026-09-30). For a brand-new chat, within 60 s of our own submit,
+            // exactly one user bubble holding exactly this question proves it is the same chat; adopt that node.
+            const boundNode = window.__aiArenaBoundUsers && window.__aiArenaBoundUsers[requestId];
+            const geminiUsers = ${users(ArenaService.GEMINI)};
+            const remounted = !(boundNode && boundNode.isConnected) && geminiUsers.length === 1 &&
+              Number(state.userBaseline || 0) === 0 && !(state.beforeUserTexts || []).length &&
+              state.submittedAt && Date.now() - state.submittedAt < 60000 && arenaUserText(geminiUsers[0]) === state.expectedPrompt;
+            if (!allowed && !state.scopeFailure && !state.transitioned && state.bound &&
+                ((boundNode && boundNode.isConnected && arenaUserText(boundNode) === state.expectedPrompt) || remounted) &&
+                state.documentToken === window.__aiArenaProviderDocument && initial.pathname.replace(/\/$/, '') === '/app' &&
+                /^\/app\/[^/]+\/?$/.test(location.pathname) && state.boundConversationUrl === initialUrl) {
+              if (remounted) {
+                geminiUsers[0].setAttribute('data-ai-arena-request', requestId);
+                window.__aiArenaBoundUsers[requestId] = geminiUsers[0];
+              }
+              state.transitioned = true;
+              state.boundConversationUrl = currentUrl;
+              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              allowed = true;
+            }
+            """.trimIndent() else ""}
             if (state.scopeFailure || state.documentToken !== window.__aiArenaProviderDocument ||
                 !allowed) {
               state.scopeFailure = true;
@@ -116,6 +140,20 @@ internal object ArenaWebMessageIdentity {
           }
           if (state.bound) {
             const original = window.__aiArenaBoundUsers && window.__aiArenaBoundUsers[requestId];
+            ${if (service == ArenaService.GEMINI) """
+            // Gemini re-renders the whole chat once it answers, replacing the bound bubble (2026-09-30). Re-adopt
+            // only the bubble right after every pre-existing one, when it is the last and holds exactly this question.
+            if (original && !original.isConnected) {
+              const at = (state.beforeUserTexts || []).length;
+              const before = state.beforeUserTexts || [];
+              const successor = users.length === at + 1 && before.every((text, i) => arenaUserText(users[i]) === text) ? users[at] : null;
+              if (successor && arenaMatchesRequestUser(successor)) {
+                successor.setAttribute('data-ai-arena-request', requestId);
+                window.__aiArenaBoundUsers[requestId] = successor;
+                return successor;
+              }
+            }
+            """.trimIndent() else ""}
             return original && matches.includes(original) ? original : null;
           }
           const tagged = matches.filter(row => row.getAttribute('data-ai-arena-request') === requestId);
@@ -183,6 +221,14 @@ internal object ArenaWebMessageIdentity {
             // Yuanbao's first migration always needs the exact outgoing CID, even
             // when a user bubble is already mounted. Conflicting DOM is not a receipt.
             if (!witnessedSend) return null;
+            """.trimIndent() else if (service == ArenaService.GEMINI) """
+            // Gemini moves /app -> /app/<id> before mounting the first user bubble (2026-09-30 real run).
+            // Only a brand-new chat (no earlier users) may migrate unbound, right after our own submit;
+            // the hidden, touch-blocked page cannot be navigated by the user meanwhile. The bubble binds when it mounts.
+            const user = arenaFindRequestUser();
+            if (user) arenaBindRequestUser(user);
+            else if (!(Number(state.userBaseline || 0) === 0 && !(state.beforeUserTexts || []).length &&
+                Date.now() - state.submittedAt < 15000)) return null;
             """.trimIndent() else "const user = arenaFindRequestUser(); if (!user) return null; arenaBindRequestUser(user);"}
             return () => {
               state.transitioned = true;

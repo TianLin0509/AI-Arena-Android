@@ -37,6 +37,7 @@ class ArenaSessionController(
     val runs: MutableMap<ArenaService, ParticipantRun> = object : MutableMap<ArenaService, ParticipantRun> by runStates {
         override fun put(key: ArenaService, value: ParticipantRun): ParticipantRun? {
             progressTracker.observe(key, value, SystemClock.elapsedRealtime(), lastRoundAttachments.isNotEmpty())
+            if (runStates[key]?.phase != value.phase) ArenaTrace.log(key, "phase ${value.phase} ${value.detail.take(40)}")
             return runStates.put(key, value)
         }
     }
