@@ -512,7 +512,10 @@ class ArenaOtherProvidersInstrumentedTest {
         assertEquals(service.name, "true", bind(view, service))
         assertEquals(service.name, "FIRST", response(view, service).getString("text"))
         js(view, "document.body.innerHTML=document.body.innerHTML;true")
-        assertFalse(service.name, response(view, service).getBoolean("found"))
+        // Gemini always re-renders its chat once it answers (2026-09-30); only the unique successor bubble is
+        // re-adopted there (see geminiReRenderedChatReadoptsOnlyTheBubbleRightAfterTheEarlierOnes). Others never drift.
+        if (service == ArenaService.GEMINI) assertEquals(service.name, "FIRST", response(view, service).getString("text"))
+        else assertFalse(service.name, response(view, service).getBoolean("found"))
     }
 
     @Test fun sameOldQuestionCannotBeReusedAsNewReceipt() = each { view, service ->
