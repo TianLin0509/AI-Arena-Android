@@ -303,6 +303,29 @@ class ArenaSimpleInstrumentedTest {
         capture("settings")
     }
 
+    @Test fun composerCollapsesToASlimBarAndExpandsAgain() {
+        var collapsed by mutableStateOf(false)
+        var stops = 0
+        var busy by mutableStateOf(false)
+        compose.setContent { ArenaTheme {
+            ModeComposer(RoundMode.ITERATE, {}, "", {}, ready = true, busy = busy, attachmentDraft = null, onChooseAttachments = null,
+                attachmentNotice = null, scope = "发给本轮成功的 3 家 AI", options = {}, preset = null, onStop = { stops++ }, onSend = {},
+                collapsed = collapsed, onCollapsedChange = { collapsed = it })
+        } }
+        compose.onNodeWithText("独立迭代").assertIsDisplayed()
+        compose.onNodeWithContentDescription("收起提问区").performClick()
+        compose.runOnIdle { assertTrue(collapsed) }
+        compose.onNodeWithText("独立迭代").assertDoesNotExist()
+        compose.onNodeWithText("独立迭代 · 点这里继续提问").assertIsDisplayed()
+        busy = true
+        compose.onNodeWithText("停止").performClick()
+        compose.runOnIdle { assertEquals("Stopping a round stays one tap away while collapsed", 1, stops) }
+        busy = false
+        compose.onNodeWithContentDescription("展开提问区").performClick()
+        compose.runOnIdle { assertFalse(collapsed) }
+        compose.onNodeWithText("工作流").assertIsDisplayed()
+    }
+
     @Test fun quickFollowUpFillsTheComposerWithEditableText() {
         var text = ""
         compose.setContent { ArenaTheme { QuickFollowUpRow { text = it } } }

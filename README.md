@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.18.2`（`versionCode 32`）
+当前版本：`v0.18.3`（`versionCode 33`）
 
 ## 开发入口
 
@@ -28,6 +28,11 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 每次可选择 2-4 家 AI。
 - 聚焦普通用户，尤其是中老年用户的日常提问、群策群力和幻觉风险提示。
 - 登录信息、成员选择和讨论历史只保存在 Android 应用沙箱内。
+
+## 0.18.3 底部提问区可收起
+
+- 回答页底部的「独立迭代 / 工作流 / 观点讨论 / 队长总结」和输入框可以收起：点顶部把手收起成一条细栏，屏幕留给回答；点细栏展开。收起状态会记住；进行中收起时细栏上仍有「停止」。
+- 去掉回答页顶部「问题都已送达，可以切到别的应用」的提示。
 
 ## 0.18.2 发送更快、修复元宝不发送与豆包附件、Gemini 可用
 
@@ -263,7 +268,7 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.18.2`，`versionCode=32`。
+- 当前基线：`versionName=0.18.3`，`versionCode=33`。
 - 下一次小修复示例：`0.18.1 / versionCode 31`。
 - 下一次向后兼容新功能示例：`0.19.0 / versionCode 31`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
