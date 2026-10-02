@@ -20,7 +20,6 @@ internal object ArenaWebMessageIdentity {
         ArenaService.QWEN -> "Array.from(document.querySelectorAll('.message-card-wrap.question')).filter(row => !!row.querySelector('.question-text-card'))"
         ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human'))"
         ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).filter(row => !row.parentElement?.closest('.conversation.question, [data-role=user], [class*=user-message]'))"
-        ArenaService.CLAUDE -> "Array.from(document.querySelectorAll('[data-testid=user-message]'))"
         ArenaService.CHATGPT -> "Array.from(document.querySelectorAll('[data-message-author-role=user]'))"
         ArenaService.GEMINI -> "Array.from(document.querySelectorAll('user-query'))"
     }
@@ -88,6 +87,26 @@ internal object ArenaWebMessageIdentity {
                 window.__aiArenaBoundUsers[requestId] = geminiUsers[0];
               }
               state.transitioned = true;
+              state.boundConversationUrl = currentUrl;
+              try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              allowed = true;
+            }
+            """.trimIndent() else ""}
+            ${if (service == ArenaService.CHATGPT) """
+            // ChatGPT swaps its temporary /c/WEB:<uuid> route for /c/<id>; real runs showed that hop sometimes
+            // slipping past the history hook (2026-10-01). Within the same document, the bubble bound under the
+            // temporary route, still on the page under the same server message ID, proves it is the same chat. Unbound,
+            // only a brand-new chat right after our own submit, holding at most this one question, may follow it.
+            const chatgptUsers = ${users(ArenaService.CHATGPT)};
+            const temporary = state.boundConversationUrl && /^\/c\/WEB:[^/]+\/?${'$'}/.test(new URL(state.boundConversationUrl).pathname);
+            const pinnedRows = state.boundUserId ? chatgptUsers.filter(row => arenaUserId(row) === state.boundUserId) : [];
+            const pinned = state.bound && pinnedRows.length === 1 && arenaUserText(pinnedRows[0]) === state.expectedPrompt;
+            const brandNew = !state.bound && Number(state.userBaseline || 0) === 0 && !(state.beforeUserTexts || []).length &&
+              state.submittedAt && Date.now() - state.submittedAt < 30000 && chatgptUsers.length <= 1 &&
+              chatgptUsers.every(row => arenaUserText(row) === state.expectedPrompt);
+            if (!allowed && !state.scopeFailure && state.transitioned && temporary && (pinned || brandNew) &&
+                state.documentToken === window.__aiArenaProviderDocument && location.origin === initial.origin &&
+                !location.search && !location.hash && /^\/c\/[^/:]+\/?${'$'}/.test(location.pathname)) {
               state.boundConversationUrl = currentUrl;
               try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
               allowed = true;
@@ -208,8 +227,23 @@ internal object ArenaWebMessageIdentity {
             });
           }
           window.__aiArenaNavigationGuard.before = value => {
-            if (!value || !state.expectedPrompt || !state.submittedAt || state.transitioned || state.scopeFailure ||
+            if (!value || !state.expectedPrompt || !state.submittedAt || state.scopeFailure ||
                 window.__aiArenaCancelledRequests?.[requestId]) return null;
+            ${if (service == ArenaService.CHATGPT) """
+            // ChatGPT then swaps its temporary /c/WEB:<uuid> route for the server's /c/<id> (2026-10-01 real run).
+            // Only that one hop, from the exact temporary route this request migrated to, keeps the request.
+            if (state.transitioned) {
+              const here = location.origin + location.pathname + location.search + location.hash;
+              const next = new URL(value, location.href);
+              if (here !== state.boundConversationUrl || !/^\/c\/WEB:[^/]+\/?${'$'}/.test(location.pathname) ||
+                  next.origin !== location.origin || next.search || next.hash || !/^\/c\/[^/:]+\/?${'$'}/.test(next.pathname)) return null;
+              return () => {
+                state.boundConversationUrl = next.origin + next.pathname;
+                try { sessionStorage.setItem(cursorKey, JSON.stringify(state)); } catch (_) {}
+              };
+            }
+            """.trimIndent() else ""}
+            if (state.transitioned) return null;
             const initial = new URL(state.initialUrl), target = new URL(value, location.href);
             if (location.href !== initial.href || target.origin !== initial.origin || target.href === initial.href) return null;
             if (!(${freshRouteExpression(service).replace("location.", "target.")})) return null;
@@ -221,14 +255,15 @@ internal object ArenaWebMessageIdentity {
             // Yuanbao's first migration always needs the exact outgoing CID, even
             // when a user bubble is already mounted. Conflicting DOM is not a receipt.
             if (!witnessedSend) return null;
-            """.trimIndent() else if (service == ArenaService.GEMINI) """
-            // Gemini moves /app -> /app/<id> before mounting the first user bubble (2026-09-30 real run).
+            """.trimIndent() else if (service == ArenaService.GEMINI || service == ArenaService.CHATGPT) """
+            // Gemini moves /app -> /app/<id>, and ChatGPT / -> /c/WEB:<uuid> -> /c/<id>, before mounting the first
+            // user bubble (2026-09-30 and 2026-10-01 real runs).
             // Only a brand-new chat (no earlier users) may migrate unbound, right after our own submit;
             // the hidden, touch-blocked page cannot be navigated by the user meanwhile. The bubble binds when it mounts.
             const user = arenaFindRequestUser();
             if (user) arenaBindRequestUser(user);
             else if (!(Number(state.userBaseline || 0) === 0 && !(state.beforeUserTexts || []).length &&
-                Date.now() - state.submittedAt < 15000)) return null;
+                Date.now() - state.submittedAt < ${if (service == ArenaService.CHATGPT) 30000 else 15000})) return null;
             """.trimIndent() else "const user = arenaFindRequestUser(); if (!user) return null; arenaBindRequestUser(user);"}
             return () => {
               state.transitioned = true;
@@ -309,7 +344,6 @@ internal object ArenaWebMessageIdentity {
     private fun freshRouteExpression(service: ArenaService): String = when (service) {
         ArenaService.QWEN -> "initial.pathname === '/' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.YUANBAO -> "arenaYuanbaoHome(initial.pathname) && /^\\/chat\\/naQivTmsDa\\/[^/]+\\/?${'$'}/.test(location.pathname)"
-        ArenaService.CLAUDE -> "initial.pathname === '/new' && /^\\/chat\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.CHATGPT -> "initial.pathname === '/' && /^\\/c\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         ArenaService.GEMINI -> "/^\\/app\\/?${'$'}/.test(initial.pathname) && /^\\/app\\/[^/]+\\/?${'$'}/.test(location.pathname)"
         else -> "false"

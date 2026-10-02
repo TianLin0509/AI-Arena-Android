@@ -59,16 +59,6 @@ enum class ArenaService(
         brandGlyph = "智",
         brandColor = 0xFF295FB8,
     ),
-    CLAUDE(
-        displayName = "Claude",
-        shortName = "Claude",
-        url = "https://claude.ai/new",
-        loginHint = "邮箱登录；需要能访问境外网站",
-        brandGlyph = "C",
-        brandColor = 0xFFC96442,
-        experimental = true,
-        overseas = true,
-    ),
     CHATGPT(
         displayName = "ChatGPT",
         shortName = "ChatGPT",
@@ -106,7 +96,7 @@ enum class ArenaService(
 }
 
 /**
- * 成员选择页的分组。国外三家是拓展成员：**默认折叠、不出现在列表里**，
+ * 成员选择页的分组。国外两家是拓展成员：**默认折叠、不出现在列表里**，
  * 免得家人在只能用国内 AI 的网络下被一串打不开的名字干扰。
  */
 object ArenaMemberGroups {

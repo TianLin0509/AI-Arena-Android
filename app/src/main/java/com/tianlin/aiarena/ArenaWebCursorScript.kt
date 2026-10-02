@@ -124,11 +124,6 @@ internal object ArenaWebCursorScript {
             "[class*='answer'] [class*='markdown']",
             "[class*='markdown-body']",
         )
-        ArenaService.CLAUDE -> listOf(
-            ".font-claude-response",
-            ".font-claude-message",
-            "[data-is-streaming] .standard-markdown",
-        )
         ArenaService.CHATGPT -> listOf(
             "[data-message-author-role='assistant'] .markdown",
             "[data-message-author-role='assistant']",
@@ -146,7 +141,6 @@ internal object ArenaWebCursorScript {
         ArenaService.QWEN -> userCountQwen
         ArenaService.YUANBAO -> userCountYuanbao
         ArenaService.ZHIPU -> userCountZhipu
-        ArenaService.CLAUDE -> userCountClaude
         ArenaService.CHATGPT -> userCountChatGpt
         ArenaService.GEMINI -> userCountGemini
     }
@@ -158,7 +152,6 @@ internal object ArenaWebCursorScript {
         ArenaService.QWEN -> "${ArenaWebMessageIdentity.users(service)}.pop() || null"
         ArenaService.YUANBAO -> "Array.from(document.querySelectorAll('.agent-chat__list__item--human')).pop() || null"
         ArenaService.ZHIPU -> "Array.from(document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]')).pop() || null"
-        ArenaService.CLAUDE -> "Array.from(document.querySelectorAll('[data-testid=user-message]')).pop() || null"
         ArenaService.CHATGPT -> "Array.from(document.querySelectorAll('[data-message-author-role=user]')).pop() || null"
         ArenaService.GEMINI -> "Array.from(document.querySelectorAll('user-query')).pop() || null"
     }
@@ -171,7 +164,6 @@ internal object ArenaWebCursorScript {
     // so its appearance counted as a sent message and a not-sent question waited five minutes.
     private const val userCountYuanbao = "document.querySelectorAll('.agent-chat__list__item--human').length"
     private const val userCountZhipu = "document.querySelectorAll('.conversation.question, [data-role=user], [class*=user-message]').length"
-    private const val userCountClaude = "document.querySelectorAll('[data-testid=user-message]').length"
     private const val userCountChatGpt = "document.querySelectorAll('[data-message-author-role=user]').length"
     private const val userCountGemini = "document.querySelectorAll('user-query').length"
 }

@@ -268,22 +268,6 @@ class ArenaWebResponseScriptInstrumentedTest {
         assertTrue("aria-busy=true 时即使操作栏已在也不能判完成", busy.getBoolean("streaming"))
     }
 
-    /** Claude 结构按 data-is-streaming 约定的夹具；真实登录页面结构待账号登录后核对。 */
-    @Test
-    fun claudeAdapterUsesStreamingAttribute() {
-        fun page(streaming: Boolean) = """
-            <div data-testid="user-message">用户问题</div>
-            <div data-is-streaming="$streaming"><div class="font-claude-response"><p>Claude 最终文本</p></div></div>
-        """.trimIndent()
-
-        val done = evaluate(ArenaService.CLAUDE, "claude_done", page(streaming = false))
-        assertTrue(done.getBoolean("found"))
-        assertFalse(done.getBoolean("streaming"))
-        assertEquals("Claude 最终文本", done.getString("text"))
-        assertTrue(done.getBoolean("localTagBound"))
-        assertTrue(evaluate(ArenaService.CLAUDE, "claude_streaming", page(streaming = true)).getBoolean("streaming"))
-    }
-
     /** ChatGPT 按 data-message-author-role 约定的夹具；真实登录页面结构待账号登录后核对。 */
     @Test
     fun chatGptAdapterWaitsForCopyActionAndIgnoresPreviousAnswer() {

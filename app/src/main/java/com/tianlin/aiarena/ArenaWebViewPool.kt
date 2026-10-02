@@ -1907,7 +1907,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "[role='textbox']",
                 "textarea",
             )
-            ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI -> promptInputSelectors(service)
+            ArenaService.CHATGPT, ArenaService.GEMINI -> promptInputSelectors(service)
         }
         val selectorJson = selectors.joinToString(",") { ArenaJs.quote(it) }
         return """
@@ -1931,7 +1931,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   return visible && loginPattern.test((el.innerText || el.textContent || '').trim());
                 } catch (_) { return false; }
               });
-              // 境外站点未登录时会跳到 /login、/auth 或停在 Cloudflare 人机验证页（2026-09-15 实测 Claude 先闪出 /new 输入框再跳走）。
+              // 境外站点未登录时会跳到 /login、/auth 或停在 Cloudflare 人机验证页（2026-09-15 实测：输入框可能先闪出再跳走）。
               // 这些页面不能沿用"之前确认过已登录"的结论，按明确的登录页处理。
               const verificationWall = /^just a moment/i.test(document.title || '') || !!document.querySelector('input[name=cf-turnstile-response], #challenge-form');
               if (${service.overseas} && (verificationWall || /^\/(login|auth|log-in)(\/|$)/i.test(location.pathname))) return 'explicit_login';
@@ -2281,7 +2281,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         ArenaService.QWEN -> listOf("[role='textbox']", "[contenteditable='true']", "[contenteditable]", "textarea")
         ArenaService.YUANBAO -> listOf("[contenteditable='true']", "textarea", "#chat-input")
         ArenaService.ZHIPU -> listOf("[contenteditable='true']", "[role='textbox']", "textarea")
-        ArenaService.CLAUDE -> listOf("div.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea")
         // 2026-09 的 ChatGPT 手机网页：输入框是无 id 的普通 textarea（旧版为 #prompt-textarea 富文本）
         ArenaService.CHATGPT -> listOf("#prompt-textarea", "form textarea", "textarea")
         ArenaService.GEMINI -> listOf("rich-textarea .ql-editor[contenteditable='true']", ".ql-editor[contenteditable='true']", "[contenteditable='true']", "textarea")
@@ -2502,11 +2501,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 "button[aria-label*='Send']",
                 "button[type='submit']",
                 "button[class*='send']",
-            )
-            ArenaService.CLAUDE -> listOf(
-                "button[aria-label='Send message']",
-                "button[aria-label*='Send']",
-                "button[aria-label*='发送']",
             )
             ArenaService.CHATGPT -> listOf(
                 "button[aria-label='Send message']",
