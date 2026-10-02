@@ -191,6 +191,32 @@ class ArenaOtherProvidersInstrumentedTest {
             }
     }
 
+    @Test fun chatgptPoolReceiptAfterFiftySecondsIsAcceptedWithoutAnotherClick() =
+        withPool(ArenaService.CHATGPT, wrongReceipt = false, receiptDelayMillis = 50000, chatgptLateRoute = true) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.CHATGPT, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", js(view, "window.sendCount"))
+            assertEquals("/c/real-receipt", js(view, "location.pathname"))
+            assertEquals("pool-user", js(view, "window.__aiArenaRequests['$request'].boundUserId"))
+        }
+
+    @Test fun chatgptPoolUnknownReceiptStillTimesOutAndNeverResends() =
+        withPool(ArenaService.CHATGPT, wrongReceipt = false, receiptDelayMillis = 65000) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            val started = android.os.SystemClock.elapsedRealtime()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.CHATGPT, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("已点击发送"))
+            assertTrue(android.os.SystemClock.elapsedRealtime() - started >= 55000)
+            Thread.sleep(700)
+            assertEquals("1", js(view, "window.sendCount"))
+        }
+
     @Test fun foreignPoolCancelledBeforeLateButtonNeverDispatches() {
         for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
             withPool(service, wrongReceipt = false, delayedComposer = true) { pool, view ->
@@ -1050,7 +1076,7 @@ class ArenaOtherProvidersInstrumentedTest {
     private fun each(block: (WebView, ArenaService) -> Unit) { services.forEach { service -> page { block(it, service) } } }
 
     @Suppress("UNCHECKED_CAST")
-    private fun withPool(service: ArenaService, wrongReceipt: Boolean, formalIdDelayMillis: Int? = null, initiallyHidden: Boolean = false, delayedComposer: Boolean = false, changedDraft: Boolean = false, duplicateButton: Boolean = false, receiptDelayMillis: Int = 1800, block: (ArenaWebViewPool, WebView) -> Unit) {
+    private fun withPool(service: ArenaService, wrongReceipt: Boolean, formalIdDelayMillis: Int? = null, initiallyHidden: Boolean = false, delayedComposer: Boolean = false, changedDraft: Boolean = false, duplicateButton: Boolean = false, receiptDelayMillis: Int = 1800, chatgptLateRoute: Boolean = false, block: (ArenaWebViewPool, WebView) -> Unit) {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             lateinit var pool: ArenaWebViewPool
             lateinit var view: WebView
@@ -1092,7 +1118,10 @@ class ArenaOtherProvidersInstrumentedTest {
                     });
                     document.querySelector('button').addEventListener('${if (service == ArenaService.ZHIPU) "mousedown" else "click"}',function(){
                       window.sendCount++;input.value='';
-                      setTimeout(function(){document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(receipt)});},$receiptDelayMillis);
+                      ${if (chatgptLateRoute) "history.replaceState(null,'','/c/WEB:fixture');" else ""}
+                      setTimeout(function(){document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(receipt)});
+                        ${if (chatgptLateRoute) "history.replaceState(null,'','/c/real-receipt');" else ""}
+                      },$receiptDelayMillis);
                       ${if (formalIdDelayMillis != null) "setTimeout(function(){document.querySelector('[data-conv-id=temporary]')?.setAttribute('data-conv-id','existing_1');},$formalIdDelayMillis);" else ""}
                     });
                     window.fixtureReady=true;

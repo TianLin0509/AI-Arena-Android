@@ -688,7 +688,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         activateForAutomation(
             service = service,
             requestId = requestId,
-            timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
+            timeoutMillis = when {
+                attachmentFiles.isNotEmpty() -> 180_000L
+                service == ArenaService.CHATGPT -> CHATGPT_SEND_RECEIPT_TIMEOUT_MS
+                else -> AUTOMATION_HARD_TIMEOUT_MS
+            },
             strictReceipt = ArenaWebMessageIdentity.supported(service),
             onTimeout = {
                 callback(SendOutcome(false, requestId, "${service.displayName} 网页发送超时，请检查原网页后重试"))
@@ -2712,6 +2716,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
+        // Real four-provider rounds mounted ChatGPT's accepted user bubble just after 45 s.
+        // Keep the same click and identity checks; leave margin before the controller's 60 s fallback.
+        private const val CHATGPT_SEND_RECEIPT_TIMEOUT_MS = 55_000L
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
         /** 复用预热页时重新确认一次的时限；过了就改走正常的开新对话。 */
         private const val WARM_RECHECK_MS = 8_000L
