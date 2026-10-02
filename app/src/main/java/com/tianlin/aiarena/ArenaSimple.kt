@@ -287,7 +287,19 @@ internal fun SimpleSettingsPage(
     var more by rememberSaveable { mutableStateOf(false) }
     var help by rememberSaveable { mutableStateOf(false) }
     var about by rememberSaveable { mutableStateOf(false) }
+    var updates by rememberSaveable { mutableStateOf(false) }
+    var releaseNotes by rememberSaveable { mutableStateOf(false) }
     var confirm by remember { mutableStateOf<String?>(null) }
+    val settingsScroll = rememberScrollState()
+    if (releaseNotes) {
+        val latest = when (updateResult) {
+            is ArenaUpdateResult.Available -> updateResult.info
+            is ArenaUpdateResult.UpToDate -> updateResult.info
+            else -> null
+        }
+        ArenaReleaseNotesPage(latest, onBack = { releaseNotes = false })
+        return
+    }
     if (confirm != null) ConfirmDialog(title = "${confirm}？", text = "历史记录和已登录的 AI 都保留。", confirmLabel = "确认",
         onConfirm = { val action = confirm; confirm = null; if (action == "重启应用") onRestartApp?.invoke() else onResetSession() }, onDismiss = { confirm = null })
     Column(Modifier.fillMaxSize().background(ArenaStyle.colors.page).navigationBarsPadding()) {
@@ -295,7 +307,7 @@ internal fun SimpleSettingsPage(
             SimpleIcon(R.drawable.ic_arrow_back, "返回圆桌", onBack)
             Text("设置", style = MaterialTheme.typography.titleMedium)
         }
-        Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+        Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(settingsScroll).padding(horizontal = 20.dp)) {
             SimpleSettingRow("AI 成员", selectedServices.joinToString(" · ") { it.shortName }, onMembers)
             Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("大字阅读", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
@@ -318,8 +330,9 @@ internal fun SimpleSettingsPage(
                         SimpleSettingRow("清除崩溃记录", "", onClearCrashReport)
                     }
                 }
-                SimpleSettingRow("关于 AI 圆桌", "v${BuildConfig.VERSION_NAME}", { about = !about })
-                if (about) {
+                SimpleSettingRow("版本更新", "v${BuildConfig.VERSION_NAME}", { updates = !updates })
+                if (updates) {
+                    SimpleSettingRow("更新日志", "每版变化与体验建议", { releaseNotes = true })
                     val available = (updateResult as? ArenaUpdateResult.Available)?.info
                     SimpleSettingRow(if (available != null) "安装 v${available.versionName}" else "检查更新",
                         if (updateChecking) "检查中…" else "", { if (available != null) onInstallUpdate(available) else onCheckUpdate() })
@@ -329,6 +342,9 @@ internal fun SimpleSettingsPage(
                         else -> ""
                     }
                     if (message.isNotBlank()) Text(message, style = MaterialTheme.typography.bodySmall)
+                }
+                SimpleSettingRow("关于 AI 圆桌", "v${BuildConfig.VERSION_NAME}", { about = !about })
+                if (about) {
                     Text("无需注册圆桌账号。历史和网页登录保存在本机；问题会发送到所选 AI 的官方网站。AI 回答可能有误，请核实重要信息。",
                         Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.bodySmall, color = ArenaStyle.colors.muted)
                 }
