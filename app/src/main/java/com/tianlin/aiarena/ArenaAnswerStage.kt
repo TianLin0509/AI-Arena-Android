@@ -168,6 +168,9 @@ internal fun SimpleRoundStage(
     val context = LocalContext.current
     val store = presetStore ?: remember(context) { ArenaPresetStore(context) }
     var presetVersion by remember { mutableIntStateOf(0) }
+    val navigationPreferences = remember(context) { ArenaNavigationPreferences(context) }
+    // 底部提问区收起 / 展开由用户自己决定，并记住到下次；新一轮迭代前再展开用。
+    var composerCollapsed by rememberSaveable { mutableStateOf(navigationPreferences.isComposerCollapsed()) }
     val scope = rememberCoroutineScope()
     val sessionKey = sessionController.askedAtMillis
     var viewing by rememberSaveable(sessionKey, stateSaver = TimeSelectionSaver) { mutableStateOf<TimeSelection?>(null) }
@@ -245,12 +248,6 @@ internal fun SimpleRoundStage(
             }
             if (offline) SimpleNotice("网络未连接；已收到的回答仍可阅读。")
             sessionController.storageWarning?.let { SimpleNotice(it) }
-            if (!reviewing && busy && ArenaRoundNotifier.delivered(sessionController)) Surface(
-                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp).testTag("free-to-leave"),
-                color = colors.accentSoft, shape = RoundedCornerShape(12.dp)) {
-                Text("问题都已送达，可以切到别的应用，答完会通知你。", Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                    style = MaterialTheme.typography.labelLarge, color = colors.accent)
-            }
             if (!reviewing && listOf("压缩", "截取", "预算", "上限").any { sessionController.sessionMessage.contains(it) }) {
                 SimpleNotice(sessionController.sessionMessage)
             }
@@ -321,6 +318,8 @@ internal fun SimpleRoundStage(
                         style = style, debateIndex = debateIndex, depth = depth, members = relayOrder.size.coerceAtLeast(2))
                 } else null
                 ModeComposer(
+                    collapsed = composerCollapsed,
+                    onCollapsedChange = { composerCollapsed = it; navigationPreferences.setComposerCollapsed(it) },
                     mode = mode, onMode = { modeName = it.name }, text = roundGuidance, onText = onRoundGuidanceChange,
                     ready = ready, busy = busy, attachmentDraft = attachmentDraft, onChooseAttachments = onChooseAttachments,
                     attachmentNotice = ArenaAttachmentSupport.notice(

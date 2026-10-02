@@ -556,7 +556,7 @@ internal fun RoundtableMembersPage(
                     }
                 }
             }
-            // 国外三家是拓展成员：默认收起，只留一行标题。用不到境外网络的家人不会看到一串打不开的名字。
+            // 国外两家是拓展成员：默认收起，只留一行标题。用不到境外网络的家人不会看到一串打不开的名字。
             item(key = "overseas") {
                 var overseasExpanded by rememberSaveable {
                     mutableStateOf(ArenaMemberGroups.overseasExpandedByDefault(selectedServices))
@@ -565,7 +565,7 @@ internal fun RoundtableMembersPage(
                     ArenaRow(
                         title = "国外 AI（拓展）",
                         detail = if (overseasExpanded) {
-                            "Claude、ChatGPT、Gemini；手机要能访问境外网站"
+                            "ChatGPT、Gemini；手机要能访问境外网站"
                         } else {
                             "默认不显示，需要时点开"
                         },

@@ -152,10 +152,6 @@ internal object ArenaWebModeScript {
               if (typeof conv.is_networking === 'boolean') mode.search = conv.is_networking ? 'on' : 'off';
             }
         """.trimIndent()
-        ArenaService.CLAUDE -> """
-            const clModel = document.querySelector('[data-testid=model-selector-dropdown]');
-            if (clModel && modeVis(clModel)) mode.model = modeTxt(clModel).slice(0, 24);
-        """.trimIndent()
         ArenaService.CHATGPT -> """
             const gptModel = document.querySelector('[data-testid=model-switcher-dropdown-button]');
             if (gptModel && modeVis(gptModel)) mode.model = modeTxt(gptModel).slice(0, 24);

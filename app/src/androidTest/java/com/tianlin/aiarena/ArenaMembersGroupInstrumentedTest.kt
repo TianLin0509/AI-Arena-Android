@@ -10,7 +10,7 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * 国外三家是拓展成员：成员选择页默认**不展示**它们，点开「国外 AI（拓展）」才出现。
+ * 国外两家是拓展成员：成员选择页默认**不展示**它们，点开「国外 AI（拓展）」才出现。
  * 用不到境外网络的家人不应该在列表里看到一串打不开的名字。
  */
 class ArenaMembersGroupInstrumentedTest {
@@ -34,15 +34,16 @@ class ArenaMembersGroupInstrumentedTest {
 
         compose.onNodeWithText("DeepSeek").assertIsDisplayed()
         compose.onNodeWithText("智谱").performScrollTo().assertIsDisplayed()
-        listOf("Claude", "ChatGPT", "Gemini").forEach { compose.onNodeWithText(it).assertDoesNotExist() }
+        listOf("ChatGPT", "Gemini").forEach { compose.onNodeWithText(it).assertDoesNotExist() }
 
         compose.onNodeWithText("国外 AI（拓展）").performScrollTo().performClick()
 
-        listOf("Claude", "ChatGPT", "Gemini").forEach {
+        listOf("ChatGPT", "Gemini").forEach {
             compose.onNodeWithText(it).performScrollTo().assertIsDisplayed()
         }
-        compose.onNodeWithText("Claude").performScrollTo().performClick()
-        compose.runOnIdle { assertEquals(listOf(ArenaService.CLAUDE), toggled) }
+        compose.onNodeWithText("Claude").assertDoesNotExist()
+        compose.onNodeWithText("ChatGPT").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(listOf(ArenaService.CHATGPT), toggled) }
     }
 
     @Test

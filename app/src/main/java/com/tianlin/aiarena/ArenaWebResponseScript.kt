@@ -406,18 +406,6 @@ internal object ArenaWebResponseScript {
                 // .interact 的时序没在真机上采样过，先按弱信号多等两轮
                 weakDoneSignal = true;
             """.trimIndent()
-            ArenaService.CLAUDE -> """
-                // Claude 网页：回答正文 .font-claude-response；生成期间外层 data-is-streaming="true"
-                const picked = pickSelector(['.font-claude-response', '.font-claude-message', '[data-is-streaming] .standard-markdown']);
-                const tagged = state.expectedPrompt ? arenaFindRequestUser() : document.querySelector('[data-ai-arena-request="' + requestId + '"]');
-                const scoped = scopeAfterTag(picked.nodes, tagged, Number(state.assistantBaseline || 0));
-                text = collectText(scoped, [], picked.selector, scoped.anchored);
-                const clBlocks = scoped.nodes.map(node => node.closest('[data-is-streaming]')).filter(Boolean);
-                const clLast = clBlocks.length ? clBlocks[clBlocks.length - 1] : null;
-                thinkingUsed = thinkingIn(clLast, '[class*=think], [class*=thought], [class*=reason]');
-                const stopVisible = Array.from(document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="停止"]')).some(isVisible);
-                streaming = stopVisible || (!!clLast && clLast.getAttribute('data-is-streaming') === 'true');
-            """.trimIndent()
             ArenaService.CHATGPT -> """
                 // ChatGPT 网页：消息带 data-message-author-role，正文在 .markdown；结束后出现复制按钮
                 const picked = pickSelector(['[data-message-author-role=assistant] .markdown', '[data-message-author-role=assistant]']);

@@ -18,7 +18,7 @@ import org.junit.Test
 class ArenaOtherProvidersInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val services = listOf(ArenaService.QWEN, ArenaService.YUANBAO, ArenaService.ZHIPU,
-        ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI)
+        ArenaService.CHATGPT, ArenaService.GEMINI)
     private val request = "other-providers-current"
 
     private val qwenFailure = "<div data-chat-answers-wrap='turn' style='width:300px'><div class='retry-container-mobile' style='min-height:30px'>消息生成失败，请重试</div></div>"
@@ -64,6 +64,56 @@ class ArenaOtherProvidersInstrumentedTest {
         assertEquals("The re-rendered successor bubble is re-adopted", "NEW ANSWER", response(view, service).getString("text"))
         js(view, "document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(user(service, "", "current question").replace(" data-message-id=''", ""))});document.body.innerHTML=document.body.innerHTML;true")
         assertFalse("With a later same-text bubble after a re-render, nothing is guessed", response(view, service).getBoolean("found"))
+    }
+
+    @Test fun chatgptFirstChatFollowsTemporaryThenServerRouteBeforeItsBubbleMounts() = page { view ->
+        // 2026-10-01: ChatGPT moves / -> /c/WEB:<uuid> -> /c/<id> and only then mounts the first user bubble.
+        val service = ArenaService.CHATGPT
+        prepare(view, service)
+        submit(view, service)
+        js(view, "history.replaceState(null,'','/c/WEB:temp-1');history.replaceState(null,'','/c/server-1');true")
+        html(view, user(service, "server-msg") + answer(service, "NEW ANSWER"))
+        assertEquals("true", bind(view, service))
+        assertEquals("NEW ANSWER", response(view, service).getString("text"))
+        js(view, "history.replaceState(null,'','/c/server-2');true")
+        assertTrue("Any later hop is still a changed conversation", response(view, service).has("error"))
+    }
+
+    @Test fun chatgptServerRouteMissedByTheHookIsAcceptedOnlyWithItsPinnedMessageId() {
+        // 2026-10-01 real runs: the /c/WEB:<uuid> -> /c/<id> hop sometimes slipped past the history hook.
+        for (keepBubble in listOf(true, false)) page { view ->
+            val service = ArenaService.CHATGPT
+            prepare(view, service)
+            submit(view, service)
+            js(view, "history.replaceState(null,'','/c/WEB:temp-1');true")
+            html(view, user(service, "server-msg") + answer(service, "NEW ANSWER"))
+            assertEquals("true", bind(view, service))
+            js(view, "window.__aiArenaNavigationGuard.before=()=>null;history.replaceState(null,'','/c/server-1');true")
+            // A re-rendered bubble keeps its server message ID; a different ID is not the same question.
+            html(view, user(service, if (keepBubble) "server-msg" else "other-msg") + answer(service, "NEW ANSWER"))
+            if (keepBubble) assertEquals("NEW ANSWER", response(view, service).getString("text"))
+            else assertTrue("Another message ID is not proof of the same chat", response(view, service).has("error"))
+        }
+    }
+
+    @Test fun chatgptOnlyABrandNewChatMayHopAndOnlyOnceFromItsTemporaryRoute() {
+        page { view ->
+            val service = ArenaService.CHATGPT
+            prepare(view, service)
+            submit(view, service)
+            js(view, "history.replaceState(null,'','/c/WEB:temp-1');history.replaceState(null,'','/c/WEB:temp-2');true")
+            html(view, user(service, "server-msg") + answer(service, "WRONG"))
+            assertEquals("A second temporary route is not the server's", "scope_changed", bind(view, service))
+        }
+        page { view ->
+            val service = ArenaService.CHATGPT
+            html(view, user(service, "old", "old question") + answer(service, "OLD ANSWER"))
+            prepare(view, service)
+            submit(view, service)
+            js(view, "history.replaceState(null,'','/c/WEB:temp-1');true")
+            html(view, user(service, "server-msg") + answer(service, "WRONG"))
+            assertEquals("A chat with earlier questions cannot migrate unbound", "scope_changed", bind(view, service))
+        }
     }
 
     @Test fun qwenAttachmentOnlyAndRemountedOldTextCannotAcknowledgeFollowup() = page { view ->
@@ -843,7 +893,6 @@ class ArenaOtherProvidersInstrumentedTest {
         ArenaService.QWEN -> "<div class='message-card-wrap question' data-mt='text/plain' data-message-id='$id'><div class='question-text-card'>$text</div></div>"
         ArenaService.YUANBAO -> "<div class='agent-chat__list__item--human' data-message-id='$id'>$text</div>"
         ArenaService.ZHIPU -> "<div class='conversation question' data-message-id='$id'>$text</div>"
-        ArenaService.CLAUDE -> "<div data-testid='user-message' data-message-id='$id'>$text</div>"
         ArenaService.CHATGPT -> "<div data-message-author-role='user' data-message-id='$id'>$text</div>"
         else -> "<user-query data-message-id='$id'>$text</user-query>"
     }
@@ -854,7 +903,6 @@ class ArenaOtherProvidersInstrumentedTest {
             ArenaService.QWEN -> "<div class='message-card-wrap answer'><div class='qk-markdown'>$text</div></div>"
             ArenaService.YUANBAO -> "<div class='agent-chat__list__item--ai'><div class='agent-chat__conv--ai__speech_show'>$text</div><div class='agent-chat__conv--ai__toolbar' style='display:$display;height:30px'>Copy</div></div>"
             ArenaService.ZHIPU -> "<div class='answer'><div class='answer-content'>$text</div><div class='interact' style='display:$display;height:30px'>Copy</div></div>"
-            ArenaService.CLAUDE -> "<div data-is-streaming='${!done}'><div class='font-claude-response'>$text</div></div>"
             ArenaService.CHATGPT -> "<article><div data-message-author-role='assistant'><div class='markdown'>$text</div></div><button data-testid='copy-turn-action-button' style='display:$display'>Copy</button></article>"
             else -> "<model-response><message-content><div class='markdown' aria-busy='${!done}'>$text</div></message-content><message-actions style='display:$display;height:30px'>Copy</message-actions></model-response>"
         }

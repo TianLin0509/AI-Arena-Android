@@ -15,8 +15,16 @@ class ArenaNavigationPreferences(context: Context) {
         preferences.edit { putBoolean(KEY_OPENED_ROUNDTABLE, true) }
     }
 
+    /** 回答页底部的模式与输入面板是否收起（用户自己点的，记住到下次）。 */
+    fun isComposerCollapsed(): Boolean = preferences.getBoolean(KEY_COMPOSER_COLLAPSED, false)
+
+    fun setComposerCollapsed(collapsed: Boolean) {
+        preferences.edit { putBoolean(KEY_COMPOSER_COLLAPSED, collapsed) }
+    }
+
     private companion object {
         const val KEY_OPENED_ROUNDTABLE = "opened_roundtable"
+        const val KEY_COMPOSER_COLLAPSED = "composer_collapsed"
     }
 }
 

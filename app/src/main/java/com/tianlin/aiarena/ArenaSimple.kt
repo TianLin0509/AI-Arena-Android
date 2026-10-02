@@ -15,6 +15,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
@@ -150,10 +151,32 @@ internal fun ModeComposer(
     mode: RoundMode, onMode: (RoundMode) -> Unit, text: String, onText: (String) -> Unit, ready: Boolean, busy: Boolean,
     attachmentDraft: AttachmentDraft?, onChooseAttachments: (() -> Unit)?, attachmentNotice: String?, scope: String,
     options: @Composable () -> Unit, preset: (@Composable () -> Unit)?, onStop: () -> Unit, onSend: () -> Unit,
+    collapsed: Boolean = false, onCollapsedChange: ((Boolean) -> Unit)? = null,
 ) {
     val colors = ArenaStyle.colors
     Surface(color = colors.page, shadowElevation = 6.dp, shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp)) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (collapsed && onCollapsedChange != null) {
+            // 收起：只留一条细栏，屏幕留给回答；点一下展开。进行中仍可直接停止。
+            Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).clickable { onCollapsedChange(false) }
+                .semantics { contentDescription = "展开提问区" }.testTag("composer-expand")
+                .padding(start = 18.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(if (busy) "${mode.label} · 本轮进行中" else "${mode.label} · 点这里继续提问", Modifier.weight(1f),
+                    style = MaterialTheme.typography.labelLarge, color = colors.muted)
+                if (busy) TextButton(onClick = onStop, modifier = Modifier.heightIn(min = 48.dp)) { Text("停止", color = colors.error) }
+                ArenaIcon(R.drawable.ic_chevron_right, Modifier.padding(12.dp).rotate(-90f), tint = colors.muted, size = 20.dp)
+            }
+            return@Surface
+        }
+        Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = if (onCollapsedChange != null) 0.dp else 10.dp, bottom = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (onCollapsedChange != null) Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onCollapsedChange(true) }
+                .semantics { contentDescription = "收起提问区" }.testTag("composer-collapse"), contentAlignment = Alignment.Center) {
+                // 一条把手 + 向下的箭头：一看就知道能往下收。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(width = 36.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(colors.border))
+                }
+                ArenaIcon(R.drawable.ic_chevron_right, Modifier.align(Alignment.CenterEnd).padding(end = 4.dp).rotate(90f), tint = colors.muted, size = 18.dp)
+            }
             ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
             options()
             preset?.invoke()

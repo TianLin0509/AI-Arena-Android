@@ -18,7 +18,7 @@ class ArenaAttachmentSupportTest {
         }
         assertTrue(ArenaAttachmentSupport.unsupportedReason(ArenaService.ZHIPU).contains("智谱"))
         // 境外成员走通用说明，不能落进「智谱」那条专属文案。
-        listOf(ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI).forEach { service ->
+        listOf(ArenaService.CHATGPT, ArenaService.GEMINI).forEach { service ->
             val reason = ArenaAttachmentSupport.unsupportedReason(service)
             assertTrue(reason.contains(service.displayName))
             assertFalse(reason.contains("智谱"))

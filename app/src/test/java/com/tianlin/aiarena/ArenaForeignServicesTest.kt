@@ -5,9 +5,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Claude / ChatGPT / Gemini 作为境外备选成员接入：身份、默认成员与脚本形状不能退回去。 */
+/** ChatGPT / Gemini 作为境外备选成员接入：身份、默认成员与脚本形状不能退回去。Claude 因封号风险于 2026-10-01 移除。 */
 class ArenaForeignServicesTest {
-    private val foreign = listOf(ArenaService.CLAUDE, ArenaService.CHATGPT, ArenaService.GEMINI)
+    private val foreign = listOf(ArenaService.CHATGPT, ArenaService.GEMINI)
 
     @Test
     fun foreignServicesAreOptionalOverseasMembers() {
@@ -41,7 +41,7 @@ class ArenaForeignServicesTest {
     @Test
     fun overseasSummaryReportsSelectedCountAndNetworkRequirement() {
         assertEquals("需境外网络", ArenaMemberGroups.overseasSummary(ArenaService.defaultMembers))
-        assertEquals("已选 2 家 · 需境外网络", ArenaMemberGroups.overseasSummary(listOf(ArenaService.CLAUDE, ArenaService.GEMINI, ArenaService.KIMI)))
+        assertEquals("已选 2 家 · 需境外网络", ArenaMemberGroups.overseasSummary(listOf(ArenaService.CHATGPT, ArenaService.GEMINI, ArenaService.KIMI)))
     }
 
     @Test
@@ -52,16 +52,44 @@ class ArenaForeignServicesTest {
     @Test
     fun appendedServicesKeepExistingEnumNamesStable() {
         assertEquals(
-            listOf("DEEPSEEK", "DOUBAO", "KIMI", "QWEN", "YUANBAO", "ZHIPU", "CLAUDE", "CHATGPT", "GEMINI"),
+            listOf("DEEPSEEK", "DOUBAO", "KIMI", "QWEN", "YUANBAO", "ZHIPU", "CHATGPT", "GEMINI"),
             ArenaService.entries.map { it.name },
         )
         foreign.forEach { assertEquals(it, ArenaService.fromName(it.name)) }
+        assertEquals("已移除的 Claude 不再解析成成员", null, ArenaService.fromName("CLAUDE"))
+    }
+
+    @Test
+    fun savedSessionsThatIncludedClaudeStillOpenWithoutIt() {
+        val original = ArenaSessionSnapshot(
+            id = "s_claude",
+            originalQuestion = "旧会话",
+            roundNumber = 1,
+            currentRoundKind = RoundKind.INITIAL,
+            currentAnswerMode = AnswerMode.PARALLEL,
+            services = foreign,
+            runs = ArenaService.entries.associateWith { ParticipantRun() },
+            history = emptyList(),
+            summary = DiscussionSummary(judge = ArenaService.GEMINI),
+            conversationUrls = mapOf(ArenaService.CHATGPT to "https://chatgpt.com/c/def"),
+            currentRoundCaptain = ArenaService.CHATGPT,
+            updatedAtMillis = 1L,
+        )
+        val json = org.json.JSONObject(ArenaSessionJson.encode(original).toString())
+        json.put("services", org.json.JSONArray(listOf("CLAUDE", "CHATGPT", "GEMINI")))
+        json.getJSONObject("conversationUrls").put("CLAUDE", "https://claude.ai/chat/abc")
+        json.put("currentRoundCaptain", "CLAUDE")
+
+        val decoded = ArenaSessionJson.decode(json)
+
+        assertEquals(foreign, decoded.services)
+        assertEquals(mapOf(ArenaService.CHATGPT to "https://chatgpt.com/c/def"), decoded.conversationUrls)
+        assertEquals(null, decoded.currentRoundCaptain)
     }
 
     @Test
     fun foreignMembersAndConversationUrlsSurviveSessionRoundTrip() {
         val urls = mapOf(
-            ArenaService.CLAUDE to "https://claude.ai/chat/abc",
             ArenaService.CHATGPT to "https://chatgpt.com/c/def",
             ArenaService.GEMINI to "https://gemini.google.com/app/8fb051286895ae52",
         )
@@ -76,7 +104,7 @@ class ArenaForeignServicesTest {
             history = emptyList(),
             summary = DiscussionSummary(judge = ArenaService.GEMINI),
             conversationUrls = urls,
-            currentRoundCaptain = ArenaService.CLAUDE,
+            currentRoundCaptain = ArenaService.CHATGPT,
             updatedAtMillis = 1L,
         )
 
@@ -84,7 +112,7 @@ class ArenaForeignServicesTest {
 
         assertEquals(foreign, decoded.services)
         assertEquals(urls, decoded.conversationUrls)
-        assertEquals(ArenaService.CLAUDE, decoded.currentRoundCaptain)
+        assertEquals(ArenaService.CHATGPT, decoded.currentRoundCaptain)
     }
 
     @Test

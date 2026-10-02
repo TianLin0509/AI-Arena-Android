@@ -11,12 +11,11 @@ import org.junit.runner.RunWith
 class ArenaForeignServicesInstrumentedTest {
     @Test
     fun foreignProviderPagesAreTrustedOnlyOnTheirOwnHosts() {
-        assertTrue(ArenaFileChooserBroker.trusted(ArenaService.CLAUDE, "https://claude.ai/chat/abc"))
         assertTrue(ArenaFileChooserBroker.trusted(ArenaService.CHATGPT, "https://chatgpt.com/c/abc"))
         assertTrue(ArenaFileChooserBroker.trusted(ArenaService.CHATGPT, "https://chat.openai.com/c/abc"))
         assertTrue(ArenaFileChooserBroker.trusted(ArenaService.GEMINI, "https://gemini.google.com/app/8fb051286895ae52"))
 
-        assertFalse(ArenaFileChooserBroker.trusted(ArenaService.CLAUDE, "https://claude.ai.example.com/chat"))
+        assertFalse(ArenaFileChooserBroker.trusted(ArenaService.CHATGPT, "https://chatgpt.com.example.com/c/abc"))
         assertFalse(ArenaFileChooserBroker.trusted(ArenaService.CHATGPT, "http://chatgpt.com/"))
         assertFalse(ArenaFileChooserBroker.trusted(ArenaService.GEMINI, "https://accounts.google.com/signin"))
         assertFalse(ArenaFileChooserBroker.trusted(ArenaService.GEMINI, "https://chatgpt.com/"))
