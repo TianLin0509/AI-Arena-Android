@@ -2,7 +2,7 @@
 
 [![Android CI](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml/badge.svg)](https://github.com/TianLin0509/AI-Arena-Android/actions/workflows/android-ci.yml)
 
-当前版本：`v0.18.3`（`versionCode 33`）
+当前版本：`v0.18.4`（`versionCode 34`）
 
 ## 开发入口
 
@@ -28,6 +28,15 @@ AI 群聊选「开发」场景，工作目录选本仓库根。工作位读取 [
 - 每次可选择 2-4 家 AI。
 - 聚焦普通用户，尤其是中老年用户的日常提问、群策群力和幻觉风险提示。
 - 登录信息、成员选择和讨论历史只保存在 Android 应用沙箱内。
+
+## 0.18.4 更新日志、等待网页发送键、智谱后台恢复、草稿提示
+
+- 设置 → 更多设置 → 版本更新 → 更新日志：逐版展开主要变化和建议体验，内置 34 个已记录版本，断网可读；检查更新与安装入口仍保留。
+
+- ChatGPT、Gemini 的成熟输入框就绪后即可开始，避免无关页面资源加载较慢时一直空等。
+- ChatGPT、Gemini 加载途中更换输入框或发送键稍晚出现时，会在本轮前台等待期限内继续核对正文并等待可用按钮，只点击一次；取消后不再发送。
+- 智谱发送等待使用 App 的前台计时，切到其他应用再回来时继续等待；已点击却没确认送达时明确提示核对原网页，避免重复发送。
+- 底部提问区收起后显示「有草稿」及附件数量，方便确认还有内容待发。
 
 ## 0.18.3 底部提问区可收起、ChatGPT 可用、移除 Claude
 
@@ -269,9 +278,9 @@ adb shell am instrument -w -r com.tianlin.aiarena.test/androidx.test.runner.Andr
 
 - `versionName` 使用语义化版本：`主版本.次版本.修订版本`。
 - `versionCode` 每次发布必须严格递增，供 Android 判断升级顺序。
-- 当前基线：`versionName=0.18.3`，`versionCode=33`。
-- 下一次小修复示例：`0.18.1 / versionCode 31`。
-- 下一次向后兼容新功能示例：`0.19.0 / versionCode 31`（与上例二选一，实际发布时继续递增）。
+- 当前基线：`versionName=0.18.4`，`versionCode=34`。
+- 下一次小修复示例：`0.18.5 / versionCode 35`。
+- 下一次向后兼容新功能示例：`0.19.0 / versionCode 35`（与上例二选一，实际发布时继续递增）。
 - 破坏兼容性的改动：升级主版本。
 
 为了保留网页登录态，升级必须保持：
@@ -326,3 +335,7 @@ release 签名可通过 `ARENA_KEYSTORE_PROPERTIES` 指向仓库外的签名配�
 ## License
 
 [MIT](LICENSE)
+
+### 应用内更新日志
+
+设置 → 更多设置 → 版本更新 → 更新日志，按版本展开主要变化和建议体验。历史摘要内置于 `ArenaReleaseNotes.kt`，断网也可阅读；新版本提示使用已有更新检查结果，不新增请求。每次发布同步更新 CHANGELOG 与该目录，保持版本和日期一致。

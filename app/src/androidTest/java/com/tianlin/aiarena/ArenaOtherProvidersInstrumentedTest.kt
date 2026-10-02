@@ -21,6 +21,67 @@ class ArenaOtherProvidersInstrumentedTest {
         ArenaService.CHATGPT, ArenaService.GEMINI)
     private val request = "other-providers-current"
 
+    private fun matureEditor(service: ArenaService, text: String = "") =
+        if (service == ArenaService.CHATGPT) "<div id='prompt-textarea' class='ProseMirror' contenteditable='true' style='min-height:40px;width:300px'>$text</div>"
+        else "<rich-textarea><div class='ql-editor' contenteditable='true' style='min-height:40px;width:300px'>$text</div></rich-textarea>"
+
+    @Test fun foreignInteractiveReadinessRejectsFallbackHiddenDisabledAndAmbiguousEditors() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI)) page { view ->
+            js(view, "Object.defineProperty(document,'readyState',{configurable:true,get:()=> 'interactive'});true")
+            val helper = ArenaEditorReadyScript.helper(service)
+            fun ready(body: String): String {
+                html(view, body)
+                return js(view, "(()=>{$helper return arenaEditorReady(document.querySelector('[contenteditable=true],textarea'));})()")
+            }
+            assertEquals("false", ready("<textarea id='prompt-textarea'></textarea>"))
+            assertEquals("false", ready("<div style='display:none'>${matureEditor(service)}</div>"))
+            assertEquals("false", ready(matureEditor(service).replace("contenteditable='true'", "contenteditable='true' aria-disabled='true'")))
+            assertEquals("false", ready(matureEditor(service) + matureEditor(service)))
+            assertEquals("true", ready(matureEditor(service)))
+        }
+    }
+
+    @Test fun foreignFreshInteractiveMatureEditorIsVerifiedWithoutWaitingForAllResources() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            withPool(service, wrongReceipt = false) { pool, view ->
+                interceptForeignFresh(view, matureEditor(service))
+                val done = CountDownLatch(1)
+                val ready = AtomicReference<Boolean>()
+                instrumentation.runOnMainSync { pool.openFreshConversation(service) { ready.set(it); done.countDown() } }
+                assertTrue(done.await(12, TimeUnit.SECONDS))
+                assertEquals(true, ready.get())
+                assertEquals("interactive", js(view, "document.readyState"))
+                assertEquals("true", js(view, "!!window.__aiArenaFreshPage"))
+                assertEquals("", js(view, "document.querySelector('[contenteditable=true]').innerText.trim()"))
+            }
+    }
+
+    @Test fun foreignFreshInteractiveMatureEditorStillProtectsExistingDraftAndHistory() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            for (draft in listOf(false, true)) withPool(service, wrongReceipt = false) { pool, view ->
+                val body = matureEditor(service, if (draft) "unsent existing draft" else "") +
+                    if (draft) "" else user(service, "previous", "earlier question")
+                interceptForeignFresh(view, body)
+                val done = CountDownLatch(1)
+                instrumentation.runOnMainSync { pool.openFreshConversation(service) { done.countDown() } }
+                assertFalse(done.await(4, TimeUnit.SECONDS))
+                assertEquals("false", js(view, "!!window.__aiArenaFreshPage"))
+                assertEquals(if (draft) "unsent existing draft" else "", js(view, "document.querySelector('[contenteditable=true]').innerText.trim()"))
+            }
+    }
+
+    private fun interceptForeignFresh(view: WebView, body: String) {
+        instrumentation.runOnMainSync {
+            val production = view.webViewClient
+            view.webViewClient = object : android.webkit.WebViewClient() {
+                override fun onPageStarted(v: WebView, url: String?, icon: android.graphics.Bitmap?) = production.onPageStarted(v, url, icon)
+                override fun onPageFinished(v: WebView, url: String?) = production.onPageFinished(v, url)
+                override fun shouldInterceptRequest(v: WebView, request: android.webkit.WebResourceRequest) =
+                    android.webkit.WebResourceResponse("text/html", "UTF-8", "<html><body>$body<script>Object.defineProperty(document,'readyState',{configurable:true,get:()=> 'interactive'});</script></body></html>".byteInputStream())
+            }
+        }
+    }
+
     private val qwenFailure = "<div data-chat-answers-wrap='turn' style='width:300px'><div class='retry-container-mobile' style='min-height:30px'>消息生成失败，请重试</div></div>"
 
     @Test fun qwenSameTextAttachmentFollowupBindsOnlyItsNewTextCard() {
@@ -114,6 +175,82 @@ class ArenaOtherProvidersInstrumentedTest {
             html(view, user(service, "server-msg") + answer(service, "WRONG"))
             assertEquals("A chat with earlier questions cannot migrate unbound", "scope_changed", bind(view, service))
         }
+    }
+
+    @Test fun foreignPoolRemountedEditorAndLateSendButtonDispatchExactlyOnce() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            withPool(service, wrongReceipt = false, delayedComposer = true) { pool, view ->
+                val done = CountDownLatch(1)
+                val outcome = AtomicReference<SendOutcome>()
+                instrumentation.runOnMainSync { pool.sendPrompt(service, "current question", request) { outcome.set(it); done.countDown() } }
+                assertTrue(done.await(20, TimeUnit.SECONDS))
+                assertTrue(outcome.get().toString(), outcome.get().success)
+                Thread.sleep(700)
+                assertEquals("1", js(view, "window.sendCount"))
+                assertEquals("current question", js(view, "window.remountedText"))
+            }
+    }
+
+    @Test fun chatgptPoolReceiptAfterFiftySecondsIsAcceptedWithoutAnotherClick() =
+        withPool(ArenaService.CHATGPT, wrongReceipt = false, receiptDelayMillis = 50000, chatgptLateRoute = true) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.CHATGPT, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertTrue(outcome.get().toString(), outcome.get().success)
+            assertEquals("1", js(view, "window.sendCount"))
+            assertEquals("/c/real-receipt", js(view, "location.pathname"))
+            assertEquals("pool-user", js(view, "window.__aiArenaRequests['$request'].boundUserId"))
+        }
+
+    @Test fun chatgptPoolUnknownReceiptStillTimesOutAndNeverResends() =
+        withPool(ArenaService.CHATGPT, wrongReceipt = false, receiptDelayMillis = 65000) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            val started = android.os.SystemClock.elapsedRealtime()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.CHATGPT, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().detail, outcome.get().detail.contains("已点击发送"))
+            assertTrue(android.os.SystemClock.elapsedRealtime() - started >= 55000)
+            Thread.sleep(700)
+            assertEquals("1", js(view, "window.sendCount"))
+        }
+
+    @Test fun foreignPoolCancelledBeforeLateButtonNeverDispatches() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            withPool(service, wrongReceipt = false, delayedComposer = true) { pool, view ->
+                val outcome = AtomicReference<SendOutcome>()
+                instrumentation.runOnMainSync { pool.sendPrompt(service, "current question", request) { outcome.set(it) } }
+                waitForZhipuInput(view)
+                instrumentation.runOnMainSync { pool.cancelAutomation(service) }
+                Thread.sleep(3500)
+                assertNull(outcome.get())
+                assertEquals("0", js(view, "window.sendCount"))
+            }
+    }
+
+    @Test fun foreignPoolChangedRemountedDraftNeverDispatches() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            withPool(service, wrongReceipt = false, delayedComposer = true, changedDraft = true) { pool, view ->
+                instrumentation.runOnMainSync { pool.sendPrompt(service, "current question", request) { } }
+                waitForZhipuInput(view)
+                Thread.sleep(3500)
+                assertEquals("changed question", js(view, "window.remountedText"))
+                assertEquals("0", js(view, "window.sendCount"))
+                instrumentation.runOnMainSync { pool.cancelAutomation(service) }
+            }
+    }
+
+    @Test fun foreignPoolAmbiguousSendButtonsNeverDispatch() {
+        for (service in listOf(ArenaService.CHATGPT, ArenaService.GEMINI))
+            withPool(service, wrongReceipt = false, delayedComposer = true, duplicateButton = true) { pool, view ->
+                instrumentation.runOnMainSync { pool.sendPrompt(service, "current question", request) { } }
+                waitForZhipuInput(view)
+                Thread.sleep(3500)
+                assertEquals("0", js(view, "window.sendCount"))
+                instrumentation.runOnMainSync { pool.cancelAutomation(service) }
+            }
     }
 
     @Test fun qwenAttachmentOnlyAndRemountedOldTextCannotAcknowledgeFollowup() = page { view ->
@@ -658,15 +795,15 @@ class ArenaOtherProvidersInstrumentedTest {
         assertEquals("0", js(view, "window.sendCount"))
     }
 
-    @Test fun zhipuLateEnabledButtonAfterDeadlineDoesNotSend() = page { view ->
+    @Test fun zhipuNativeCancellationBlocksButtonAfterFormerWallDeadline() = page { view ->
         zhipuSetup(view)
         js(view, "window.realNow=Date.now;window.testNow=realNow();Date.now=()=>testNow;true")
         zhipuPost(view)
         Thread.sleep(150)
-        js(view, "window.testNow+=50000;document.querySelector('button').disabled=false;true")
+        js(view, "window.__aiArenaCancelledRequests={'$request':true};window.testNow+=50000;document.querySelector('button').disabled=false;true")
         Thread.sleep(700)
         assertEquals("0", js(view, "window.sendCount"))
-        assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+        assertEquals("waiting", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
     }
 
     @Test fun zhipuSlowReadinessUsesOriginalTotalDeadlineWithoutAnotherClick() = page { view ->
@@ -704,43 +841,61 @@ class ArenaOtherProvidersInstrumentedTest {
         assertEquals("0", js(view, "window.sendCount"))
     }
 
-    @Test fun zhipuHiddenTimeNeverExtendsNativeTotalDeadline() = page { view ->
+    @Test fun zhipuTwoMinutesHiddenDoNotConsumeTheNativeForegroundBudget() = page { view ->
         zhipuSetup(view)
         zhipuClock(view, hidden = true)
         zhipuPost(view)
         Thread.sleep(150)
-        js(view, "window.testNow+=50000;window.fakeVisibility='visible';document.querySelector('button').disabled=false;true")
+        js(view, "window.testNow+=120000;document.querySelector('button').disabled=false;true")
         Thread.sleep(500)
         assertEquals("0", js(view, "window.sendCount"))
-        assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+        assertEquals("waiting", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+        js(view, "window.fakeVisibility='visible';true")
+        Thread.sleep(500)
+        assertEquals("1", js(view, "window.sendCount"))
+        assertEquals("dispatched", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
     }
 
-    @Test fun zhipuAlreadyExpiredDispatchDoesNotEvenWriteTheEditor() = page { view ->
+    @Test fun zhipuAlreadyCancelledDispatchDoesNotEvenWriteTheEditor() = page { view ->
         zhipuSetup(view)
-        js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question',deadlineMillis:Date.now()-1},location.origin);true")
+        js(view, "window.__aiArenaCancelledRequests={'$request':true};window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question'},location.origin);true")
         Thread.sleep(700)
         assertEquals("0", js(view, "window.sendCount"))
         assertEquals("", js(view, "document.querySelector('textarea').value"))
-        assertEquals("error:send_disabled", js(view, "window.__aiArenaZhipuDispatchResults['$request']"))
+        assertEquals("true", js(view, "!window.__aiArenaZhipuDispatchResults || !window.__aiArenaZhipuDispatchResults['$request']"))
     }
 
     private fun zhipuClock(view: WebView, hidden: Boolean = false) {
         js(view, "window.testNow=Date.now();Date.now=()=>testNow;window.fakeVisibility='${if (hidden) "hidden" else "visible"}';Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});true")
     }
 
-    @Test fun zhipuPoolWaitsOverTenSecondsInBackgroundAndDispatchesOnce() =
+    @Test fun zhipuPoolWaitsBeyondWallDeadlineInBackgroundAndDispatchesOnce() =
         withPool(ArenaService.ZHIPU, wrongReceipt = false, initiallyHidden = true) { pool, view ->
             val done = CountDownLatch(1)
             val outcome = AtomicReference<SendOutcome>()
             instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it); done.countDown() } }
             waitForZhipuInput(view)
-            Thread.sleep(13000)
+            instrumentation.runOnMainSync { ArenaForeground.setVisible(false) }
+            try { Thread.sleep(50000) }
+            finally { instrumentation.runOnMainSync { ArenaForeground.setVisible(true) } }
             assertNull(outcome.get())
             assertEquals("0", js(view, "window.sendCount"))
             js(view, "window.fakeVisibility='visible';true")
             assertTrue(done.await(20, TimeUnit.SECONDS))
             assertTrue(outcome.get().toString(), outcome.get().success)
             assertEquals("1", js(view, "window.inputCount"))
+            assertEquals("1", js(view, "window.sendCount"))
+        }
+
+    @Test fun zhipuPoolClickedButReceiptLateReportsUncertainWithoutResending() =
+        withPool(ArenaService.ZHIPU, wrongReceipt = false, receiptDelayMillis = 65000) { pool, view ->
+            val done = CountDownLatch(1)
+            val outcome = AtomicReference<SendOutcome>()
+            instrumentation.runOnMainSync { pool.sendPrompt(ArenaService.ZHIPU, "current question", request) { outcome.set(it); done.countDown() } }
+            assertTrue(done.await(60, TimeUnit.SECONDS))
+            assertFalse(outcome.get().success)
+            assertTrue(outcome.get().toString(), outcome.get().detail.contains("已点击发送"))
+            Thread.sleep(700)
             assertEquals("1", js(view, "window.sendCount"))
         }
 
@@ -803,7 +958,7 @@ class ArenaOtherProvidersInstrumentedTest {
             button.addEventListener('mousedown',()=>{window.sendCount++;window.sentText=editor.value;});true;
         """.trimIndent())
     }
-    private fun zhipuPost(view: WebView) { js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question',deadlineMillis:Date.now()+45000},location.origin);true") }
+    private fun zhipuPost(view: WebView) { js(view, "window.postMessage({channel:'__ai_arena_zhipu_send_v1',requestId:'$request',text:'current question'},location.origin);true") }
 
     @Test fun qwenUnboundNetworkCaptureAndSidebarCannotMasqueradeAsAnswer() = page { view ->
         val service = ArenaService.QWEN
@@ -921,7 +1076,7 @@ class ArenaOtherProvidersInstrumentedTest {
     private fun each(block: (WebView, ArenaService) -> Unit) { services.forEach { service -> page { block(it, service) } } }
 
     @Suppress("UNCHECKED_CAST")
-    private fun withPool(service: ArenaService, wrongReceipt: Boolean, formalIdDelayMillis: Int? = null, initiallyHidden: Boolean = false, block: (ArenaWebViewPool, WebView) -> Unit) {
+    private fun withPool(service: ArenaService, wrongReceipt: Boolean, formalIdDelayMillis: Int? = null, initiallyHidden: Boolean = false, delayedComposer: Boolean = false, changedDraft: Boolean = false, duplicateButton: Boolean = false, receiptDelayMillis: Int = 1800, chatgptLateRoute: Boolean = false, block: (ArenaWebViewPool, WebView) -> Unit) {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             lateinit var pool: ArenaWebViewPool
             lateinit var view: WebView
@@ -943,16 +1098,30 @@ class ArenaOtherProvidersInstrumentedTest {
                 val fixtureUrl = if (service == ArenaService.YUANBAO) "https://yuanbao.tencent.com/chat/naQivTmsDa/existing" else service.url
                 view.loadDataWithBaseURL(fixtureUrl, """
                     <html><body><div data-new-input-card><textarea id='prompt-textarea'></textarea>
-                    <button id='yuanbao-send-btn' class='button-right-inner send-button' aria-label='Send message'>Send</button>
+                    <button id='yuanbao-send-btn' class='button-right-inner send-button' aria-label='Send message' ${if (delayedComposer) "disabled" else ""}>Send</button>
                     </div>
                     <script>
                     window.sendCount=0;window.inputCount=0;
                     ${if (initiallyHidden) "window.fakeVisibility='hidden';Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>window.fakeVisibility});" else ""}
                     const input=document.querySelector('textarea');
-                    input.addEventListener('input',function(){window.inputCount++;});
+                    input.addEventListener('input',function(){window.inputCount++;
+                      ${if (delayedComposer) """
+                      setTimeout(function(){
+                        const replacement=document.createElement('div');replacement.id='prompt-textarea';
+                        replacement.contentEditable='true';replacement.textContent=${if (changedDraft) "'changed question'" else "input.value"};
+                        window.remountedText=replacement.textContent;input.replaceWith(replacement);
+                      },1800);
+                      setTimeout(function(){const button=document.querySelector('button');button.disabled=false;
+                        ${if (duplicateButton) "button.after(button.cloneNode(true));" else ""}
+                      },2500);
+                      """.trimIndent() else ""}
+                    });
                     document.querySelector('button').addEventListener('${if (service == ArenaService.ZHIPU) "mousedown" else "click"}',function(){
                       window.sendCount++;input.value='';
-                      setTimeout(function(){document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(receipt)});},1800);
+                      ${if (chatgptLateRoute) "history.replaceState(null,'','/c/WEB:fixture');" else ""}
+                      setTimeout(function(){document.body.insertAdjacentHTML('beforeend',${JSONObject.quote(receipt)});
+                        ${if (chatgptLateRoute) "history.replaceState(null,'','/c/real-receipt');" else ""}
+                      },$receiptDelayMillis);
                       ${if (formalIdDelayMillis != null) "setTimeout(function(){document.querySelector('[data-conv-id=temporary]')?.setAttribute('data-conv-id','existing_1');},$formalIdDelayMillis);" else ""}
                     });
                     window.fixtureReady=true;

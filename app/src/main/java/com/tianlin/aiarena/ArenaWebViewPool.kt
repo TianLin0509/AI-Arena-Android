@@ -63,7 +63,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
     private var uiSelectedService: ArenaService? = null
     private class Automation(val requestId: String, val onTimeout: () -> Unit, val onInterrupted: (String) -> Unit, val strictReceipt: Boolean = false) {
         var progressDescription: String = "等待网页输入框就绪"
-        var deadlineWallMillis: Long = 0L
         var deadlineElapsedMillis: Long = 0L
         var watchdog: Runnable? = null
         var parked = false
@@ -536,6 +535,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 return true;
               });
               const input = usable.length === 1 ? usable[0] : null;
+              ${ArenaEditorReadyScript.helper(service)}
               $editorDraftHelper
               const draft = arenaEditorDraft(input);
               // Only the exact text the user saw and confirmed may be replaced by this round's question.
@@ -550,7 +550,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
               // History or a website send queue on the root page is never ready. Keep polling:
               // a single hydration sample must not fail the round; the deadline still decides.
               let blocked = !expected.includes(root) ? 'not_root' : !empty ? 'history' : queued ? 'queued' : draft && !replaceableDraft ? 'draft' :
-                (!input || document.readyState !== 'complete') ? 'no_editor' : '';
+                (!input || !arenaEditorReady(input)) ? 'no_editor' : '';
               // The same unsent draft for 10 s is the website's restored draft, not hydration noise:
               // report it now instead of holding the whole round until the fresh-page deadline.
               if (blocked === 'draft') {
@@ -688,7 +688,11 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         activateForAutomation(
             service = service,
             requestId = requestId,
-            timeoutMillis = if (attachmentFiles.isEmpty()) AUTOMATION_HARD_TIMEOUT_MS else 180_000L,
+            timeoutMillis = when {
+                attachmentFiles.isNotEmpty() -> 180_000L
+                service == ArenaService.CHATGPT -> CHATGPT_SEND_RECEIPT_TIMEOUT_MS
+                else -> AUTOMATION_HARD_TIMEOUT_MS
+            },
             strictReceipt = ArenaWebMessageIdentity.supported(service),
             onTimeout = {
                 callback(SendOutcome(false, requestId, "${service.displayName} 网页发送超时，请检查原网页后重试"))
@@ -833,7 +837,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         if (service in automations) return onBusy()
         val webView = ensureWebView(service) ?: return onTimeout()
         val token = Automation(requestId, onTimeout, onInterrupted, strictReceipt)
-        token.deadlineWallMillis = System.currentTimeMillis() + timeoutMillis
         token.deadlineElapsedMillis = ArenaForeground.elapsed() + timeoutMillis
         automations[service] = token
         val watchdog = Runnable {
@@ -841,7 +844,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             val detail = token.timeoutDetail
             val page = webViews[service]
             val yuanbaoLoop = service == ArenaService.YUANBAO && strictReceipt
-            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL || yuanbaoLoop)) {
+            val zhipuLoop = service == ArenaService.ZHIPU && strictReceipt
+            val deferredLoop = service in DEFERRED_SEND_SERVICES && strictReceipt
+            if (page != null && (detail == DOUBAO_BUSY_DETAIL || detail == DOUBAO_HIDDEN_DETAIL || yuanbaoLoop || zhipuLoop || deferredLoop)) {
                 // The page may have clicked just before this deadline while its callback is still queued.
                 // Never tell the user "not sent" then: a retry would ask the question twice.
                 var reported = false
@@ -852,6 +857,12 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                     when {
                         clicked == null -> onTimeout()
                         yuanbaoLoop && detail == null -> onInterrupted(if (clicked) YUANBAO_UNCONFIRMED_DETAIL else yuanbaoNotSentDetail(waitReason))
+                        zhipuLoop -> onInterrupted(if (clicked)
+                            "智谱已点击发送，但尚未确认送达；请查看原网页，不会自动重复发送"
+                        else "智谱本轮未发送：发送按钮尚未就绪；请查看原网页后再试")
+                        deferredLoop -> onInterrupted(if (clicked)
+                            "${service.displayName}已点击发送，但尚未确认送达；请查看原网页，不会自动重复发送"
+                        else "${service.displayName}本轮未发送：输入框或发送按钮尚未就绪；请查看原网页后再试")
                         clicked -> onInterrupted(DOUBAO_UNCONFIRMED_DETAIL)
                         else -> onInterrupted(detail ?: "")
                     }
@@ -901,15 +912,16 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             (function() {
               ${selectorHelperScript()}
               const input = arenaFirstMatch($selectors);
+              ${ArenaEditorReadyScript.helper(service)}
               ${if (service == ArenaService.DOUBAO) "void ${doubaoHiddenExpression(service)};" else ""}
               if (!${token.strictReceipt}) return !!input;
               const key = ${ArenaJs.quote(token.requestId)};
               const text = input ? (input.value || input.innerText || input.textContent || '') : '';
               // The fresh-page check held this very element stable and empty for 1.6 s just before.
-              if (${freshlyVerified(service)} && input && !text.trim() && document.readyState === 'complete' &&
+              if (${freshlyVerified(service)} && input && !text.trim() && arenaEditorReady(input) &&
                   window.__aiArenaFreshPage && window.__aiArenaFreshPage.input === input) return true;
               const previous = window.__aiArenaReadyProbe;
-              if (!input || document.readyState !== 'complete' || !previous || previous.key !== key || previous.input !== input || previous.text !== text || previous.url !== location.href) {
+              if (!input || !arenaEditorReady(input) || !previous || previous.key !== key || previous.input !== input || previous.text !== text || previous.url !== location.href) {
                 window.__aiArenaReadyProbe = { key, input, text, url: location.href, since: Date.now() };
                 return false;
               }
@@ -1187,7 +1199,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
             } else {
                 // Yuanbao's formal ID and Zhipu's foreground readiness can arrive late.
                 // Keep observing without another click, bounded by the original watchdog.
-                if (token?.strictReceipt == true && (service == ArenaService.YUANBAO || service == ArenaService.ZHIPU || attempt < 15)) handler.postDelayed({
+                if (token?.strictReceipt == true && (service == ArenaService.YUANBAO || service == ArenaService.ZHIPU || service in DEFERRED_SEND_SERVICES || attempt < 15)) handler.postDelayed({
                     if (isCurrent(service, token)) verifyStandardSend(webView, service, requestId, callback, attempt + 1)
                 }, 500L)
                 else finishSend(service, SendOutcome(false, requestId, "发送后未检测到与本轮正文一致的新消息，请检查原网页；不会自动重复发送"), callback)
@@ -2031,8 +2043,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                 window.postMessage({
                   channel: '__ai_arena_zhipu_send_v1',
                   requestId: requestId,
-                  text: text,
-                  deadlineMillis: ${automations[service]?.deadlineWallMillis ?: 0L}
+                  text: text
                 }, location.origin);
                 return 'sent_pending';
             """.trimIndent()
@@ -2041,6 +2052,8 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         }
         val scheduleClicks = if (service == ArenaService.ZHIPU || !scheduleSubmit) {
             ""
+        } else if (service in DEFERRED_SEND_SERVICES && requireIdentity) {
+            ArenaDeferredSendScript.awaitFirstSend(inputSelectors, sendSelectors, conversationAdvanced, firstClickDelayMs)
         } else if (service == ArenaService.YUANBAO && automations[service] != null) {
             """
                 // Wait for this composer's FIRST send control. No deadline of its own: the App's watchdog
@@ -2345,10 +2358,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                   if (window.__aiArenaZhipuDispatchResults[requestId]) return;
                   window.__aiArenaZhipuDispatchResults[requestId] = 'preparing';
                   try {
-                    // Use the native automation's original deadline. Background throttling
-                    // must not consume a separate short readiness window or extend the task.
-                    const deadline = Number(payload.deadlineMillis);
-                    if (!Number.isFinite(deadline) || deadline <= Date.now()) throw new Error('send_disabled');
+                    // The native foreground-time watchdog owns the deadline and cancels first,
+                    // then reads the click receipt. A wall-clock deadline here would expire
+                    // while the App is paused in the background, leaving no send on return.
                     const pageUrl = location.href;
                     const owner = window.__aiArenaRequests?.[requestId];
                     if (owner && owner.initialUrl !== pageUrl) throw new Error('page_changed');
@@ -2388,7 +2400,6 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                       try {
                         if (window.__aiArenaCancelledRequests?.[requestId] || window.__aiArenaSendClicks?.[requestId]) return;
                         if (location.href !== pageUrl || (owner && window.__aiArenaRequests?.[requestId] !== owner)) throw new Error('page_changed');
-                        if (Date.now() >= deadline) throw new Error('send_disabled');
                         if (!input.isConnected) throw new Error('input_changed');
                         const currentText = String(input.value || input.innerText || input.textContent || '').replace(/\s+/g,' ').trim();
                         if (currentText !== text.replace(/\s+/g,' ').trim()) throw new Error('input_changed');
@@ -2398,12 +2409,10 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
                         }
                         const send = document.querySelector('.button-right-inner');
                         if (!arenaSendEnabled(send)) {
-                          if (Date.now() >= deadline) throw new Error('send_disabled');
                           window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
                           setTimeout(attempt, 100); return;
                         }
                         const rect = send.getBoundingClientRect();
-                        if (Date.now() >= deadline) throw new Error('send_disabled');
                         if (document.visibilityState !== 'visible') {
                           window.__aiArenaZhipuDispatchResults[requestId] = 'waiting';
                           setTimeout(attempt, 100); return;
@@ -2693,6 +2702,7 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
         /** Sites whose round work advances on animation frames; only these stay drawn for a whole round. */
         // Gemini (2026-09-30) types its answer with a frame-driven animation; aria-busy only clears once it has drawn.
         private val FRAME_DRIVEN_SERVICES = setOf(ArenaService.DOUBAO, ArenaService.GEMINI)
+        private val DEFERRED_SEND_SERVICES = setOf(ArenaService.CHATGPT, ArenaService.GEMINI)
         /** Longer drafts are never offered for replacement: the user must see the exact full text. */
         private const val MAX_FRESH_DRAFT_CHARS = 2_000
         private val FRESH_REASONS = setOf("draft", "history", "not_root", "queued", "no_editor")
@@ -2706,6 +2716,9 @@ class ArenaWebViewPool(private val activity: MainActivity) : ArenaGateway {
 
         /** 整条自动化链（等输入框 + 注入 + 校验）的硬上限，超过即认定回调已丢失。 */
         private const val AUTOMATION_HARD_TIMEOUT_MS = 45_000L
+        // Real four-provider rounds mounted ChatGPT's accepted user bubble just after 45 s.
+        // Keep the same click and identity checks; leave margin before the controller's 60 s fallback.
+        private const val CHATGPT_SEND_RECEIPT_TIMEOUT_MS = 55_000L
         private const val FOCUS_ACTION_TIMEOUT_MS = 12_000L
         /** 复用预热页时重新确认一次的时限；过了就改走正常的开新对话。 */
         private const val WARM_RECHECK_MS = 8_000L

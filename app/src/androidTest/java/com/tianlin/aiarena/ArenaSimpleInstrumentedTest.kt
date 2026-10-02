@@ -286,6 +286,61 @@ class ArenaSimpleInstrumentedTest {
         compose.onNodeWithContentDescription("打开 DeepSeek 网页").assertIsDisplayed()
     }
 
+    @Test fun releaseNotesStayReadableWhenUpdateCheckFailsAndReturnToSettings() {
+        var checks = 0
+        compose.setContent { ArenaTheme {
+            SimpleSettingsPage(ArenaService.defaultMembers, false, {}, {}, {}, {}, {}, {}, null, {},
+                ArenaUpdateResult.Failed("网络暂时不可用"), false, { checks++ }, {}, null, {}, null)
+        } }
+        compose.onNodeWithText("更多设置").performClick()
+        compose.onNodeWithText("版本更新").performScrollTo().performClick()
+        compose.onNodeWithText("更新日志").performScrollTo().performClick()
+        compose.onNodeWithTag("release-installed-version").assertTextEquals("当前安装 v${BuildConfig.VERSION_NAME}")
+        compose.onNodeWithTag("release-detail-${BuildConfig.VERSION_NAME}").assertExists()
+        compose.onNodeWithTag("release-notes-list").performScrollToNode(hasTestTag("release-version-0.18.3"))
+        compose.onNodeWithTag("release-version-0.18.3").performClick()
+        compose.onNodeWithTag("release-detail-0.18.3").assertExists()
+        compose.onNodeWithText("阅读长回答时点输入区把手收起，再点细栏展开。", substring = false).assertExists()
+        InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
+        compose.waitForIdle()
+        compose.onNodeWithTag("release-notes-page").assertDoesNotExist()
+        compose.onNodeWithText("更新日志").assertExists()
+        compose.onNodeWithText("网络暂时不可用").assertExists()
+        compose.runOnIdle { assertEquals(0, checks) }
+        compose.onNodeWithText("检查更新").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, checks) }
+    }
+
+    @Test fun releaseNotesIncludeAvailableVersionAlongsideOfflineHistoryAtLargeFont() {
+        val futureVersion = "0.${BuildConfig.VERSION_CODE + 1}.0"
+        val latest = ArenaUpdateInfo(BuildConfig.VERSION_CODE + 1, futureVersion, "https://example.test/arena.apk", 100, "", "2026-10-03", "下一版的体验说明")
+        var installs = 0
+        compose.setContent {
+            val base = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(base.density, 1.3f)) { ArenaTheme {
+                Box(Modifier.width(320.dp).fillMaxHeight()) {
+                    SimpleSettingsPage(ArenaService.defaultMembers, false, {}, {}, {}, {}, {}, {}, null, {},
+                        ArenaUpdateResult.Available(latest), false, {}, { installs++ }, null, {}, null)
+                }
+            } }
+        }
+        compose.onNodeWithText("更多设置").performClick()
+        compose.onNodeWithText("版本更新").performScrollTo().performClick()
+        compose.onNodeWithText("更新日志").performScrollTo().performClick()
+        compose.onNodeWithTag("release-version-$futureVersion").assertIsDisplayed()
+        compose.onNodeWithText("下一版的体验说明", substring = true).assertExists()
+        compose.onNodeWithTag("release-notes-list").performScrollToNode(hasTestTag("release-version-${BuildConfig.VERSION_NAME}"))
+        compose.onNodeWithTag("release-version-${BuildConfig.VERSION_NAME}").performClick()
+        compose.onNodeWithTag("release-detail-${BuildConfig.VERSION_NAME}").assertExists()
+        compose.onNodeWithTag("release-notes-list").performScrollToNode(hasTestTag("release-version-0.1.0"))
+        compose.onNodeWithTag("release-version-0.1.0").performClick()
+        compose.onNodeWithTag("release-detail-0.1.0").assertExists()
+        compose.runOnIdle { assertEquals(0, installs) }
+        compose.onNodeWithContentDescription("返回设置").performClick()
+        compose.onNodeWithText("安装 v$futureVersion").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, installs) }
+    }
+
     @Test fun settingsOnlyShowsTwoFrequentItemsUntilExpanded() {
         compose.setContent { ArenaTheme {
             SimpleSettingsPage(ArenaService.defaultMembers, false, {}, {}, {}, {}, {}, {}, null, {},
@@ -307,8 +362,10 @@ class ArenaSimpleInstrumentedTest {
         var collapsed by mutableStateOf(false)
         var stops = 0
         var busy by mutableStateOf(false)
+        var text by mutableStateOf("")
+        var attachment by mutableStateOf<AttachmentDraft?>(null)
         compose.setContent { ArenaTheme {
-            ModeComposer(RoundMode.ITERATE, {}, "", {}, ready = true, busy = busy, attachmentDraft = null, onChooseAttachments = null,
+            ModeComposer(RoundMode.ITERATE, {}, text, { text = it }, ready = true, busy = busy, attachmentDraft = attachment, onChooseAttachments = null,
                 attachmentNotice = null, scope = "发给本轮成功的 3 家 AI", options = {}, preset = null, onStop = { stops++ }, onSend = {},
                 collapsed = collapsed, onCollapsedChange = { collapsed = it })
         } }
@@ -324,6 +381,14 @@ class ArenaSimpleInstrumentedTest {
         compose.onNodeWithContentDescription("展开提问区").performClick()
         compose.runOnIdle { assertFalse(collapsed) }
         compose.onNodeWithText("工作流").assertIsDisplayed()
+        compose.runOnIdle {
+            text = "继续追问的草稿"
+            attachment = AttachmentDraft(listOf(ArenaAttachment("collapse-file", "说明.txt", "text/plain", 12, "a".repeat(64))))
+        }
+        compose.onNodeWithContentDescription("收起提问区").performClick()
+        compose.onNodeWithText("独立迭代 · 有草稿 · 1 个附件").assertIsDisplayed()
+        compose.onNodeWithContentDescription("展开提问区").performClick()
+        compose.onNodeWithText("继续追问的草稿").assertIsDisplayed()
     }
 
     @Test fun quickFollowUpFillsTheComposerWithEditableText() {
