@@ -160,7 +160,12 @@ internal fun ModeComposer(
             Row(Modifier.fillMaxWidth().heightIn(min = 52.dp).clickable { onCollapsedChange(false) }
                 .semantics { contentDescription = "展开提问区" }.testTag("composer-expand")
                 .padding(start = 18.dp, end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(if (busy) "${mode.label} · 本轮进行中" else "${mode.label} · 点这里继续提问", Modifier.weight(1f),
+                val pending = buildList {
+                    if (text.isNotBlank()) add("有草稿")
+                    attachmentDraft?.attachments?.size?.takeIf { it > 0 }?.let { add("$it 个附件") }
+                }
+                Text(if (busy) "${mode.label} · 本轮进行中" else
+                    "${mode.label} · ${pending.takeIf { it.isNotEmpty() }?.joinToString(" · ") ?: "点这里继续提问"}", Modifier.weight(1f),
                     style = MaterialTheme.typography.labelLarge, color = colors.muted)
                 if (busy) TextButton(onClick = onStop, modifier = Modifier.heightIn(min = 48.dp)) { Text("停止", color = colors.error) }
                 ArenaIcon(R.drawable.ic_chevron_right, Modifier.padding(12.dp).rotate(-90f), tint = colors.muted, size = 20.dp)

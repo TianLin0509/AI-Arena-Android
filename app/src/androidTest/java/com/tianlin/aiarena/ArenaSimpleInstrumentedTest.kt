@@ -307,8 +307,10 @@ class ArenaSimpleInstrumentedTest {
         var collapsed by mutableStateOf(false)
         var stops = 0
         var busy by mutableStateOf(false)
+        var text by mutableStateOf("")
+        var attachment by mutableStateOf<AttachmentDraft?>(null)
         compose.setContent { ArenaTheme {
-            ModeComposer(RoundMode.ITERATE, {}, "", {}, ready = true, busy = busy, attachmentDraft = null, onChooseAttachments = null,
+            ModeComposer(RoundMode.ITERATE, {}, text, { text = it }, ready = true, busy = busy, attachmentDraft = attachment, onChooseAttachments = null,
                 attachmentNotice = null, scope = "发给本轮成功的 3 家 AI", options = {}, preset = null, onStop = { stops++ }, onSend = {},
                 collapsed = collapsed, onCollapsedChange = { collapsed = it })
         } }
@@ -324,6 +326,14 @@ class ArenaSimpleInstrumentedTest {
         compose.onNodeWithContentDescription("展开提问区").performClick()
         compose.runOnIdle { assertFalse(collapsed) }
         compose.onNodeWithText("工作流").assertIsDisplayed()
+        compose.runOnIdle {
+            text = "继续追问的草稿"
+            attachment = AttachmentDraft(listOf(ArenaAttachment("collapse-file", "说明.txt", "text/plain", 12, "a".repeat(64))))
+        }
+        compose.onNodeWithContentDescription("收起提问区").performClick()
+        compose.onNodeWithText("独立迭代 · 有草稿 · 1 个附件").assertIsDisplayed()
+        compose.onNodeWithContentDescription("展开提问区").performClick()
+        compose.onNodeWithText("继续追问的草稿").assertIsDisplayed()
     }
 
     @Test fun quickFollowUpFillsTheComposerWithEditableText() {
