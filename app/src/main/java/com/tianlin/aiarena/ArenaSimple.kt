@@ -169,7 +169,7 @@ internal fun ModeComposer(
         }
         Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = if (onCollapsedChange != null) 0.dp else 10.dp, bottom = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (onCollapsedChange != null) Box(Modifier.fillMaxWidth().heightIn(min = 36.dp).clickable { onCollapsedChange(true) }
+            if (onCollapsedChange != null) Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onCollapsedChange(true) }
                 .semantics { contentDescription = "收起提问区" }.testTag("composer-collapse"), contentAlignment = Alignment.Center) {
                 // 一条把手 + 向下的箭头：一看就知道能往下收。
                 Row(verticalAlignment = Alignment.CenterVertically) {
