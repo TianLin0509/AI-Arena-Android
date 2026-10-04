@@ -912,14 +912,23 @@ class ArenaParallelWebViewInstrumentedTest {
             val done = CountDownLatch(1)
             val ready = AtomicBoolean(true)
             val method = ArenaWebViewPool::class.java.declaredMethods.single { it.name == "waitForFreshPage" }.apply { isAccessible = true }
+            var deadline = 0L
             onMain {
                 val generation = (field(pool, "navigationGenerations") as Map<*, *>)[ArenaService.DOUBAO]
-                method.invoke(pool, ArenaService.DOUBAO, view, generation, SystemClock.elapsedRealtime() + 300L, "",
+                deadline = ArenaForeground.elapsed() + 300L
+                method.invoke(pool, ArenaService.DOUBAO, view, generation, deadline, "",
                     { value: Boolean -> ready.set(value); done.countDown() })
             }
             assertTrue(view.probed.await(2, TimeUnit.SECONDS))
-            Thread.sleep(500)
-            onMain { view.held?.onReceiveValue("true") }
+            waitUntil("foreground fresh-editor deadline expired", timeoutMs = 2_000L) {
+                var expired = false
+                onMain { expired = ArenaForeground.elapsed() >= deadline }
+                expired
+            }
+            onMain {
+                assertTrue("The foreground probe deadline must have expired before the late callback", ArenaForeground.elapsed() >= deadline)
+                view.held?.onReceiveValue("true")
+            }
             assertTrue(done.await(1, TimeUnit.SECONDS))
             assertFalse("An expired probe cannot grant permission to send", ready.get())
         }
