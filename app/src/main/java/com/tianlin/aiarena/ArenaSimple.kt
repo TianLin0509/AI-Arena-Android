@@ -99,10 +99,23 @@ internal fun InputBar(
     text: String, onChange: (String) -> Unit, hint: String, enabled: Boolean, busy: Boolean, onSend: () -> Unit, onStop: () -> Unit,
     attachmentDraft: AttachmentDraft?, onChooseAttachments: (() -> Unit)?, attachmentNotice: String?, sendDescription: String = "发送问题",
 ) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        InputAttachments(attachmentDraft, attachmentNotice, enabled, busy)
+        ComposerInputRow(text, onChange, hint, enabled, busy, onSend, onStop, attachmentDraft, onChooseAttachments, sendDescription)
+    }
+}
+
+/** 附件与提示可放入上方滚动区，编辑行不会被附件列表挤出视口。 */
+@Composable
+private fun InputAttachments(attachmentDraft: AttachmentDraft?, attachmentNotice: String?, enabled: Boolean, busy: Boolean,
+                             scrollList: Boolean = true) {
+    if (attachmentDraft == null || (attachmentDraft.attachments.isEmpty() && attachmentDraft.error == null && !attachmentDraft.picking)) return
     val colors = ArenaStyle.colors
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         if (attachmentDraft != null && attachmentDraft.attachments.isNotEmpty()) {
-            Column(Modifier.fillMaxWidth().heightIn(max = 140.dp).verticalScroll(rememberScrollState())) {
+            val listModifier = if (scrollList) Modifier.fillMaxWidth().heightIn(max = 140.dp).verticalScroll(rememberScrollState())
+                else Modifier.fillMaxWidth()
+            Column(listModifier) {
                 attachmentDraft.attachments.forEach { file ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(file.name, Modifier.weight(1f).padding(start = 10.dp), maxLines = 1,
@@ -118,7 +131,16 @@ internal fun InputBar(
         }
         attachmentDraft?.error?.let { SimpleNotice(it) }
         if (attachmentDraft?.picking == true) Text("正在添加附件…", Modifier.padding(10.dp), style = MaterialTheme.typography.labelSmall)
-        Row(verticalAlignment = Alignment.Bottom) {
+    }
+}
+
+@Composable
+private fun ComposerInputRow(
+    text: String, onChange: (String) -> Unit, hint: String, enabled: Boolean, busy: Boolean, onSend: () -> Unit, onStop: () -> Unit,
+    attachmentDraft: AttachmentDraft?, onChooseAttachments: (() -> Unit)?, sendDescription: String,
+) {
+    val colors = ArenaStyle.colors
+    Row(verticalAlignment = Alignment.Bottom) {
             Surface(Modifier.weight(1f), color = colors.card, shape = RoundedCornerShape(24.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (onChooseAttachments != null) SimpleIcon(R.drawable.ic_add, "添加照片或文件", onChooseAttachments,
@@ -138,7 +160,6 @@ internal fun InputBar(
                         tint = if (busy || enabled) colors.onAccent else colors.muted, size = 22.dp)
                 }
             }
-        }
     }
 }
 
@@ -174,20 +195,25 @@ internal fun ModeComposer(
         }
         Column(Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = if (onCollapsedChange != null) 0.dp else 10.dp, bottom = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (onCollapsedChange != null) Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onCollapsedChange(true) }
-                .semantics { contentDescription = "收起提问区" }.testTag("composer-collapse"), contentAlignment = Alignment.Center) {
-                // 一条把手 + 向下的箭头：一看就知道能往下收。
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(width = 36.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(colors.border))
+            // 先为编辑与发送保留高度；键盘缩小视口时，上方设置滚动，不能挤掉正在输入的文字。
+            Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState())
+                .testTag("composer-settings"), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (onCollapsedChange != null) Box(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onCollapsedChange(true) }
+                    .semantics { contentDescription = "收起提问区" }.testTag("composer-collapse"), contentAlignment = Alignment.Center) {
+                    // 一条把手 + 向下的箭头：一看就知道能往下收。
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(width = 36.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(colors.border))
+                    }
+                    ArenaIcon(R.drawable.ic_chevron_right, Modifier.align(Alignment.CenterEnd).padding(end = 4.dp).rotate(90f), tint = colors.muted, size = 18.dp)
                 }
-                ArenaIcon(R.drawable.ic_chevron_right, Modifier.align(Alignment.CenterEnd).padding(end = 4.dp).rotate(90f), tint = colors.muted, size = 18.dp)
+                ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
+                options()
+                preset?.invoke()
+                Text(scope, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                InputAttachments(attachmentDraft, attachmentNotice, ready, busy, scrollList = false)
             }
-            ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
-            options()
-            preset?.invoke()
-            Text(scope, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)
-            InputBar(text, onText, mode.placeholder, ready, busy, onSend, onStop, attachmentDraft, onChooseAttachments,
-                attachmentNotice, sendDescription = mode.sendLabel)
+            ComposerInputRow(text, onText, mode.placeholder, ready, busy, onSend, onStop, attachmentDraft, onChooseAttachments,
+                sendDescription = mode.sendLabel)
         }
     }
 }
