@@ -44,7 +44,7 @@ class ArenaSessionController(
 
     fun waitingProgress(service: ArenaService, nowElapsedMillis: Long): ArenaWaitProgress? =
         runs[service]?.let { run ->
-            val answerStarted = recoveryExecution?.takeIf { it.service == service && it.requestId == run.requestId }?.startedAtElapsedMillis
+            val answerStarted = recoveries[service]?.takeIf { it.requestId == run.requestId }?.startedAtElapsedMillis
                 ?: pollStates[service]?.takeIf { it.requestId == run.requestId }?.startedAtElapsedMillis
             progressTracker.describe(service, run, nowElapsedMillis, timing, pool.sendProgress(service, run.requestId),
                 answerStarted?.plus(timing.responseTimeoutMillis))
@@ -130,7 +130,18 @@ class ArenaSessionController(
     private val pollStates = mutableMapOf<ArenaService, PollState>()
     private var activeExecution: RoundExecution? = null
     private var summaryExecution: SummaryExecution? = null
-    private var recoveryExecution: RecoveryExecution? = null
+    /** 轮次结束后的单家补救（重新提取 / 重新发送 / 换人接手）；每家一条，彼此独立，可以同时进行。 */
+    private val recoveries = mutableMapOf<ArenaService, RecoveryExecution>()
+
+    /**
+     * 「换人」只从下一轮起生效时记在这里：旧成员 → 新成员。开下一轮时替换成员表并清空。
+     * 旧成员本轮已完成 / 已跳过 / 整轮被停止时走这条，本轮不自动发送。
+     */
+    private val pendingSwapState = mutableStateMapOf<ArenaService, ArenaService>()
+    val pendingSwaps: Map<ArenaService, ArenaService> get() = pendingSwapState
+
+    /** 本轮中途换上来的新成员：网页里没有这场讨论的上下文，重发也要开新对话。 */
+    private var roundNewcomers: Set<ArenaService> = emptySet()
     private var sessionEpoch = 0L
     private var requestSequence = 0L
     private var sessionId = ""
@@ -152,10 +163,11 @@ class ArenaSessionController(
         get() = stage == SessionStage.INITIAL ||
             stage == SessionStage.ITERATION ||
             stage == SessionStage.DEBATE ||
+            stage == SessionStage.INSPIRE ||
             summary.phase == ParticipantPhase.SENDING ||
             summary.phase == ParticipantPhase.WAITING ||
             summary.phase == ParticipantPhase.STREAMING ||
-            recoveryExecution != null
+            recoveries.isNotEmpty()
 
     val completedCount: Int
         get() = runs.values.count { it.phase == ParticipantPhase.COMPLETE }
@@ -171,6 +183,7 @@ class ArenaSessionController(
                     ?: lastRoundPrompts.values.firstOrNull { it.isNotBlank() }
                     ?: "本轮问题未保存"
                 RoundKind.DEBATE -> originalQuestion + (guidance?.let { "\n\n本轮讨论要求：$it" } ?: "")
+                RoundKind.INSPIRE -> originalQuestion + (guidance?.let { "\n\n本轮激发要求：$it" } ?: "")
                 else -> originalQuestion
             }
         }
@@ -204,6 +217,8 @@ class ArenaSessionController(
         lastRoundAttachments = emptyList()
         lastRoundPrompts = emptyMap()
         conversationUrls.clear()
+        pendingSwapState.clear()
+        roundNewcomers = emptySet()
         currentRoundContextNotice = ""
         roundNumber = 0
         originalQuestion = normalizedQuestion
@@ -216,6 +231,7 @@ class ArenaSessionController(
             guidance = "",
             attachments = attachments,
             relayOrder = relayOrder,
+            question = normalizedQuestion,
         )
     }
 
@@ -235,18 +251,119 @@ class ArenaSessionController(
             sessionMessage = "本轮 Prompt 超过 ${ArenaLimits.MAX_GUIDANCE_CHARS} 字，请缩短后重试"
             return false
         }
-        val completed = completedResponses()
-        val services = ArenaService.entries.filter { it in completed.keys }
+        val services = nextRoundMembers()
+        val newcomers = nextRoundNewcomers(services)
         // 逃生通道：其他几家都被跳过时，剩下的一家仍可继续独立追问；接力至少要两家。
         val needed = if (relayOrder != null) ArenaService.MIN_MEMBERS else 1
         if (services.size < needed) {
             sessionMessage = if (services.isEmpty()) "本轮没有答完的成员，请先重发或重新读取" else "工作流至少需要 ${ArenaService.MIN_MEMBERS} 家答完"
             return false
         }
-        val prompts = services.associateWith { newPrompt }
+        val prompts = services.associateWith { if (it in newcomers) RoundMaterials.forNewcomer(newPrompt, originalQuestion) else newPrompt }
         return startRound(RoundKind.ITERATION, services, prompts, answerMode, newPrompt, attachments,
-            relayOrder = relayOrder?.filter { it in services })
+            relayOrder = relayOrder?.filter { it in services }, newcomers = newcomers, question = newPrompt)
     }
+
+    /**
+     * 回答页的成员标签：成员表，再把本轮被换下、仍有记录的旧成员排在接替它的人前面，旧回答还能看。
+     */
+    val roundTabs: List<ArenaService>
+        get() {
+            val out = mutableListOf<ArenaService>()
+            fun predecessors(member: ArenaService, seen: Set<ArenaService>): List<ArenaService> =
+                ArenaService.entries.filter { old ->
+                    old !in sessionServices && old !in seen && runs[old]?.let { it.replacedBy == member && it.requestId.isNotBlank() } == true
+                }.flatMap { old -> predecessors(old, seen + old) + old }
+            sessionServices.forEach { member ->
+                predecessors(member, setOf(member)).forEach { if (it !in out) out += it }
+                if (member !in out) out += member
+            }
+            return out
+        }
+
+    /** 下一轮会参加的成员：本轮回答被采用的成员（待换人已替换）+ 新换上来的成员。界面的人数、接力顺序也用它。 */
+    fun nextRoundMembers(): List<ArenaService> = RoundMaterials.nextParticipants(sessionServices, runs, pendingSwapState)
+
+    private fun nextRoundNewcomers(participants: List<ArenaService>): Set<ArenaService> =
+        pendingSwapState.filterKeys { it in sessionServices }.values.filter { it in participants }.toSet()
+
+    /** 观点讨论 / 互相激发给某一位组装材料；新成员在材料缺原问题时补一句。超出上下文预算返回 null。 */
+    private fun composeExchangePrompt(
+        kind: RoundKind,
+        style: DebateStyle?,
+        target: ArenaService,
+        base: Map<ArenaService, String>,
+        index: Int,
+        instruction: String,
+        newcomer: Boolean,
+    ): BudgetedPrompt? {
+        val inspire = kind == RoundKind.INSPIRE
+        return PromptBudgetPolicy.fit(
+            target,
+            initialQuoteLimit = if (inspire) ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS else ArenaLimits.MAX_QUOTED_RESPONSE_CHARS,
+        ) { quoteLimit ->
+            val prompt = if (inspire) {
+                InspirePromptBuilder.build(target, base, index, instruction, quoteLimit, presets, originalQuestion)
+            } else {
+                DebatePromptBuilder.build(originalQuestion, target, base, index, instruction, quoteLimit, style ?: DebateStyle.DEBATE, presets)
+            }
+            if (newcomer) RoundMaterials.forNewcomer(prompt, originalQuestion) else prompt
+        }
+    }
+
+    /** 同一种讨论方式 / 互相激发，在 [beforeRound] 之前已经做过几轮。 */
+    private fun exchangeIndex(kind: RoundKind, style: DebateStyle?, beforeRound: Int): Int =
+        history.count { round ->
+            round.number < beforeRound && round.kind == kind &&
+                (kind != RoundKind.DEBATE || (round.style ?: DebateStyle.DEBATE) == (style ?: DebateStyle.DEBATE))
+        } + 1
+
+    /** 观点讨论与互相激发共用：每位收到别人的回答（不含自己的），新成员收到全部。 */
+    private fun startExchange(
+        kind: RoundKind,
+        answerMode: AnswerMode,
+        guidance: String,
+        attachments: List<ArenaAttachment>,
+        style: DebateStyle?,
+    ): Boolean {
+        if (isBusy || stage != SessionStage.READY) return false
+        val base = completedResponses()
+        if (base.size < 2) {
+            sessionMessage = "至少要有 ${ArenaService.MIN_MEMBERS} 份完整回答才能${kind.displayName}；先在成员卡片上重新提取或重新发送，或跳过不完整的"
+            return false
+        }
+        val index = exchangeIndex(kind, style, roundNumber + 1)
+        val instruction = AttachmentPromptPolicy.withDefault(guidance, attachments).take(ArenaLimits.MAX_GUIDANCE_CHARS)
+        val services = nextRoundMembers()
+        val newcomers = nextRoundNewcomers(services)
+        val prompts = linkedMapOf<ArenaService, String>()
+        var compressedCount = 0
+        services.forEach { target ->
+            val budgeted = composeExchangePrompt(kind, style, target, base, index, instruction, target in newcomers) ?: run {
+                sessionMessage = "${target.displayName} 上下文超过 ${PromptBudgetPolicy.budgetFor(target)} 字，请缩短原问题或开始新问题"
+                return false
+            }
+            prompts[target] = budgeted.text
+            if (budgeted.compressed) compressedCount += 1
+        }
+        val started = startRound(kind, services, prompts, answerMode, instruction, attachments, style = style,
+            newcomers = newcomers, question = instruction, baseResponses = base, roundIndex = index)
+        if (started && compressedCount > 0) {
+            currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
+            sessionMessage += " · $currentRoundContextNotice"
+        }
+        return started
+    }
+
+    /**
+     * 互相激发：每位收到其他成员上一轮的完整回答当灵感，各自产出更好的独立答案，不追求一致。
+     * 规则同观点讨论：至少两份完整回答，独立计轮，用户补充附在预设之后。
+     */
+    fun startInspire(
+        answerMode: AnswerMode = AnswerMode.PARALLEL,
+        guidance: String = "",
+        attachments: List<ArenaAttachment> = emptyList(),
+    ): Boolean = startExchange(RoundKind.INSPIRE, answerMode, guidance, attachments, style = null)
 
     /** 观点讨论：把其他 AI 的回答转给每一家让它们互相评论。各家平等；把大家收拢成一条的活交给「队长总结」。 */
     fun startDebate(
@@ -254,41 +371,7 @@ class ArenaSessionController(
         guidance: String = "",
         attachments: List<ArenaAttachment> = emptyList(),
         style: DebateStyle = DebateStyle.DEBATE,
-    ): Boolean {
-        if (isBusy || stage != SessionStage.READY) return false
-        val responses = completedResponses()
-        if (responses.size < 2) return false
-        val debateIndex = history.count { it.kind == RoundKind.DEBATE && (it.style ?: DebateStyle.DEBATE) == style } + 1
-        val instruction = AttachmentPromptPolicy.withDefault(guidance, attachments).take(ArenaLimits.MAX_GUIDANCE_CHARS)
-        val services = ArenaService.entries.filter { it in responses.keys }
-        val prompts = linkedMapOf<ArenaService, String>()
-        var compressedCount = 0
-        services.forEach { target ->
-            val budgeted = PromptBudgetPolicy.fit(target) { quoteLimit ->
-                DebatePromptBuilder.build(
-                    originalQuestion = originalQuestion,
-                    target = target,
-                    responses = responses,
-                    debateIndex = debateIndex,
-                    guidance = instruction,
-                    quoteLimit = quoteLimit,
-                    style = style,
-                    presets = presets,
-                )
-            } ?: run {
-                sessionMessage = "${target.displayName} 上下文超过 ${PromptBudgetPolicy.budgetFor(target)} 字，请缩短原问题或开始新问题"
-                return false
-            }
-            prompts[target] = budgeted.text
-            if (budgeted.compressed) compressedCount += 1
-        }
-        val started = startRound(RoundKind.DEBATE, services, prompts, answerMode, instruction, attachments, style = style)
-        if (started && compressedCount > 0) {
-            currentRoundContextNotice = "已压缩 $compressedCount 家的引用回答"
-            sessionMessage += " · $currentRoundContextNotice"
-        }
-        return started
-    }
+    ): Boolean = startExchange(RoundKind.DEBATE, answerMode, guidance, attachments, style)
 
     /**
      * 「队长总结」：[preferredServices] 里第一位答完了的成员当队长（界面按用户选的队长排在最前），
@@ -403,23 +486,40 @@ class ArenaSessionController(
     }
 
     private fun startNextFailedRecovery(): Boolean {
+        while (recoveryQueue.isNotEmpty() && runs[recoveryQueue.first().first]?.skipped == true) recoveryQueue.removeFirst()
         if (isBusy || recoveryQueue.isEmpty()) return false
         val (service, resend) = recoveryQueue.removeFirst()
         return startRecovery(service, if (resend) lastRoundPrompts[service] else null, resend)
     }
 
-    fun retrySend(service: ArenaService): Boolean {
-        if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+    /** 旧名字：等同于 [resend]。 */
+    fun retrySend(service: ArenaService): Boolean = resend(service)
+
+    /**
+     * 逃生动作「重新发送」：把本轮这位成员该收到的内容再发一次。任何时候都可以点：
+     * - 本轮进行中：只重发这一家，其他成员照常；工作流里还在排队的成员立即用当下已有的前面回答组装并发送。
+     * - 本轮结束后：单家补救，可以和别家的补救、队长总结同时进行（队长本人正在总结时除外）。
+     * 已收到的回答存进「之前的回答」，不会丢。是否先弹确认由界面按 [MemberActionPolicy.resendNeedsConfirm] 决定。
+     */
+    fun resend(service: ArenaService): Boolean {
+        if (summaryOccupies(service)) return false
+        activeRound()?.let { execution ->
+            if (service !in execution.services) {
+                sessionMessage = "${service.displayName} 本轮没有任务；要让它参加请用「换人」"
+                return false
+            }
+            return resendInRound(execution, service)
+        }
+        if (stage != SessionStage.READY || (service !in sessionServices && runs[service]?.requestId.isNullOrBlank())) return false
         if (currentRoundRelay && service in relayOrder && service != relayOrder.first()) {
             // A member stopped or skipped before its turn still gets the question plus the earlier answers.
-            val question = lastRoundPrompts[relayOrder.first()]
+            val question = currentRelayQuestion()
             if (!question.isNullOrBlank()) {
-                val earlier = LinkedHashMap<ArenaService, String>()
-                relayOrder.takeWhile { it != service }.forEach { previous ->
-                    runs[previous]?.takeIf { it.phase == ParticipantPhase.COMPLETE && it.response.isNotBlank() }?.let { earlier[previous] = it.response }
-                }
+                val earlier = RoundMaterials.earlierAnswers(relayOrder, service, runs)
                 val budgeted = PromptBudgetPolicy.fit(service, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
-                    RelayPromptBuilder.build(question, earlier, limit, presets)
+                    RelayPromptBuilder.build(question, earlier, limit, presets).let {
+                        if (service in roundNewcomers) RoundMaterials.forNewcomer(it, originalQuestion) else it
+                    }
                 } ?: run {
                     sessionMessage = "工作流材料超过 ${service.displayName} 的上下文预算（${PromptBudgetPolicy.budgetFor(service)} 字），没有发送"
                     return false
@@ -432,7 +532,30 @@ class ArenaSessionController(
             sessionMessage = "缺少 ${service.displayName} 的原始发送内容，可重新开始问题"
             return false
         }
+        stopRecovery(service)
         return startRecovery(service, prompt, resend = true)
+    }
+
+    /** 工作流这一轮的问题本身（不含新成员补的原问题）。 */
+    private fun currentRelayQuestion(): String? = when (currentRoundKind) {
+        RoundKind.INITIAL -> originalQuestion
+        else -> history.lastOrNull { it.number == roundNumber }?.guidance?.takeIf { it.isNotBlank() }
+    } ?: relayOrder.firstOrNull()?.let { lastRoundPrompts[it] }
+
+    /** 正在进行、且仍有效的一轮；没有则 null。 */
+    private fun activeRound(): RoundExecution? = activeExecution?.takeIf { isActive(it) }
+
+    /** 队长正在用这家网页写总结：同一网页上不能再跑别的自动化。 */
+    private fun summaryOccupies(service: ArenaService): Boolean {
+        val active = summaryExecution?.takeIf { isSummaryActive(it) } ?: return false
+        if (active.judge != service) return false
+        sessionMessage = "${service.displayName} 正在当队长写总结，等总结完成或停止后再操作"
+        return true
+    }
+
+    /** 停掉这一家正在进行的单家补救（不影响别家）。 */
+    private fun stopRecovery(service: ArenaService) {
+        if (recoveries.remove(service) != null) pool.cancelAutomation(service)
     }
 
     /** 新对话因网页输入框里的草稿停下时的草稿原文，供界面原样展示给用户确认。 */
@@ -468,20 +591,84 @@ class ArenaSessionController(
         history[index] = history[index].copy(summary = done)
     }
 
-    fun retryExtraction(service: ArenaService): Boolean {
-        if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
+    /** 旧名字：等同于 [reextract]。 */
+    fun retryExtraction(service: ArenaService): Boolean = reextract(service)
+
+    /**
+     * 逃生动作「重新提取」：只读，从这家网页重新读本轮回答，绝不重发。正在回答时也能点：重新开始读取，
+     * 不打断网页生成。网页最新提问对不上时由网页池按本轮请求号核对，读不到就明确报错，不会读别的问题。
+     */
+    fun reextract(service: ArenaService): Boolean {
+        if (summaryOccupies(service)) return false
         val run = runs[service] ?: return false
+        activeRound()?.let { execution ->
+            if (service !in execution.services) {
+                sessionMessage = "${service.displayName} 本轮没有任务，没有可提取的回答"
+                return false
+            }
+            return reextractInRound(execution, service, run)
+        }
+        if (stage != SessionStage.READY) return false
         if (run.requestId.isBlank()) {
             sessionMessage = "${service.displayName} 没有可重新提取的请求"
             return false
         }
+        if (!MemberActionPolicy.canReextract(run)) {
+            sessionMessage = "${service.displayName} 本轮问题没有发出去，没有可提取的回答；可以点「重新发送」"
+            return false
+        }
+        recoveries[service]?.let { running ->
+            if (running.resend && runs[service]?.phase in setOf(ParticipantPhase.QUEUED, ParticipantPhase.SENDING)) {
+                sessionMessage = "${service.displayName} 正在重新发送，发出后会自动读取回答"
+                return false
+            }
+            recoveries.remove(service)
+        }
         return startRecovery(service, prompt = null, resend = false)
     }
 
-    fun skipService(service: ArenaService): Boolean {
-        if (isBusy || stage != SessionStage.READY || service !in sessionServices) return false
-        val current = runs[service] ?: return false
-        val skipped = current.copy(phase = ParticipantPhase.ERROR, detail = "已跳过本轮")
+    private fun reextractInRound(execution: RoundExecution, service: ArenaService, run: ParticipantRun): Boolean {
+        if (run.phase == ParticipantPhase.QUEUED || run.phase == ParticipantPhase.SENDING) {
+            sessionMessage = "${service.displayName} 还在${if (run.phase == ParticipantPhase.QUEUED) "准备" else "发送"}，发出后会自动读取回答"
+            return false
+        }
+        if (!MemberActionPolicy.canReextract(run)) {
+            sessionMessage = "${service.displayName} 本轮问题没有发出去，没有可提取的回答；可以点「重新发送」"
+            return false
+        }
+        execution.skipped -= service
+        execution.dispatchedServices += service
+        if (run.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank()) execution.reextractBackups[service] = run
+        runs[service] = run.copy(phase = ParticipantPhase.WAITING, skipped = false, stopped = false, detail = "正在重新提取")
+        sessionMessage = "正在重新提取 ${service.displayName} 的回答，其他成员照常进行"
+        startPolling(execution, service, run.requestId)
+        schedulePersist()
+        return true
+    }
+
+    /** 旧名字：等同于 [skip]。 */
+    fun skipService(service: ArenaService): Boolean = skip(service)
+
+    /** 旧名字：等同于 [skip]。 */
+    fun skipRunning(service: ArenaService): Boolean = skip(service)
+
+    /**
+     * 逃生动作「跳过」：本轮不再等它，之后的讨论 / 激发 / 总结 / 工作流都不带它。任何状态都可点：
+     * 正在回答时只停这一家，其他照常；已完成的回答也可跳过（本轮不采用，文字保留）。之后点重新提取 / 重新发送可恢复。
+     */
+    fun skip(service: ArenaService): Boolean {
+        val run = runs[service] ?: return false
+        if (run.skipped) {
+            sessionMessage = "${service.displayName} 本轮已经跳过；要恢复请点「重新提取」或「重新发送」"
+            return false
+        }
+        activeRound()?.let { execution ->
+            if (service !in execution.services) return false
+            return skipInRound(execution, service, run)
+        }
+        if (stage != SessionStage.READY || run.requestId.isBlank()) return false
+        stopRecovery(service)
+        val skipped = run.copy(phase = ParticipantPhase.ERROR, skipped = true, detail = "已跳过本轮")
         runs[service] = skipped
         updateLatestRoundResult(service, skipped)
         sessionMessage = "已跳过 ${service.displayName}，其他结果仍保留"
@@ -490,54 +677,220 @@ class ArenaSessionController(
     }
 
     /**
-     * 逃生通道：本轮进行中某一家明显卡住或出错时，只停掉这一家，其他成员照常进行、照常收尾。
-     * 停掉的是 App 这边的等待和网页自动化；网页里可能仍在生成，本轮结束后可「重新读取」或「重发」把它拉回来。
-     * 跳过的成员不参加之后基于本轮的讨论、工作流和总结（这些只发给本轮答完的成员）。
+     * 本轮进行中跳过一家：只停掉这一家，其他成员照常进行、照常收尾。
+     * 停掉的是 App 这边的等待和网页自动化；网页里可能仍在生成，之后可「重新提取」或「重新发送」把它拉回来。
      */
-    fun skipRunning(service: ArenaService): Boolean {
-        val execution = activeExecution?.takeIf { isActive(it) } ?: return false
-        if (service !in execution.services || service in execution.skipped) return false
-        val run = runs.getValue(service)
-        if (run.phase.isTerminal()) return false
+    private fun skipInRound(execution: RoundExecution, service: ArenaService, run: ParticipantRun): Boolean {
         execution.skipped += service
+        execution.reextractBackups.remove(service)
+        pollStates.remove(service)
+        if (run.phase.isTerminal()) {
+            runs[service] = run.copy(phase = ParticipantPhase.ERROR, skipped = true, detail = "已跳过本轮")
+            sessionMessage = "已跳过 ${service.displayName}，本轮不采用它的回答"
+            schedulePersist()
+            return true
+        }
         pool.cancelAutomation(service)
+        execution.dispatchedServices += service
         if (execution.answerMode == AnswerMode.PARALLEL) {
-            execution.dispatchedServices += service
-            execution.dispatchComplete = execution.dispatchedServices.size == execution.services.size
+            execution.dispatchComplete = execution.dispatchedServices.containsAll(execution.services)
         }
         sessionMessage = "已跳过 ${service.displayName}，其他成员照常进行"
         markTerminal(execution, service, run.copy(
             phase = ParticipantPhase.ERROR,
+            skipped = true,
             detail = if (run.phase == ParticipantPhase.QUEUED) "已跳过，这一家本轮没有发送"
             else "已跳过本轮；网页可能仍在生成，可稍后重新读取",
         ))
         return true
     }
 
+    /** 换人对话框用：这位成员现在换人，是本轮马上接手还是只从下一轮起。 */
+    fun swapTiming(service: ArenaService): SwapTiming = MemberActionPolicy.swapTiming(runs[service] ?: ParticipantRun())
+
+    /** 可以换上来的 AI：不在成员表里、也没有被别的位置预约。 */
+    fun swapCandidates(from: ArenaService): List<ArenaService> = ArenaService.entries.filter { candidate ->
+        candidate !in sessionServices && pendingSwapState.none { (key, value) -> value == candidate && key != from } &&
+            // 本轮刚被换下的成员本轮不再换回来（它这一轮的任务已作废），下一轮起可以。
+            runs[candidate]?.let { it.replacedBy != null && it.requestId.isNotBlank() } != true
+    }
+
+    /**
+     * 逃生动作「换人」：选另一家 AI 接替 [from] 的位置，成员数不变。
+     * - [from] 本轮还在排队 / 进行中 / 出错：[to] 立刻接手本轮，收到与该位置相同的材料（讨论、激发按新成员重新组装，
+     *   别人的回答全给它；工作流在同一位置接力），[from] 记为「已跳过 · 已换成 X」。
+     * - [from] 本轮已完成、已跳过、或整轮被停止：只从下一轮起换人，本轮不自动发送。
+     * [to] 等于 [from] 表示取消已预约的下一轮换人。
+     */
+    fun swap(from: ArenaService, to: ArenaService): Boolean {
+        if (from !in sessionServices) {
+            sessionMessage = "${from.displayName} 已经不在成员里"
+            return false
+        }
+        if (to == from) {
+            val cancelled = pendingSwapState.remove(from) != null
+            if (cancelled) { sessionMessage = "已取消换人，下一轮仍由 ${from.displayName} 参加"; schedulePersist(immediate = true) }
+            return cancelled
+        }
+        if (to !in swapCandidates(from)) {
+            sessionMessage = "${to.displayName} 已经在成员里，或已被安排接替别的位置"
+            return false
+        }
+        if (stage == SessionStage.IDLE) return false
+        if (summaryOccupies(from)) return false
+        val run = runs[from] ?: ParticipantRun()
+        if (MemberActionPolicy.swapTiming(run) == SwapTiming.NEXT_ROUND) {
+            pendingSwapState[from] = to
+            sessionMessage = "已安排：从下一轮起由 ${to.displayName} 接替 ${from.displayName}"
+            schedulePersist(immediate = true)
+            return true
+        }
+        pendingSwapState.remove(from)
+        activeRound()?.let { execution ->
+            if (from in execution.services) return swapInRound(execution, from, to)
+        }
+        if (stage != SessionStage.READY) return false
+        return swapAfterRound(from, to, run)
+    }
+
+    /** 成员表里把 [from] 换成 [to]，位置不变。 */
+    private fun replaceMember(from: ArenaService, to: ArenaService) {
+        sessionServices = sessionServices.map { if (it == from) to else it }.distinct()
+        if (relayOrder.isNotEmpty()) relayOrder = relayOrder.map { if (it == from) to else it }
+    }
+
+    private fun swapInRound(execution: RoundExecution, from: ArenaService, to: ArenaService): Boolean {
+        val run = runs.getValue(from)
+        // 先把新成员的材料组装好；放不下就不换，旧成员原样继续。
+        val prompt: String? = when {
+            execution.relay -> "" // 轮到这个位置时再按前面各位的回答组装
+            execution.kind == RoundKind.DEBATE || execution.kind == RoundKind.INSPIRE ->
+                composeExchangePrompt(execution.kind, execution.style, to, execution.baseResponses, execution.roundIndex, execution.guidance, newcomer = true)?.text
+            else -> RoundMaterials.forNewcomer(execution.question, originalQuestion)
+        }
+        if (prompt == null) {
+            sessionMessage = "${to.displayName} 上下文预算不够放下本轮材料（${PromptBudgetPolicy.budgetFor(to)} 字），没有换人"
+            return false
+        }
+        val fromWasDispatched = from in execution.dispatchedServices
+        // 先登记「已换下」再取消网页自动化：取消可能同步回调旧的「新对话未就绪」，必须被当作过期结果丢掉。
+        execution.skipped += from
+        execution.dispatchedServices += from
+        execution.freshGeneration[from] = (execution.freshGeneration[from] ?: 0) + 1
+        execution.reextractBackups.remove(from)
+        pollStates.remove(from)
+        runs[from] = run.copy(phase = ParticipantPhase.ERROR, skipped = true, replacedBy = to,
+            detail = "已跳过 · 已换成 ${to.displayName}")
+        pool.cancelAutomation(from)
+        replaceMember(from, to)
+        execution.services.add(execution.services.indexOf(from) + 1, to)
+        val position = execution.dispatchOrder.indexOf(from)
+        if (position >= 0) execution.dispatchOrder[position] = to else execution.dispatchOrder += to
+        execution.newcomers += to
+        roundNewcomers = roundNewcomers + to
+        val requestId = buildRequestId(execution.kind, execution.number, to)
+        execution.requestIds[to] = requestId
+        if (!execution.relay) {
+            execution.prompts[to] = prompt
+            lastRoundPrompts = lastRoundPrompts + (to to prompt.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+        }
+        runs[to] = ParticipantRun(phase = ParticipantPhase.QUEUED, requestId = requestId,
+            detail = "接替 ${from.shortName}，正在打开新对话…")
+        pool.setProtectedServices(execution.services.toSet())
+        sessionMessage = "${to.displayName} 接替 ${from.displayName}，马上接手本轮"
+        if (execution.answerMode == AnswerMode.PARALLEL) {
+            execution.dispatchComplete = false
+            prepareFresh(execution, to) { dispatchParallelService(execution, to) }
+        } else if (fromWasDispatched) {
+            // 工作流已经轮过这个位置：新成员在同一位置立刻接力，后面的成员等它答完再继续。
+            execution.dispatchedServices += to
+            prepareFresh(execution, to) { sendOutOfLine(execution, to) }
+        } else {
+            prepareFresh(execution, to) { dispatchSerialNext(execution) }
+        }
+        schedulePersist()
+        // 被换下的那位如果正占着串行队列，队列由新成员接着走。
+        if (execution.answerMode == AnswerMode.SERIAL) dispatchSerialNext(execution) else maybeFinishRound(execution)
+        return true
+    }
+
+    /** 串行 / 工作流里不按队列顺序立刻发出某一位（换人接手、排队成员重新发送）。 */
+    private fun sendOutOfLine(execution: RoundExecution, service: ArenaService) {
+        if (!isActive(execution) || service in execution.skipped) return
+        if (execution.relay && !composeRelayPrompt(execution, service)) {
+            dispatchSerialNext(execution)
+            return
+        }
+        sendService(execution, service) { sent -> if (!sent) dispatchSerialNext(execution) }
+    }
+
+    /** 本轮已结束、旧成员出错：新成员单独接手这一轮，结果并入本轮记录。 */
+    private fun swapAfterRound(from: ArenaService, to: ArenaService, run: ParticipantRun): Boolean {
+        val kind = currentRoundKind ?: return false
+        val round = history.lastOrNull { it.number == roundNumber }
+        val guidance = round?.guidance.orEmpty()
+        val order = relayOrder.map { if (it == from) to else it }
+        val budgeted: BudgetedPrompt? = when {
+            currentRoundRelay -> {
+                val question = currentRelayQuestion().orEmpty()
+                val earlier = RoundMaterials.earlierAnswers(order, to, runs)
+                PromptBudgetPolicy.fit(to, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
+                    RoundMaterials.forNewcomer(RelayPromptBuilder.build(question, earlier, limit, presets), originalQuestion)
+                }
+            }
+            kind == RoundKind.DEBATE || kind == RoundKind.INSPIRE -> {
+                val base = RoundMaterials.adopted(history.lastOrNull { it.number < roundNumber }?.results.orEmpty())
+                if (base.isEmpty()) null
+                else composeExchangePrompt(kind, currentRoundStyle, to, base, exchangeIndex(kind, currentRoundStyle, roundNumber), guidance, newcomer = true)
+            }
+            kind == RoundKind.INITIAL -> BudgetedPrompt(originalQuestion, false, originalQuestion.length, PromptBudgetPolicy.budgetFor(to), 0)
+            else -> (guidance.ifBlank { lastRoundPrompts[from].orEmpty() }).takeIf { it.isNotBlank() }?.let {
+                val text = RoundMaterials.forNewcomer(it, originalQuestion)
+                BudgetedPrompt(text, false, text.length, PromptBudgetPolicy.budgetFor(to), 0)
+            }
+        }
+        if (budgeted == null || budgeted.text.isBlank()) {
+            sessionMessage = "没能为 ${to.displayName} 组装本轮材料，没有换人；可以先「重新发送」${from.displayName}"
+            return false
+        }
+        stopRecovery(from)
+        val replaced = run.copy(phase = ParticipantPhase.ERROR, skipped = true, replacedBy = to, detail = "已跳过 · 已换成 ${to.displayName}")
+        runs[from] = replaced
+        updateLatestRoundResult(from, replaced)
+        replaceMember(from, to)
+        roundNewcomers = roundNewcomers + to
+        lastRoundPrompts = lastRoundPrompts + (to to budgeted.text.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+        runs[to] = ParticipantRun(detail = "接替 ${from.shortName}")
+        val started = startRecovery(to, budgeted.text, resend = true)
+        if (started) sessionMessage = "${to.displayName} 接替 ${from.displayName}，马上接手本轮"
+        return started
+    }
+
     fun cancelCurrentRound() {
         recoveryQueue.clear()
         val activeSummary = summaryExecution
         if (activeSummary != null && isSummaryActive(activeSummary)) {
-            handler.removeCallbacksAndMessages(null)
-            pool.cancelAutomation()
+            // 只停队长这一家；别家可能正在单家补救，不能一起打断。
+            pool.cancelAutomation(activeSummary.judge)
             summary = summary.copy(phase = ParticipantPhase.ERROR, detail = "已停止总结")
             summaryExecution = null
-            sessionEpoch += 1
             sessionMessage = "已停止讨论总结"
             schedulePersist()
             return
         }
-        val activeRecovery = recoveryExecution
-        if (activeRecovery != null && isRecoveryActive(activeRecovery)) {
+        if (recoveries.isNotEmpty()) {
             handler.removeCallbacksAndMessages(null)
             pool.cancelAutomation()
-            finishRecovery(
-                activeRecovery,
-                runs.getValue(activeRecovery.service).copy(
-                    phase = ParticipantPhase.ERROR,
-                    detail = "已停止单家补救；网页可能仍在生成",
-                ),
-            )
+            recoveries.values.toList().forEach { active ->
+                finishRecovery(
+                    active,
+                    runs.getValue(active.service).copy(
+                        phase = ParticipantPhase.ERROR,
+                        stopped = true,
+                        detail = "已停止单家补救；网页可能仍在生成",
+                    ),
+                )
+            }
             sessionEpoch += 1
             return
         }
@@ -548,9 +901,12 @@ class ArenaSessionController(
         pollStates.clear()
         execution.services.forEach { service ->
             val run = runs.getValue(service)
+            // 整轮被用户停止：没答完的成员都记一笔，之后「换人」只从下一轮起生效，不自动发送。
+            if (run.phase == ParticipantPhase.ERROR) runs[service] = run.copy(stopped = true)
             if (!run.phase.isTerminal()) {
                 runs[service] = run.copy(
                     phase = ParticipantPhase.ERROR,
+                    stopped = true,
                     detail = if (run.phase == ParticipantPhase.QUEUED) {
                         "已停止，这一家还没来得及发送"
                     } else {
@@ -582,7 +938,9 @@ class ArenaSessionController(
         pollStates.clear()
         activeExecution = null
         summaryExecution = null
-        recoveryExecution = null
+        recoveries.clear()
+        pendingSwapState.clear()
+        roundNewcomers = emptySet()
         stage = SessionStage.IDLE
         askedAtMillis = 0L
         currentRoundKind = null
@@ -617,7 +975,7 @@ class ArenaSessionController(
         pollStates.clear()
         activeExecution = null
         summaryExecution = null
-        recoveryExecution = null
+        recoveries.clear()
     }
 
     /**
@@ -657,6 +1015,12 @@ class ArenaSessionController(
         attachments: List<ArenaAttachment> = emptyList(),
         relayOrder: List<ArenaService>? = null,
         style: DebateStyle? = null,
+        /** 中途换上来的新成员：先开新对话再发送。 */
+        newcomers: Set<ArenaService> = emptySet(),
+        /** 本轮的问题本身（首轮 = 原问题，独立迭代 = 本轮问题，讨论 / 激发 = 用户补充）；换人和工作流组装用。 */
+        question: String = guidance,
+        baseResponses: Map<ArenaService, String> = emptyMap(),
+        roundIndex: Int = 1,
     ): Boolean {
         // 只有独立迭代允许单独一家（其他成员被跳过后的逃生通道）；提问、讨论、工作流都要至少两家。
         val minimum = if (kind == RoundKind.ITERATION && relayOrder == null) 1 else 2
@@ -683,10 +1047,18 @@ class ArenaSessionController(
         currentRoundStyle = style
         this.relayOrder = if (relay) relayOrder!!.toList() else emptyList()
         currentAnswerMode = answerMode
+        // 预约的换人从这一轮起生效：成员表位置不变地换掉旧成员。
+        if (pendingSwapState.isNotEmpty()) {
+            sessionServices = RoundMaterials.swappedRoster(sessionServices, pendingSwapState)
+            pendingSwapState.clear()
+        }
+        roundNewcomers = newcomers
+        recoveries.clear()
         stage = when (kind) {
             RoundKind.INITIAL -> SessionStage.INITIAL
             RoundKind.ITERATION -> SessionStage.ITERATION
             RoundKind.DEBATE -> SessionStage.DEBATE
+            RoundKind.INSPIRE -> SessionStage.INSPIRE
         }
         sessionMessage = when {
             relay -> "第 $roundNumber 轮工作流：${services.size} 家按顺序接力回答"
@@ -700,15 +1072,19 @@ class ArenaSessionController(
             number = roundNumber,
             kind = kind,
             answerMode = answerMode,
-            services = services,
-            dispatchOrder = dispatchOrder,
+            services = services.toMutableList(),
+            dispatchOrder = dispatchOrder.toMutableList(),
             prompts = prompts.toMutableMap(),
             attachments = attachments.toList(),
             guidance = guidance.take(ArenaLimits.MAX_GUIDANCE_CHARS),
             relay = relay,
             style = style,
             startedAtMillis = System.currentTimeMillis(),
-            requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) },
+            requestIds = services.associateWith { service -> buildRequestId(kind, roundNumber, service) }.toMutableMap(),
+            newcomers = newcomers.toMutableSet(),
+            question = question,
+            baseResponses = baseResponses,
+            roundIndex = roundIndex,
         )
         lastRoundAttachments = attachments.toList()
         // 所有参与者立即有请求号和准备状态；并行发送不等其他成员的发送回调。
@@ -729,12 +1105,59 @@ class ArenaSessionController(
         schedulePersist()
         if (kind == RoundKind.INITIAL) {
             // 新问题必须发进干净的新对话，否则 AI 带着上一题的上下文作答
-            prepareFreshConversations(execution)
+            prepareFreshConversations(execution, execution.services)
         } else {
+            // 新换上来的成员网页里没有这场讨论：先开新对话，其余成员照常在原对话里继续。
+            if (newcomers.isNotEmpty()) prepareFreshConversations(execution, execution.services.filter { it in newcomers })
             when (answerMode) {
-                AnswerMode.PARALLEL -> dispatchParallel(execution)
+                AnswerMode.PARALLEL -> execution.dispatchOrder.filter { it !in newcomers }.forEach { dispatchParallelService(execution, it) }
                 AnswerMode.SERIAL -> dispatchSerialNext(execution)
             }
+        }
+        return true
+    }
+
+    /** 这一位发送前要不要先开新对话：首轮全体；之后只有中途换上来的新成员。 */
+    private fun needsFresh(execution: RoundExecution, service: ArenaService): Boolean =
+        execution.kind == RoundKind.INITIAL || service in execution.newcomers
+
+    /**
+     * 本轮进行中重新发送一位：旧回答存进「之前的回答」，换新请求号重发；工作流按当下已有的前面回答重新组装。
+     * 串行 / 工作流里还在排队的成员立即发送，不再等前面的人；其他成员照常进行。
+     */
+    private fun resendInRound(execution: RoundExecution, service: ArenaService): Boolean {
+        val previous = runs.getValue(service)
+        // 先换新请求号、作废旧的开新对话结果，再取消网页自动化：取消时同步回来的旧失败一律对不上号而被丢弃。
+        val requestId = buildRequestId(execution.kind, execution.number, service)
+        execution.requestIds[service] = requestId
+        execution.freshGeneration[service] = (execution.freshGeneration[service] ?: 0) + 1
+        execution.reextractBackups.remove(service)
+        pollStates.remove(service)
+        execution.skipped -= service
+        execution.dispatchedServices += service
+        if (execution.answerMode == AnswerMode.PARALLEL) {
+            execution.dispatchComplete = execution.dispatchedServices.containsAll(execution.services)
+        }
+        runs[service] = RoundMaterials.keepPrevious(previous).copy(
+            phase = ParticipantPhase.QUEUED,
+            requestId = requestId,
+            skipped = false,
+            stopped = false,
+            replacedBy = null,
+            detail = if (needsFresh(execution, service)) "重新发送前正在打开新对话…" else "准备重新发送",
+        )
+        pool.cancelAutomation(service)
+        sessionMessage = "正在单独重新发送给 ${service.displayName}，其他成员照常进行"
+        schedulePersist()
+        val send = {
+            if (execution.answerMode == AnswerMode.SERIAL) sendOutOfLine(execution, service)
+            else sendService(execution, service) { maybeFinishRound(execution) }
+        }
+        if (needsFresh(execution, service)) {
+            execution.freshReadiness.remove(service)
+            prepareFresh(execution, service) { send() }
+        } else {
+            send()
         }
         return true
     }
@@ -753,16 +1176,10 @@ class ArenaSessionController(
      * 每家独立开新对话，就绪的一家可立即发送；失败与丢失回调只影响本家。
      * 不在新对话尚未确认时冒险发送，否则可能串入上一个问题。
      */
-    private fun prepareFreshConversations(execution: RoundExecution) {
-        execution.services.forEach { service ->
-            runs[service] = runs.getValue(service).copy(detail = "已收到，正在打开新对话…")
-            var settled = false
-            fun ready(ok: Boolean) {
-                if (settled || !isActive(execution)) return
-                settled = true
-                execution.freshReadiness[service] = ok
-                // Skipping already moved the round on (markTerminal); a late page result changes nothing.
-                if (service in execution.skipped) return
+    private fun prepareFreshConversations(execution: RoundExecution, services: List<ArenaService>) {
+        services.forEach { service ->
+            if (execution.kind == RoundKind.INITIAL) runs[service] = runs.getValue(service).copy(detail = "已收到，正在打开新对话…")
+            prepareFresh(execution, service) {
                 when (execution.answerMode) {
                     AnswerMode.PARALLEL -> dispatchParallelService(execution, service)
                     AnswerMode.SERIAL -> {
@@ -771,12 +1188,30 @@ class ArenaSessionController(
                     }
                 }
             }
-            val timeout = ArenaDeadline { ready(false) }
-            handler.postDelayed(timeout, timing.freshConversationTimeoutMillis)
-            pool.openFreshConversation(service) { ok ->
-                handler.removeCallbacks(timeout)
-                ready(ok)
-            }
+        }
+    }
+
+    /**
+     * 给一位成员开新对话，结果记入 freshReadiness 后调用 [onSettled]（成功或失败都调用，发送时再按结果决定）。
+     * 同一位重新准备（重新发送、换人）后，旧的迟到结果一律作废。
+     */
+    private fun prepareFresh(execution: RoundExecution, service: ArenaService, onSettled: () -> Unit) {
+        val generation = (execution.freshGeneration[service] ?: 0) + 1
+        execution.freshGeneration[service] = generation
+        var settled = false
+        fun ready(ok: Boolean) {
+            if (settled || !isActive(execution) || execution.freshGeneration[service] != generation) return
+            settled = true
+            execution.freshReadiness[service] = ok
+            // Skipping already moved the round on (markTerminal); a late page result changes nothing.
+            if (service in execution.skipped) return
+            onSettled()
+        }
+        val timeout = ArenaDeadline { ready(false) }
+        handler.postDelayed(timeout, timing.freshConversationTimeoutMillis)
+        pool.openFreshConversation(service) { ok ->
+            handler.removeCallbacks(timeout)
+            ready(ok)
         }
     }
 
@@ -797,8 +1232,8 @@ class ArenaSessionController(
         prompt: String?,
         resend: Boolean,
     ): Boolean {
-        sessionEpoch += 1
-        handler.removeCallbacksAndMessages(null)
+        // 每家补救彼此独立：不清别家的计时器，也不作废正在进行的队长总结。
+        recoveries.remove(service)
         val previous = runs[service] ?: ParticipantRun()
         val requestId = if (resend) {
             "retry_${++requestSequence}_${service.name.lowercase()}_${System.currentTimeMillis()}"
@@ -814,12 +1249,18 @@ class ArenaSessionController(
             previousResponse = previous.response,
             previousTruncated = previous.responseTruncated,
             previousOriginalLength = previous.originalResponseLength,
+            previousRun = previous,
         )
-        recoveryExecution = execution
-        runs[service] = previous.copy(
-            phase = if (!resend) ParticipantPhase.WAITING else if (currentRoundKind == RoundKind.INITIAL) ParticipantPhase.QUEUED else ParticipantPhase.SENDING,
+        recoveries[service] = execution
+        val fresh = resend && (currentRoundKind == RoundKind.INITIAL || service in roundNewcomers)
+        // 重新发送：已收到的回答存进「之前的回答」，不丢。
+        val base = if (resend) RoundMaterials.keepPrevious(previous) else previous
+        runs[service] = base.copy(
+            phase = if (!resend) ParticipantPhase.WAITING else if (fresh) ParticipantPhase.QUEUED else ParticipantPhase.SENDING,
             requestId = requestId,
-            response = if (resend) "" else previous.response,
+            skipped = false,
+            stopped = false,
+            replacedBy = null,
             detail = if (resend) "正在重发" else "正在重新提取",
         )
         sessionMessage = if (resend) {
@@ -866,7 +1307,7 @@ class ArenaSessionController(
                 }
             }
         }
-        if (currentRoundKind == RoundKind.INITIAL) {
+        if (fresh) {
             runs[service] = runs.getValue(service).copy(detail = "重发前正在确认新对话")
             var freshSettled = false
             fun ready(ok: Boolean) {
@@ -996,24 +1437,26 @@ class ArenaSessionController(
 
     private fun finishRecovery(execution: RecoveryExecution, result: ParticipantRun) {
         if (!isRecoveryActive(execution)) return
-        // 重发前会清空 response 以便重新采集；如果这次重发没拿到任何内容，
-        // 就把之前那份部分回答还回去，而不是让用户既没有旧的也没有新的。
+        // 重发前已把旧回答存进「之前的回答」；这次没拿到内容时说明一句，旧回答仍可在卡片下方展开查看。
+        val backup = execution.previousRun
         val restored = if (
+            !execution.resend && result.phase == ParticipantPhase.ERROR &&
+            backup != null && backup.phase == ParticipantPhase.COMPLETE && backup.response.isNotBlank()
+        ) {
+            // 重新提取一份已完成的回答却没读到：原回答原样保留，不降成失败。
+            backup.copy(detail = "${backup.detail}（重新提取没读到新内容，保留原回答）")
+        } else if (
+            execution.resend &&
             result.phase == ParticipantPhase.ERROR &&
             result.response.isBlank() &&
             execution.previousResponse.isNotBlank()
         ) {
-            result.copy(
-                response = execution.previousResponse,
-                responseTruncated = execution.previousTruncated,
-                originalResponseLength = execution.previousOriginalLength,
-                detail = "${result.detail}；已保留上一次的部分回答",
-            )
+            result.copy(detail = "${result.detail}；之前的回答已保留")
         } else {
             result
         }
         runs[execution.service] = restored
-        recoveryExecution = null
+        recoveries.remove(execution.service)
         updateLatestRoundResult(execution.service, restored)
         sessionMessage = when (restored.phase) {
             ParticipantPhase.COMPLETE -> "${execution.service.displayName} 单家补救完成"
@@ -1039,7 +1482,7 @@ class ArenaSessionController(
 
     private fun dispatchParallelService(execution: RoundExecution, service: ArenaService) {
         if (!isActive(execution) || !execution.dispatchedServices.add(service)) return
-        execution.dispatchComplete = execution.dispatchedServices.size == execution.services.size
+        execution.dispatchComplete = execution.dispatchedServices.containsAll(execution.services)
         sendService(execution, service) {
             maybeFinishRound(execution)
         }
@@ -1047,20 +1490,26 @@ class ArenaSessionController(
 
     private fun dispatchSerialNext(execution: RoundExecution) {
         if (!isActive(execution)) return
-        // 其他成员的网页可能先加载好，但串行模式仍须等待当前成员回答结束。
-        if (execution.services.any { runs.getValue(it).phase in setOf(ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING) }) return
+        // 其他成员的网页可能先加载好，但串行模式仍须等待当前成员回答结束；
+        // 不按队列提前发出的成员（换人接手、排队时重新发送）也要等它答完，后面的人才接着接力。
+        if (execution.services.any { service ->
+                val phase = runs.getValue(service).phase
+                phase in setOf(ParticipantPhase.SENDING, ParticipantPhase.WAITING, ParticipantPhase.STREAMING) ||
+                    (phase == ParticipantPhase.QUEUED && service in execution.dispatchedServices && service !in execution.skipped)
+            }) return
         val service = execution.dispatchOrder.getOrNull(execution.nextDispatchIndex)
         if (service == null) {
             execution.dispatchComplete = true
             maybeFinishRound(execution)
             return
         }
-        if (service in execution.skipped) {
+        if (service in execution.skipped || service in execution.dispatchedServices) {
             execution.nextDispatchIndex += 1
             return dispatchSerialNext(execution)
         }
-        if (execution.kind == RoundKind.INITIAL && service !in execution.freshReadiness) return
+        if (needsFresh(execution, service) && service !in execution.freshReadiness) return
         execution.nextDispatchIndex += 1
+        execution.dispatchedServices += service
         if (execution.relay && !composeRelayPrompt(execution, service)) return dispatchSerialNext(execution)
         sessionMessage = if (execution.relay) "工作流：轮到 ${service.displayName}" else "串行模式：正在发送给 ${service.displayName}"
         sendService(execution, service) { sent ->
@@ -1078,15 +1527,19 @@ class ArenaSessionController(
      * 前面没成功的成员不提供材料。超出这家网页的上下文预算时逐步压缩引用，仍放不下就标明失败并跳到下一位。
      */
     private fun composeRelayPrompt(execution: RoundExecution, service: ArenaService): Boolean {
-        val first = execution.dispatchOrder.first()
-        if (service == first) return true
-        val question = execution.prompts.getValue(first)
-        val earlier = LinkedHashMap<ArenaService, String>()
-        execution.dispatchOrder.takeWhile { it != service }.forEach { previous ->
-            runs[previous]?.takeIf { it.phase == ParticipantPhase.COMPLETE && it.response.isNotBlank() }?.let { earlier[previous] = it.response }
+        val newcomer = service in execution.newcomers
+        val question = execution.question
+        if (service == execution.dispatchOrder.first()) {
+            val text = if (newcomer) RoundMaterials.forNewcomer(question, originalQuestion) else execution.prompts[service] ?: question
+            execution.prompts[service] = text
+            lastRoundPrompts = lastRoundPrompts + (service to text.take(ArenaLimits.MAX_STORED_PROMPT_CHARS))
+            return true
         }
+        val earlier = RoundMaterials.earlierAnswers(execution.dispatchOrder, service, runs)
         val budgeted = PromptBudgetPolicy.fit(service, initialQuoteLimit = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) { limit ->
-            RelayPromptBuilder.build(question, earlier, limit, presets)
+            RelayPromptBuilder.build(question, earlier, limit, presets).let {
+                if (newcomer) RoundMaterials.forNewcomer(it, originalQuestion) else it
+            }
         }
         if (budgeted == null) {
             runs[service] = runs.getValue(service).copy(
@@ -1109,11 +1562,13 @@ class ArenaSessionController(
     ) {
         if (!isActive(execution)) return
         val requestId = execution.requestIds.getValue(service)
-        if (execution.kind == RoundKind.INITIAL && execution.freshReadiness[service] != true) {
+        val kept = runs[service]?.previousResponses.orEmpty()
+        if (needsFresh(execution, service) && execution.freshReadiness[service] != true) {
             runs[service] = ParticipantRun(
                 phase = ParticipantPhase.ERROR,
                 requestId = requestId,
                 detail = pool.freshConversationFailure(service) ?: "新对话未能就绪，未发送；请打开原网页确认后重试",
+                previousResponses = kept,
             )
             onSendFinished(false)
             schedulePersist()
@@ -1124,6 +1579,7 @@ class ArenaSessionController(
             phase = ParticipantPhase.SENDING,
             requestId = requestId,
             detail = "正在发送",
+            previousResponses = kept,
         )
         schedulePersist()
         // 每家独立兜底，不能因一家丢失回调而取消其他成员的在途上传和发送。
@@ -1137,6 +1593,7 @@ class ArenaSessionController(
                 phase = ParticipantPhase.ERROR,
                 requestId = requestId,
                 detail = "发送无响应，已停止等待",
+                previousResponses = kept,
             )
             pool.cancelAutomation(service)
             onSendFinished(false)
@@ -1159,6 +1616,7 @@ class ArenaSessionController(
                     phase = ParticipantPhase.WAITING,
                     requestId = requestId,
                     detail = "等待回答",
+                    previousResponses = kept,
                 )
                 rememberConversationUrl(service)
                 startPolling(execution, service, requestId)
@@ -1167,6 +1625,7 @@ class ArenaSessionController(
                     phase = ParticipantPhase.ERROR,
                     requestId = requestId,
                     detail = outcome.detail,
+                    previousResponses = kept,
                 )
             }
             onSendFinished(outcome.success)
@@ -1329,8 +1788,12 @@ class ArenaSessionController(
         terminalRun: ParticipantRun,
     ) {
         if (!isActive(execution)) return
-        runs[service] = terminalRun
-        if (terminalRun.phase == ParticipantPhase.COMPLETE) rememberConversationUrl(service)
+        // 重新提取一份已完成的回答却没读到：原回答原样保留，不降成失败。
+        val backup = execution.reextractBackups.remove(service)
+        runs[service] = if (backup != null && terminalRun.phase == ParticipantPhase.ERROR && !terminalRun.skipped) {
+            backup.copy(detail = "${backup.detail}（重新提取没读到新内容，保留原回答）")
+        } else terminalRun
+        if (runs[service]?.phase == ParticipantPhase.COMPLETE) rememberConversationUrl(service)
         schedulePersist()
         pollStates.remove(service)
         if (execution.answerMode == AnswerMode.SERIAL) {
@@ -1554,6 +2017,8 @@ class ArenaSessionController(
             lastRoundAttachments = lastRoundAttachments,
             conversationUrls = conversationUrls.toMap(),
             updatedAtMillis = System.currentTimeMillis(),
+            pendingSwaps = pendingSwapState.toMap(),
+            roundNewcomers = roundNewcomers,
         )
     }
 
@@ -1619,7 +2084,7 @@ class ArenaSessionController(
         pollStates.clear()
         activeExecution = null
         summaryExecution = null
-        recoveryExecution = null
+        recoveries.clear()
         sessionId = snapshot.id
         originalQuestion = snapshot.originalQuestion
         askedAtMillis = snapshot.askedAtMillis
@@ -1642,6 +2107,9 @@ class ArenaSessionController(
         lastRoundPrompts = snapshot.lastRoundPrompts
         conversationUrls.clear()
         conversationUrls.putAll(snapshot.conversationUrls)
+        pendingSwapState.clear()
+        pendingSwapState.putAll(snapshot.pendingSwaps.filterKeys { it in sessionServices }.filterValues { it !in sessionServices })
+        roundNewcomers = snapshot.roundNewcomers
         currentRoundContextNotice = ""
         stage = if (originalQuestion.isBlank()) SessionStage.IDLE else SessionStage.READY
         sessionMessage = if (recovered) {
@@ -1689,16 +2157,8 @@ class ArenaSessionController(
             .onFailure { storageWarning = "无法读取最近问题" }
     }
 
-    private fun completedResponses(): Map<ArenaService, String> = ArenaService.entries
-        .mapNotNull { service ->
-            val run = runs[service]
-            if (run?.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank()) {
-                service to run.response
-            } else {
-                null
-            }
-        }
-        .toMap()
+    /** 本轮被采用的回答（已完成且没被跳过）。 */
+    private fun completedResponses(): Map<ArenaService, String> = RoundMaterials.adopted(runs)
 
     private fun buildRequestId(kind: RoundKind, number: Int, service: ArenaService): String {
         requestSequence += 1
@@ -1712,7 +2172,7 @@ class ArenaSessionController(
         summaryExecution === execution && execution.epoch == sessionEpoch
 
     private fun isRecoveryActive(execution: RecoveryExecution): Boolean =
-        recoveryExecution === execution && execution.epoch == sessionEpoch
+        recoveries[execution.service] === execution && execution.epoch == sessionEpoch
 
     private fun responseLengthLabel(snapshot: ResponseSnapshot): String =
         if (snapshot.truncated) {
@@ -1726,14 +2186,15 @@ class ArenaSessionController(
         val number: Int,
         val kind: RoundKind,
         val answerMode: AnswerMode,
-        val services: List<ArenaService>,
-        val dispatchOrder: List<ArenaService>,
+        /** 本轮成员；换人接手时会追加新成员。 */
+        val services: MutableList<ArenaService>,
+        val dispatchOrder: MutableList<ArenaService>,
         val prompts: MutableMap<ArenaService, String>,
         val attachments: List<ArenaAttachment>,
         val guidance: String,
         val startedAtMillis: Long,
         /** 开轮时就给每家分配好请求号，卡片从第一秒起就能显示准备进度。 */
-        val requestIds: Map<ArenaService, String>,
+        val requestIds: MutableMap<ArenaService, String>,
         val freshReadiness: MutableMap<ArenaService, Boolean> = mutableMapOf(),
         val dispatchedServices: MutableSet<ArenaService> = mutableSetOf(),
         var nextDispatchIndex: Int = 0,
@@ -1742,6 +2203,18 @@ class ArenaSessionController(
         val style: DebateStyle? = null,
         /** 用户在本轮中途跳过的成员：迟到的回调一律不再改动它们。 */
         val skipped: MutableSet<ArenaService> = mutableSetOf(),
+        /** 中途换上来的新成员：先开新对话，材料里补原问题。 */
+        val newcomers: MutableSet<ArenaService> = mutableSetOf(),
+        /** 本轮的问题本身（首轮 = 原问题，独立迭代 = 本轮问题，讨论 / 激发 = 用户补充）。 */
+        val question: String = "",
+        /** 观点讨论 / 互相激发开轮时用的材料（上一轮被采用的回答），换人时给新成员重新组装。 */
+        val baseResponses: Map<ArenaService, String> = emptyMap(),
+        /** 观点讨论 / 互相激发是同类第几轮。 */
+        val roundIndex: Int = 1,
+        /** 每位成员开新对话的代次：重新准备后旧的迟到结果作废。 */
+        val freshGeneration: MutableMap<ArenaService, Int> = mutableMapOf(),
+        /** 本轮进行中重新提取已完成回答时的原状态；没读到就恢复它。 */
+        val reextractBackups: MutableMap<ArenaService, ParticipantRun> = mutableMapOf(),
     )
 
     private data class PollState(
@@ -1774,6 +2247,8 @@ class ArenaSessionController(
         val previousResponse: String = "",
         val previousTruncated: Boolean = false,
         val previousOriginalLength: Int = 0,
+        /** 动手前的完整状态：重新提取失败时据此恢复已完成的回答。 */
+        val previousRun: ParticipantRun? = null,
         var lastText: String = "",
         var stableCount: Int = 0,
         var consecutiveReadErrors: Int = 0,

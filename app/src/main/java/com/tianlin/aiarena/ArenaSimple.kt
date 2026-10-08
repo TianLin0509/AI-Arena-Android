@@ -207,6 +207,8 @@ internal fun ModeComposer(
                     ArenaIcon(R.drawable.ic_chevron_right, Modifier.align(Alignment.CenterEnd).padding(end = 4.dp).rotate(90f), tint = colors.muted, size = 18.dp)
                 }
                 ModeSegmented(RoundMode.entries.map { it.name to it.label }, mode.name, !busy, { onMode(RoundMode.fromName(it)) })
+                Text(mode.hint, Modifier.padding(horizontal = 4.dp).testTag("mode-hint"), style = MaterialTheme.typography.bodySmall,
+                    color = ArenaStyle.colors.ink)
                 options()
                 preset?.invoke()
                 Text(scope, Modifier.padding(start = 4.dp), style = MaterialTheme.typography.labelSmall, color = colors.muted)

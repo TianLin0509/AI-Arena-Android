@@ -49,7 +49,7 @@ data class TimeEntry(
 )
 
 enum class TimeKind(val hue: Long) {
-    ASK(0xFF6B7280), ITERATE(0xFFE07A1F), RELAY(0xFF1F9D57), DISCUSS(0xFF7C4DDB), SUMMARY(0xFF4268ED)
+    ASK(0xFF6B7280), ITERATE(0xFFE07A1F), RELAY(0xFF1F9D57), DISCUSS(0xFF7C4DDB), INSPIRE(0xFFD0457A), SUMMARY(0xFF4268ED)
 }
 
 object ArenaTimeMachine {
@@ -57,6 +57,7 @@ object ArenaTimeMachine {
         relay -> TimeKind.RELAY
         kind == RoundKind.ITERATION -> TimeKind.ITERATE
         kind == RoundKind.DEBATE -> TimeKind.DISCUSS
+        kind == RoundKind.INSPIRE -> TimeKind.INSPIRE
         else -> TimeKind.ASK
     }
 

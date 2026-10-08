@@ -197,6 +197,14 @@ data class ParticipantRun(
     val modeLabel: String = "",
     /** 这条回答里出现过思考过程块：站点自己承认"这次深度思考了"，比开关状态更可信。 */
     val thinkingUsed: Boolean = false,
+    /** 用户点了「跳过」：本轮不再等它，之后的讨论 / 激发 / 总结 / 工作流都不带它；已收到的文字原样保留。 */
+    val skipped: Boolean = false,
+    /** 用户点了「换人」，本轮由这位接手。 */
+    val replacedBy: ArenaService? = null,
+    /** 整轮被用户「停止」时还没完成。 */
+    val stopped: Boolean = false,
+    /** 「重新发送」前已经收到的回答，按先后保留，界面里可展开查看，绝不丢弃。 */
+    val previousResponses: List<String> = emptyList(),
 )
 
 enum class AnswerMode(val displayName: String, val description: String) {
@@ -220,6 +228,8 @@ enum class RoundKind(val displayName: String) {
     INITIAL("初始回答"),
     ITERATION("独立迭代"),
     DEBATE("观点讨论"),
+    /** 互相激发：每位收到其他成员的完整回答当灵感，各自产出更好的独立答案。 */
+    INSPIRE("互相激发"),
 }
 
 enum class SessionStage {
@@ -227,6 +237,7 @@ enum class SessionStage {
     INITIAL,
     ITERATION,
     DEBATE,
+    INSPIRE,
     READY,
 }
 

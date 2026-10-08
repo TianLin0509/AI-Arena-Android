@@ -155,7 +155,8 @@ internal fun RoundStage(
     }.keys.map { it.shortName }
     val roundRunning = sessionStage == SessionStage.INITIAL ||
         sessionStage == SessionStage.ITERATION ||
-        sessionStage == SessionStage.DEBATE
+        sessionStage == SessionStage.DEBATE ||
+        sessionStage == SessionStage.INSPIRE
     val busy = sessionController.isBusy
     val narration = if (busy && !roundRunning) {
         // 总结 / 单家补救进行中：控制器的文案已经是"正在请 X 做标准总结"这类人话

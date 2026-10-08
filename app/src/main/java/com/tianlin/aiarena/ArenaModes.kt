@@ -24,20 +24,29 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 
 /**
- * 下一轮做什么（参考 AI圆桌 Lite 0.3.0 的四个按钮）：
- * 独立迭代 = 原文发给每位；工作流 = 按顺序接力；观点讨论 = 互相评议；队长总结 = 一位队长整理。
+ * 下一轮做什么（参考 AI圆桌 Lite 的五个按钮）：
+ * 独立迭代 = 原文发给每位；工作流 = 按顺序接力；观点讨论 = 互相评判找分歧；
+ * 互相激发 = 把别人的答案当灵感各自升级；队长总结 = 一位队长整理。
  */
-enum class RoundMode(val label: String, val placeholder: String, val sendLabel: String, val preset: Boolean) {
-    ITERATE("独立迭代", "新的问题或追问，原文发给每位成员…", "发送给每位成员", false),
-    RELAY("工作流", "你的问题（第 1 位直接收到）…", "开始工作流", true),
-    DISCUSS("观点讨论", "你的补充（可选，附在预设之后）…", "发起讨论", true),
-    SUMMARY("队长总结", "你的补充（可选，附在预设之后）…", "请队长总结", true),
+enum class RoundMode(val label: String, val placeholder: String, val sendLabel: String, val preset: Boolean, val hint: String) {
+    ITERATE("独立迭代", "新的问题或追问，原文发给每位成员…", "发送给每位成员", false,
+        "原文发给每位成员，各自独立回答。"),
+    RELAY("工作流", "你的问题（第 1 位直接收到）…", "开始工作流", true,
+        "按顺序接力：后一位读完前面各位的回答再补充。"),
+    DISCUSS("观点讨论", "你的补充（可选，附在预设之后）…", "发起讨论", true,
+        "讨论是互相评判、找分歧：指出别人哪里对、哪里不对。"),
+    INSPIRE("互相激发", "你的补充（可选，附在预设之后）…", "开始互相激发", true,
+        "激发是把别人的答案当灵感：各自写出更好的独立答案，不追求一致。"),
+    SUMMARY("队长总结", "你的补充（可选，附在预设之后）…", "请队长总结", true,
+        "一位队长读完几家的完整回答，整理成一条。"),
     ;
 
     companion object {
@@ -45,28 +54,52 @@ enum class RoundMode(val label: String, val placeholder: String, val sendLabel: 
     }
 }
 
-/** 胶囊式分段选择器；选中项蓝底白字。 */
+/**
+ * 胶囊式分段选择器；选中项蓝底白字。
+ * 五个模式在窄屏或大字下放不下一行时，单个标签从中间断成两行（「独立 / 迭代」），不截断、不藏进菜单。
+ */
 @Composable
 internal fun ModeSegmented(options: List<Pair<String, String>>, selected: String, enabled: Boolean,
                            onSelect: (String) -> Unit, modifier: Modifier = Modifier, testTagPrefix: String = "mode") {
     val colors = ArenaStyle.colors
-    Row(modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.card).padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-        options.forEach { (key, label) ->
-            val on = key == selected
-            Box(Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(11.dp))
-                .background(if (on) colors.accent else colors.card)
-                .clickable(enabled = enabled && !on) { onSelect(key) }
-                .semantics { role = Role.Tab; this.selected = on; contentDescription = label }
-                .testTag("$testTagPrefix-$key"),
-                contentAlignment = Alignment.Center) {
-                Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1,
-                    fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
-                    color = if (on) colors.onAccent else if (enabled) colors.ink else colors.muted)
+    val measurer = rememberTextMeasurer()
+    val style = MaterialTheme.typography.labelLarge
+    BoxWithConstraints(modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(colors.card).padding(3.dp)) {
+        val gap = 3.dp
+        val cell = (maxWidth - gap * (options.size - 1)) / options.size
+        val density = LocalDensity.current
+        // 先试原字号一行；放不下就略缩小字号（不小于原来的 86%）仍排一行；还放不下才让所有标签都按两行排，避免高低不齐。
+        fun fits(textStyle: androidx.compose.ui.text.TextStyle) = options.all { (_, label) ->
+            with(density) { measurer.measure(label, textStyle.copy(fontWeight = FontWeight.SemiBold)).size.width.toDp() } <= cell - 6.dp
+        }
+        val smaller = style.copy(fontSize = style.fontSize * 0.86f)
+        val labelStyle = if (fits(style)) style else if (fits(smaller)) smaller else style
+        val wrap = !fits(labelStyle)
+        // 两行时所有格子取同一个最小高度（按当前字号量出两行字的高度），保持一排整齐。
+        val twoLines = with(density) { measurer.measure("独\n立", style.copy(fontWeight = FontWeight.SemiBold)).size.height.toDp() }
+        val minHeight = if (wrap) maxOf(48.dp, twoLines + 12.dp) else 48.dp
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(gap)) {
+            options.forEach { (key, label) ->
+                val on = key == selected
+                Box(Modifier.weight(1f).heightIn(min = minHeight).clip(RoundedCornerShape(11.dp))
+                    .background(if (on) colors.accent else colors.card)
+                    .clickable(enabled = enabled && !on) { onSelect(key) }
+                    .semantics { role = Role.Tab; this.selected = on; contentDescription = label }
+                    .testTag("$testTagPrefix-$key"),
+                    contentAlignment = Alignment.Center) {
+                    Text(if (wrap) twoLineLabel(label) else label, Modifier.padding(horizontal = 2.dp, vertical = 4.dp),
+                        style = labelStyle, maxLines = 2, textAlign = TextAlign.Center,
+                        fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (on) colors.onAccent else if (enabled) colors.ink else colors.muted)
+                }
             }
         }
     }
 }
+
+/** 「独立迭代」→「独立\n迭代」：从中间断开，两行各占一半；两个字以内原样返回。 */
+internal fun twoLineLabel(label: String): String =
+    if (label.length <= 2 || label.contains('\n')) label else label.substring(0, (label.length + 1) / 2) + "\n" + label.substring((label.length + 1) / 2)
 
 /** 工作流顺序：① DeepSeek → ② 豆包 ↑ …，点 ↑ 把这一位提前一位。 */
 @Composable

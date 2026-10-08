@@ -36,6 +36,10 @@ data class ArenaSessionSnapshot(
     val currentRoundStyle: DebateStyle? = null,
     /** 当前工作流轮的接力顺序（重发时重新组装接力材料用）。 */
     val currentRelayOrder: List<ArenaService> = emptyList(),
+    /** 预约的换人（旧成员 → 新成员），下一轮开始时生效；老文件没有这个字段。 */
+    val pendingSwaps: Map<ArenaService, ArenaService> = emptyMap(),
+    /** 当前轮中途换上来的新成员（重发时要开新对话）。 */
+    val roundNewcomers: Set<ArenaService> = emptySet(),
 )
 
 data class RecentArenaSession(
@@ -247,6 +251,10 @@ internal object ArenaSessionJson {
         .put("currentRoundRelay", snapshot.currentRoundRelay)
         .put("currentRoundStyle", snapshot.currentRoundStyle?.name ?: JSONObject.NULL)
         .put("currentRelayOrder", JSONArray(snapshot.currentRelayOrder.map { it.name }))
+        .put("pendingSwaps", JSONObject().also { swaps ->
+            snapshot.pendingSwaps.forEach { (from, to) -> swaps.put(from.name, to.name) }
+        })
+        .put("roundNewcomers", JSONArray(snapshot.roundNewcomers.map { it.name }))
 
     /** 只认识到 [SCHEMA_VERSION] 为止的文件；更高版本宁可当作不可读，也不要静默丢字段。 */
     const val SCHEMA_VERSION = 1
@@ -296,6 +304,12 @@ internal object ArenaSessionJson {
             currentRoundRelay = json.optBoolean("currentRoundRelay"),
             currentRoundStyle = json.optString("currentRoundStyle").enumOrNull<DebateStyle>(),
             currentRelayOrder = json.optJSONArray("currentRelayOrder").enumList<ArenaService>(),
+            pendingSwaps = json.optJSONObject("pendingSwaps")?.let { swaps ->
+                ArenaService.entries.mapNotNull { from ->
+                    swaps.optString(from.name).enumOrNull<ArenaService>()?.takeIf { it != from }?.let { from to it }
+                }.toMap()
+            }.orEmpty(),
+            roundNewcomers = json.optJSONArray("roundNewcomers").enumList<ArenaService>().toSet(),
         )
     }
 
@@ -334,6 +348,10 @@ internal object ArenaSessionJson {
         .put("originalResponseLength", run.originalResponseLength)
         .put("modeLabel", run.modeLabel)
         .put("thinkingUsed", run.thinkingUsed)
+        .put("skipped", run.skipped)
+        .put("replacedBy", run.replacedBy?.name ?: JSONObject.NULL)
+        .put("stopped", run.stopped)
+        .put("previousResponses", JSONArray(run.previousResponses))
 
     private fun decodeRun(json: JSONObject): ParticipantRun = ParticipantRun(
         phase = json.optString("phase").enumOrNull<ParticipantPhase>() ?: ParticipantPhase.IDLE,
@@ -344,6 +362,12 @@ internal object ArenaSessionJson {
         originalResponseLength = json.optInt("originalResponseLength"),
         modeLabel = json.optString("modeLabel").take(80),
         thinkingUsed = json.optBoolean("thinkingUsed"),
+        skipped = json.optBoolean("skipped"),
+        replacedBy = json.optString("replacedBy").enumOrNull<ArenaService>(),
+        stopped = json.optBoolean("stopped"),
+        previousResponses = json.optJSONArray("previousResponses")?.let { array ->
+            (0 until array.length()).mapNotNull { index -> array.optString(index).takeIf { it.isNotBlank() }?.take(ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS) }
+        }.orEmpty(),
     )
 
     private fun encodeRound(round: RoundRecord): JSONObject = JSONObject()
