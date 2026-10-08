@@ -750,6 +750,13 @@ private fun DiscussionHome(
                     },
                 )
             } else {
+                // 「换人」改了本场成员：同步成员选择，网页池保留新成员的网页、不回收。
+                val sessionMembers = sessionController.sessionServices
+                LaunchedEffect(sessionMembers) {
+                    if (sessionMembers != selectedServices && sessionMembers.size in ArenaService.MIN_MEMBERS..ArenaService.MAX_MEMBERS) {
+                        onSelectedServicesChange(sessionMembers)
+                    }
+                }
                 SimpleRoundStage(
                     attachmentDraft = followupAttachments, onChooseAttachments = { chooseFiles(followupAttachments) },
                     statuses = pool.statuses, sessionController = sessionController,

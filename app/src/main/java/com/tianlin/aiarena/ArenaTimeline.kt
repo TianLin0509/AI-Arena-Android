@@ -11,6 +11,7 @@ object ArenaTimeline {
         relay -> "工作流"
         kind == RoundKind.INITIAL -> "提问"
         kind == RoundKind.ITERATION -> "独立迭代"
+        kind == RoundKind.INSPIRE -> "互相激发"
         style == DebateStyle.COLLAB -> "观点讨论 · 取长补短"
         else -> "观点讨论"
     }
@@ -22,6 +23,7 @@ object ArenaTimeline {
         RoundKind.INITIAL -> originalQuestion
         RoundKind.ITERATION -> round.guidance.ifBlank { "本轮问题未保存" }
         RoundKind.DEBATE -> round.guidance.takeIf { it.isNotBlank() }?.let { "讨论要求：$it" } ?: "让 AI 互相讨论：$originalQuestion"
+        RoundKind.INSPIRE -> round.guidance.takeIf { it.isNotBlank() }?.let { "激发要求：$it" } ?: "让 AI 互相激发：$originalQuestion"
     }
 
     /** 当前轮之前、已经结束的轮次，按先后排列；当前轮仍在正文区显示，不重复出现在时光机里。 */
@@ -46,6 +48,8 @@ object ArenaTimeline {
     /** 某成员在某轮的一句话状态；成功时为空，由正文说话。 */
     fun runNote(run: ParticipantRun?): String = when {
         run == null -> "这一轮没有参与"
+        run.replacedBy != null && run.skipped -> "这一轮已跳过，由 ${run.replacedBy.shortName} 接手"
+        run.skipped -> "这一轮已跳过，回答不采用"
         run.phase == ParticipantPhase.COMPLETE && run.response.isNotBlank() -> ""
         run.phase == ParticipantPhase.ERROR -> "这一轮没有成功：" + run.detail.take(60)
         run.response.isNotBlank() -> "这一轮只收到部分回答"

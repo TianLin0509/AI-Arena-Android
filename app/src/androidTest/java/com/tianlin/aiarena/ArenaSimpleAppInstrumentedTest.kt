@@ -38,7 +38,8 @@ class ArenaSimpleAppInstrumentedTest {
     @get:Rule(order = 1) val compose = createAndroidComposeRule<MainActivity>()
 
     @Test fun productionNavigationPreservesSelectedAnswerAndDraftAcrossWebpage() {
-        compose.onNodeWithTag("simple-answer-DEEPSEEK").assertIsDisplayed()
+        // 0.19.0: the four escape actions sit above the answer, so on a 320x640dp screen the text starts below the fold.
+        compose.onNodeWithTag("simple-answer-DEEPSEEK").performScrollTo().assertIsDisplayed()
         compose.onNodeWithTag("choose-attachments").assertIsDisplayed().assertIsEnabled()
         capture("production-answer")
         compose.onNodeWithTag("answer-tab-KIMI").performClick()

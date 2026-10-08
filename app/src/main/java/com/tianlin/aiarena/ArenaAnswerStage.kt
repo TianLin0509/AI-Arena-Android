@@ -30,16 +30,16 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** 成员胶囊标签：头像 + 名字；选中蓝底描边；没成功的一家带小红点。 */
+/** 成员胶囊标签：头像 + 名字 + 状态小圆点（进行中蓝、完成绿、出问题红、跳过灰）；选中蓝底描边。 */
 @Composable
-internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, phases: Map<ArenaService, ParticipantPhase>, onSelect: (String) -> Unit) {
+internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, runs: Map<ArenaService, ParticipantRun>, onSelect: (String) -> Unit) {
     val colors = ArenaStyle.colors
     Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
         (members.map { it.name } + "summary").forEach { key ->
             val service = ArenaService.fromName(key)
             val on = key == selected
-            val failed = service != null && phases[service] == ParticipantPhase.ERROR
+            val run = service?.let { runs[it] }
             Surface(Modifier.clip(RoundedCornerShape(20.dp)).clickable { onSelect(key) }
                 .semantics { this.selected = on }.testTag("answer-tab-$key"),
                 shape = RoundedCornerShape(20.dp), color = if (on) colors.accentSoft else colors.page,
@@ -48,9 +48,9 @@ internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, pha
                     Box {
                         if (service != null) BrandAvatar(service, size = 26.dp)
                         else ArenaIcon(R.drawable.ic_logo, tint = androidx.compose.ui.graphics.Color.Unspecified, size = 26.dp)
-                        if (failed) Box(Modifier.align(Alignment.TopEnd).size(8.dp).background(colors.error, CircleShape))
+                        ToneDot(run, Modifier.align(Alignment.TopEnd))
                     }
-                    Text((service?.shortName ?: "综合") + if (failed) " · !" else "", Modifier.padding(start = 6.dp),
+                    Text(service?.shortName ?: "综合", Modifier.padding(start = 6.dp),
                         style = MaterialTheme.typography.labelLarge, color = if (on) colors.accent else colors.ink,
                         fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
                 }
@@ -59,75 +59,92 @@ internal fun SimpleAnswerTabs(members: List<ArenaService>, selected: String, pha
     }
 }
 
-/** 本轮一家的回答：头像名字 + 模式小字，Markdown 正文，轻量操作；失败时给出原因和补救按钮。 */
+/**
+ * 本轮一家的回答：头像名字 + 状态胶囊，四个逃生动作（重新提取 / 重新发送 / 跳过 / 换人）始终在名字下面，
+ * 然后是等待进度、Markdown 正文、失败说明和「之前的回答」。
+ */
 @Composable
 internal fun SimpleAnswer(
     service: ArenaService, run: ParticipantRun, status: ServiceStatus, onOpen: () -> Unit,
     onCopy: (() -> Unit)?, onShare: (() -> Unit)?, busy: Boolean,
     onReextract: () -> Unit, onResend: () -> Unit, onSummary: () -> Unit,
     draft: String? = null, onReplaceDraft: (String) -> Unit = {},
+    onSkip: () -> Unit = {}, onSwap: () -> Unit = {}, isMember: Boolean = true, pendingSwap: ArenaService? = null,
+    progress: (@Composable () -> Unit)? = null,
 ) {
-    var confirmResend by remember { mutableStateOf(false) }
     var confirmDraft by remember { mutableStateOf<String?>(null) }
     var details by rememberSaveable { mutableStateOf(false) }
     val colors = ArenaStyle.colors
-    if (confirmResend) ConfirmDialog("重新发送给 ${service.shortName}？", "会再次发送本轮问题。请先打开网页确认是否已收到或仍在排队，避免重复发送。", "确认重发",
-        onConfirm = { confirmResend = false; onResend() }, onDismiss = { confirmResend = false })
     confirmDraft?.let { text ->
         ConfirmDialog("清空这段草稿并重发？",
             "${service.shortName} 输入框里的这段文字会被本轮问题替换：\n\n「${text.take(300)}${if (text.length > 300) "…" else ""}」\n\n只替换这一段；网页里的文字若已改变会停下，不会发送。",
             "清空并重发", onConfirm = { confirmDraft = null; onReplaceDraft(text) }, onDismiss = { confirmDraft = null })
     }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        SimpleAvatar(service, onOpen)
-        Column(Modifier.weight(1f)) {
-            Text(service.shortName, style = MaterialTheme.typography.titleSmall, color = colors.ink)
-            val caption = run.modeLabel.ifBlank { AiModePolicy.label(status.modeReading) }
-            if (caption.isNotBlank()) Text(caption + if (run.thinkingUsed) " · 已深度思考" else "", style = MaterialTheme.typography.labelSmall,
-                color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    val satOut = run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与"
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SimpleAvatar(service, onOpen)
+            Column(Modifier.weight(1f).padding(start = 2.dp)) {
+                Text(service.displayName, style = MaterialTheme.typography.titleMedium, color = colors.ink, fontWeight = FontWeight.SemiBold)
+                val caption = run.modeLabel.ifBlank { AiModePolicy.label(status.modeReading) }
+                if (caption.isNotBlank()) Text(caption + if (run.thinkingUsed) " · 已深度思考" else "", style = MaterialTheme.typography.labelMedium,
+                    color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (MemberActionPolicy.hasTask(run) || satOut) MemberStatusPill(run, Modifier.testTag("member-status-${service.name}"))
         }
-        if (run.phase != ParticipantPhase.COMPLETE) Text(if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") "本轮未参与"
-            else runStatusWord(run, status), style = MaterialTheme.typography.labelSmall,
-            color = if (run.phase == ParticipantPhase.ERROR) colors.error else colors.muted)
-    }
-    if (run.phase == ParticipantPhase.IDLE && run.detail == "本轮未参与") {
-        Text("这一轮没有发给 ${service.shortName}：上一轮它没有成功回答。之前的内容在右上角时光机里。",
-            Modifier.padding(vertical = 8.dp).testTag("sat-out-${service.name}"),
-            style = MaterialTheme.typography.bodySmall, color = colors.muted)
-    }
-    if (run.response.isNotBlank()) SelectionContainer(Modifier.padding(top = 4.dp).testTag("simple-answer-${service.name}")) {
-        MarkdownText(run.response, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
-    }
-    if (run.responseTruncated) {
-        SimpleNotice("原回答约 ${run.originalResponseLength} 字，圆桌仅保留前 ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS} 字；点击头像查看完整原文。")
-    }
-    if (run.phase == ParticipantPhase.WAITING && (run.detail.contains("安全验证") || run.detail.contains("迟迟没有回应"))) {
-        SimpleNotice(run.detail)
-        TextButton(onClick = onOpen) { Text("打开网页处理") }
-    }
-    if (run.phase == ParticipantPhase.ERROR) {
-        val advice = ArenaErrorHelp.explain(run.detail, service.shortName)
-        SimpleNotice(advice.what + " " + advice.next)
-        if (draft != null) {
-            Surface(Modifier.fillMaxWidth().padding(vertical = 4.dp), color = colors.card, shape = RoundedCornerShape(12.dp)) {
-                Column(Modifier.padding(12.dp)) {
-                    Text("网页输入框里没发出的文字", style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                    Text(draft, Modifier.padding(top = 4.dp).testTag("blocking-draft-${service.name}"),
-                        style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+        MemberActionBar(service, run, isMember, pendingSwap, onReextract = onReextract, onResend = onResend, onSkip = onSkip, onSwap = onSwap)
+        if (satOut) {
+            Text("这一轮没有发给 ${service.shortName}：上一轮它没有被采用的回答（没答完或被跳过）。之前的内容在右上角时光机里。",
+                Modifier.testTag("sat-out-${service.name}"),
+                style = MaterialTheme.typography.bodySmall, color = colors.muted)
+        }
+        progress?.invoke()
+        if (run.skipped && run.response.isNotBlank()) {
+            Text(if (run.replacedBy != null) "已换成 ${run.replacedBy.shortName}，下面是 ${service.shortName} 被换下前收到的内容，本轮不采用。"
+                else "已跳过：下面的回答保留可看，本轮之后的讨论、激发和总结不带它。",
+                style = MaterialTheme.typography.bodySmall, color = colors.muted)
+        }
+        if (run.response.isNotBlank()) SelectionContainer(Modifier.testTag("simple-answer-${service.name}")) {
+            MarkdownText(run.response, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
+        }
+        if (run.responseTruncated) {
+            SimpleNotice("原回答约 ${run.originalResponseLength} 字，圆桌仅保留前 ${ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS} 字；点击头像查看完整原文。")
+        }
+        if (run.phase == ParticipantPhase.WAITING && (run.detail.contains("安全验证") || run.detail.contains("迟迟没有回应"))) {
+            SimpleNotice(run.detail)
+            TextButton(onClick = onOpen, modifier = Modifier.heightIn(min = 48.dp)) { Text("打开网页处理") }
+        }
+        if (run.phase == ParticipantPhase.ERROR && !run.skipped) {
+            val advice = ArenaErrorHelp.explain(run.detail, service.shortName)
+            Surface(Modifier.fillMaxWidth(), color = if (run.stopped) colors.surfaceAlt else colors.errorSoft, shape = RoundedCornerShape(12.dp)) {
+                Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(advice.what, style = MaterialTheme.typography.bodyMedium, color = colors.ink)
+                    Text(advice.next, style = MaterialTheme.typography.bodySmall, color = colors.muted)
                 }
             }
-            TextButton(onClick = { confirmDraft = draft }, enabled = !busy,
-                modifier = Modifier.testTag("replace-draft-${service.name}")) { Text("清空这段草稿并重发") }
+            if (draft != null) {
+                Surface(Modifier.fillMaxWidth(), color = colors.card, shape = RoundedCornerShape(12.dp)) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("网页输入框里没发出的文字", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                        Text(draft, Modifier.padding(top = 4.dp).testTag("blocking-draft-${service.name}"),
+                            style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                TextButton(onClick = { confirmDraft = draft }, enabled = !busy,
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("replace-draft-${service.name}")) { Text("清空这段草稿并重发") }
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onOpen, modifier = Modifier.heightIn(min = 48.dp)) { Text("打开网页") }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { details = !details }, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Text(if (details) "收起详情" else "错误详情", style = MaterialTheme.typography.bodySmall, color = colors.muted)
+                }
+            }
+            if (details) Text(run.detail, style = MaterialTheme.typography.bodySmall, color = colors.muted)
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            TextButton(onClick = onOpen) { Text("打开网页") }
-            TextButton(onClick = onReextract, enabled = !busy && run.requestId.isNotBlank()) { Text("重新读取") }
-        }
-        TextButton(onClick = { confirmResend = true }, enabled = !busy) { Text("重发本轮问题") }
-        TextButton(onClick = { details = !details }) { Text(if (details) "收起详情" else "错误详情", style = MaterialTheme.typography.bodySmall) }
-        if (details) Text(run.detail, style = MaterialTheme.typography.bodySmall, color = colors.muted)
+        PreviousAnswers(service, run.previousResponses)
+        if (run.response.isNotBlank()) AnswerActions(service.shortName, onCopy, onShare, onOpen)
     }
-    if (run.response.isNotBlank()) AnswerActions(service.shortName, onCopy, onShare, onOpen)
 }
 
 /** 复制 / 分享 / 原网页：描边按钮，老人也点得准。 */
@@ -188,21 +205,32 @@ internal fun SimpleRoundStage(
     val pastRound = viewing?.takeIf { it.round != liveRound || it.summary }?.let { sel -> sessionController.history.firstOrNull { it.number == sel.round } }
     val reviewing = viewing != null && (pastRound != null || viewing?.summary == true)
     val members = pastRound?.results?.filter { it.value.phase != ParticipantPhase.IDLE || it.value.response.isNotBlank() }?.keys
-        ?.let { keys -> ArenaService.entries.filter { it in keys } }?.ifEmpty { null } ?: sessionController.sessionServices
+        ?.let { keys -> ArenaService.entries.filter { it in keys } }?.ifEmpty { null } ?: sessionController.roundTabs
     var selected by rememberSaveable(sessionKey, viewing?.round, viewing?.summary) {
         mutableStateOf(if (viewing?.summary == true) "summary" else members.first().name)
     }
     val current = selected.takeIf { it == "summary" || members.any { m -> m.name == it } } ?: members.first().name
     val busy = sessionController.isBusy
-    // 独立迭代只剩一家也能继续问（逃生通道）；工作流、讨论、总结需要至少两家的回答。
-    val needed = if (mode == RoundMode.ITERATE) 1 else ArenaService.MIN_MEMBERS
-    val ready = sessionController.stage == SessionStage.READY && sessionController.completedCount >= needed && !busy
-    val completedMembers = sessionController.sessionServices.filter { sessionController.runs[it]?.phase == ParticipantPhase.COMPLETE }
+    // 下一轮会参加的成员：本轮回答被采用的成员（预约的换人已替换）+ 新换上来的成员。
+    val nextMembers = sessionController.nextRoundMembers()
+    // 独立迭代只剩一家也能继续问（逃生通道）；工作流要两位成员；讨论、激发、总结要两份完整回答。
+    val enough = when (mode) {
+        RoundMode.ITERATE -> nextMembers.isNotEmpty()
+        RoundMode.RELAY -> nextMembers.size >= ArenaService.MIN_MEMBERS
+        else -> sessionController.completedCount >= ArenaService.MIN_MEMBERS
+    }
+    val ready = sessionController.stage == SessionStage.READY && enough && !busy
+    val completedMembers = sessionController.sessionServices.filter {
+        sessionController.runs[it]?.let { run -> run.phase == ParticipantPhase.COMPLETE && !run.skipped } == true
+    }
     var orderNames by rememberSaveable(sessionKey) { mutableStateOf(emptyList<String>()) }
-    val relayOrder = orderNames.mapNotNull(ArenaService::fromName).filter { it in completedMembers }
-        .let { saved -> saved + completedMembers.filterNot { it in saved } }
+    val relayOrder = orderNames.mapNotNull(ArenaService::fromName).filter { it in nextMembers }
+        .let { saved -> saved + nextMembers.filterNot { it in saved } }
+    var swapping by rememberSaveable { mutableStateOf<String?>(null) }
     val captain = CaptainPolicy.resolve(ArenaService.fromName(captainName), sessionController.sessionServices)
     fun notifyFailure(success: Boolean) { if (!success) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } }
+    // 逃生动作成功和失败都说一句：成功时说明发生了什么，失败时说明为什么做不了。
+    fun announce(@Suppress("UNUSED_PARAMETER") success: Boolean) { scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } }
 
     // Copies and shares pair the text with the question it actually answered (current round, a reviewed round, or the topic).
     val shareQuestion = when {
@@ -228,6 +256,28 @@ internal fun SimpleRoundStage(
         }; Unit
     } }
 
+    swapping?.let(ArenaService::fromName)?.let { from ->
+        SwapMemberDialog(
+            from = from,
+            run = sessionController.runs[from] ?: ParticipantRun(),
+            candidates = sessionController.swapCandidates(from),
+            statuses = statuses,
+            pending = sessionController.pendingSwaps[from],
+            onPick = { to ->
+                swapping = null
+                val ok = sessionController.swap(from, to)
+                scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
+                if (ok && sessionController.runs[to]?.requestId?.isNotBlank() == true) selected = to.name
+            },
+            onCancelPending = {
+                swapping = null
+                sessionController.swap(from, from)
+                scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) }
+            },
+            onDismiss = { swapping = null },
+        )
+    }
+
     editing?.let { key ->
         PresetEditorDialog(key, store, onDone = { message -> editing = null; presetVersion++; scope.launch { snackbarHostState.showSnackbar(message) } },
             onDismiss = { editing = null })
@@ -237,7 +287,7 @@ internal fun SimpleRoundStage(
         Column(Modifier.fillMaxSize().background(colors.page).navigationBarsPadding().imePadding()) {
             SimpleHeader(busy, onNewSession, onNavigate, onShareSession = shareSession.takeIf { sessionController.history.isNotEmpty() },
                 onTimeMachine = { drawer = true })
-            SimpleAnswerTabs(members, current, (pastRound?.results ?: sessionController.runs).mapValues { it.value.phase }) { selected = it }
+            SimpleAnswerTabs(members, current, pastRound?.results ?: sessionController.runs) { selected = it }
             if (reviewing) Surface(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp).testTag("reviewing-banner"),
                 color = colors.accentSoft, shape = RoundedCornerShape(12.dp)) {
                 Row(Modifier.padding(start = 14.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -286,8 +336,6 @@ internal fun SimpleRoundStage(
                         val service = members.first { it.name == current }
                         val run = (pastRound?.results ?: sessionController.runs)[service] ?: ParticipantRun()
                         Column {
-                            if (!reviewing) SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) },
-                                onSkip = { if (sessionController.skipRunning(service)) scope.launch { snackbarHostState.showSnackbar(sessionController.sessionMessage) } })
                             if (reviewing) {
                                 ReadOnlyAnswer(service, run, onOpen = { onOpenService(service) },
                                     onCopy = copyFrom?.let { f -> { f("${service.shortName} 第 ${viewing?.round} 轮回答", run.response) } },
@@ -295,11 +343,16 @@ internal fun SimpleRoundStage(
                             } else SimpleAnswer(service, run, statuses[service] ?: ServiceStatus(), { onOpenService(service) },
                                 onCopy = copyFrom?.let { f -> { f("${service.shortName} 的回答", run.response) } },
                                 onShare = shareFrom?.let { f -> { f("${service.shortName} 的回答", run.response) } }, busy = busy,
-                                onReextract = { notifyFailure(sessionController.retryExtraction(service)) },
-                                onResend = { notifyFailure(sessionController.retrySend(service)) },
+                                onReextract = { announce(sessionController.reextract(service)) },
+                                onResend = { announce(sessionController.resend(service)) },
                                 onSummary = { modeName = RoundMode.SUMMARY.name },
                                 draft = sessionController.blockingDraft(service),
-                                onReplaceDraft = { text -> notifyFailure(sessionController.retrySendReplacingDraft(service, text)) })
+                                onReplaceDraft = { text -> notifyFailure(sessionController.retrySendReplacingDraft(service, text)) },
+                                onSkip = { announce(sessionController.skip(service)) },
+                                onSwap = { swapping = service.name },
+                                isMember = service in sessionController.sessionServices,
+                                pendingSwap = sessionController.pendingSwaps[service],
+                                progress = { SimpleWaitProgress(sessionController, service, run, onOpen = { onOpenService(service) }) })
                         }
                     }
                 }
@@ -312,8 +365,14 @@ internal fun SimpleRoundStage(
             } else {
                 val presetParts = if (mode.preset) {
                     presetVersion
-                    val key = when (mode) { RoundMode.RELAY -> PresetKey.RELAY; RoundMode.SUMMARY -> PresetKey.SUMMARY; else -> style.preset }
-                    val debateIndex = sessionController.history.count { it.kind == RoundKind.DEBATE && (it.style ?: DebateStyle.DEBATE) == style } + 1
+                    val key = when (mode) {
+                        RoundMode.RELAY -> PresetKey.RELAY
+                        RoundMode.SUMMARY -> PresetKey.SUMMARY
+                        RoundMode.INSPIRE -> PresetKey.INSPIRE
+                        else -> style.preset
+                    }
+                    val debateIndex = if (mode == RoundMode.INSPIRE) sessionController.history.count { it.kind == RoundKind.INSPIRE } + 1
+                        else sessionController.history.count { it.kind == RoundKind.DEBATE && (it.style ?: DebateStyle.DEBATE) == style } + 1
                     key to ArenaPresets.view(key, store, peers = (completedMembers.size - 1).coerceAtLeast(1), answers = completedMembers.size,
                         style = style, debateIndex = debateIndex, depth = depth, members = relayOrder.size.coerceAtLeast(2))
                 } else null
@@ -332,11 +391,11 @@ internal fun SimpleRoundStage(
                             else "只发给队长${judge?.let { " ${it.shortName}" }.orEmpty()}"
                         }
                         RoundMode.RELAY -> "按顺序接力，${relayOrder.size} 家"
-                        RoundMode.ITERATE -> if (!busy && completedMembers.isEmpty()) "本轮还没有答完的成员，先在上方重发或重新读取"
-                            else "发给本轮成功的 ${completedMembers.size} 家 AI"
+                        RoundMode.ITERATE -> if (!busy && nextMembers.isEmpty()) "本轮还没有答完的成员，先在成员卡片上重新提取或重新发送"
+                            else "发给 ${membersLabel(nextMembers, sessionController.pendingSwaps.values.toSet())}"
                         else -> if (!busy && completedMembers.size < ArenaService.MIN_MEMBERS)
-                            "至少 ${ArenaService.MIN_MEMBERS} 家答完才能讨论，先在上方重发失败的成员；只想继续问可用「独立迭代」"
-                        else "发给本轮成功的 ${completedMembers.size} 家 AI"
+                            "至少 ${ArenaService.MIN_MEMBERS} 份完整回答才能${mode.label}，先在成员卡片上重新提取或重新发送；只想继续问可用「独立迭代」"
+                        else "发给 ${membersLabel(nextMembers, sessionController.pendingSwaps.values.toSet())}，每位收到别人的完整回答"
                     },
                     options = {
                         when (mode) {
@@ -349,6 +408,7 @@ internal fun SimpleRoundStage(
                                 onCaptain = { captainName = it.name; captainPreferences.saveCaptain(it) },
                                 onDepth = { depthName = it.name; captainPreferences.saveDepth(it) })
                             RoundMode.ITERATE -> if (ready && roundGuidance.isBlank()) QuickFollowUpRow(onRoundGuidanceChange)
+                            RoundMode.INSPIRE -> Unit
                         }
                     },
                     preset = presetParts?.let { (key, parts) -> { PresetCard(key, parts, store.custom(key) != null, !busy) { editing = key } } },
@@ -367,10 +427,11 @@ internal fun SimpleRoundStage(
                             RoundMode.ITERATE -> sessionController.startIteration(AnswerMode.PARALLEL, roundGuidance, files)
                             RoundMode.RELAY -> sessionController.startIteration(AnswerMode.SERIAL, roundGuidance, files, relayOrder = relayOrder)
                             RoundMode.DISCUSS -> sessionController.startDebate(AnswerMode.PARALLEL, roundGuidance, files, style)
+                            RoundMode.INSPIRE -> sessionController.startInspire(AnswerMode.PARALLEL, roundGuidance, files)
                             RoundMode.SUMMARY -> sessionController.startSummary(CaptainPolicy.judgePreference(sessionController.sessionServices, captain),
                                 roundGuidance, depth, attachments = files).also { if (it) selected = "summary" }
                         }
-                        if (started) { onRoundGuidanceChange(""); attachmentDraft?.clear(); if (mode != RoundMode.SUMMARY) selected = members.first().name }
+                        if (started) { onRoundGuidanceChange(""); attachmentDraft?.clear(); if (mode != RoundMode.SUMMARY) selected = sessionController.roundTabs.first().name }
                         else notifyFailure(false)
                     },
                 )
@@ -426,8 +487,9 @@ private fun ReadOnlyAnswer(service: ArenaService, run: ParticipantRun, onOpen: (
         SelectionContainer(Modifier.testTag("timeline-answer-${service.name}")) {
             MarkdownText(run.response, modifier = Modifier.fillMaxWidth(), style = MaterialTheme.typography.bodyLarge)
         }
-        AnswerActions(service.shortName, onCopy, onShare, onOpen)
     }
+    PreviousAnswers(service, run.previousResponses)
+    if (run.response.isNotBlank()) AnswerActions(service.shortName, onCopy, onShare, onOpen)
 }
 
 /** 综合 Tab：展示结果；生成统一走输入区的「队长总结」。 */
@@ -515,4 +577,10 @@ internal fun SimpleWaitProgress(controller: ArenaSessionController, service: Are
             }
         }
     }
+}
+
+/** 「发给 3 家 AI（含新换上的 Kimi）」。 */
+internal fun membersLabel(members: List<ArenaService>, newcomers: Set<ArenaService>): String {
+    val joined = members.filter { it in newcomers }
+    return "${members.size} 家 AI" + if (joined.isEmpty()) "" else "（含新换上的 ${joined.joinToString("、") { it.shortName }}）"
 }

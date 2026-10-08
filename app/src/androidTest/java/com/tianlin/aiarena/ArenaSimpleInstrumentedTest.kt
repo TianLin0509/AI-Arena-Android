@@ -224,7 +224,7 @@ class ArenaSimpleInstrumentedTest {
             compose.onNodeWithText(visibleReason, substring = true).performScrollTo().assertIsDisplayed()
             compose.onNodeWithText("可能已经回答", substring = true).assertDoesNotExist()
             compose.onNodeWithText("打开网页", substring = false).performScrollTo().performClick()
-            compose.onNodeWithText("重发本轮问题").performScrollTo().performClick()
+            compose.onNodeWithTag("action-resend-KIMI").performScrollTo().performClick()
             compose.onNodeWithText("是否已收到或仍在排队", substring = true).assertIsDisplayed()
             compose.runOnIdle { assertEquals(0, sends) }
             compose.onNodeWithText("取消", substring = false).performClick()

@@ -11,6 +11,7 @@ import androidx.core.content.edit
 enum class PresetKey(val displayName: String, val required: List<String>) {
     DEBATE("观点讨论 · 互挑错", listOf("{队友回答}")),
     COLLAB("观点讨论 · 取长补短", listOf("{队友回答}")),
+    INSPIRE("互相激发", listOf("{队友回答}")),
     RELAY("工作流 · 第 2 位起", listOf("{问题}", "{前面回答}")),
     SUMMARY("队长总结", listOf("{各家回答}")),
     ;
@@ -46,6 +47,11 @@ object DefaultPresets : PresetSource {
         PresetKey.COLLAB to "{轮次引导}\n\n原始问题：\n{原问题}\n\n以下是队友们对同一问题的回答：\n{队友回答}\n\n" +
             "你们是协作关系，目标是共同得出最优方案。请吸收队友回答中的亮点和你没想到的角度，补充你认为重要而尚未覆盖的内容，" +
             "整合各方优势，给出一个更完善的综合回答。$IN_BODY",
+        // 与 AI圆桌lite 逐字一致（2026-10-08 任务书），改动须两端同步。
+        PresetKey.INSPIRE to "{轮次引导}\n\n以下是其他 AI 对同一问题的回答，供你参考和启发。请不要逐条点评或复述，而是把它们当作灵感：" +
+            "先找出其中你没想到、能让答案更好的思路、事实或角度，再与你自己的思考碰撞、组合、延伸，争取提出任何一方单独都没想到的新想法；" +
+            "你原有回答中仍然站得住的独到之处请保留，不必为了一致而趋同。请直接给出你升级后的完整回答，最后用一两句话说明受到了哪些启发、新增了什么。" +
+            "请直接在对话正文中完整写出你的回答。\n\n{队友回答}",
         PresetKey.RELAY to "{问题}\n\n前面的成员已按顺序回答了这个问题。请认真阅读后给出你的回答：可以补充新的角度、纠正或反驳，" +
             "重点写出前面还没有覆盖的内容。$IN_BODY\n\n{前面回答}",
         PresetKey.SUMMARY to "你是这次多 AI 讨论的队长，请替一位普通家庭用户做一份总结。\n\n原始问题：\n{原问题}\n\n讨论轮次：\n{讨论经过}\n\n" +
@@ -114,6 +120,13 @@ object ArenaPresets {
         DebateStyle.COLLAB -> "这是第 $index 轮协作。\n" + (COLLAB_HINTS.getOrNull(index - 1) ?: "请继续整合，聚焦尚未完善的部分。")
     }
 
+    /** 互相激发第几轮的引导语，独立计轮；与 AI圆桌lite 逐字一致。 */
+    fun inspireHint(index: Int): String = when (index) {
+        1 -> "这是第1轮互相激发。请先读完其他 AI 的回答，留意哪些地方触动了你、补上了你的盲区。"
+        2 -> "这是第2轮互相激发。大家已经互相启发过一轮，请寻找还没被挖掘的方向，让答案再上一个台阶。"
+        else -> "这是第${index.coerceAtLeast(3)}轮互相激发。请聚焦仍可突破的地方，避免重复已有内容。"
+    }
+
     /** 单遍替换：问题或回答里恰好出现「{各家回答}」这类文字也不会被二次替换。 */
     fun fill(template: String, values: Map<String, String>): String =
         SLOT.replace(template) { match -> values[match.groupValues[1]] ?: match.value }
@@ -136,7 +149,8 @@ object ArenaPresets {
             "{原问题}" to listOf("原问题"),
             "{讨论经过}" to listOf("讨论经过"),
         )
-        val text = fill(source.template(key), mapOf("轮次引导" to roundHint(style, debateIndex), "总结要求" to summaryStructure(depth, answers)))
+        val hint = if (key == PresetKey.INSPIRE) inspireHint(debateIndex) else roundHint(style, debateIndex)
+        val text = fill(source.template(key), mapOf("轮次引导" to hint, "总结要求" to summaryStructure(depth, answers)))
         val parts = mutableListOf<PresetPart>()
         var rest = text
         while (rest.isNotEmpty()) {
@@ -191,6 +205,30 @@ object DebatePromptBuilder {
             "问题" to originalQuestion,
             "队友回答" to PromptSections.otherResponses(target, responses, quoteLimit),
         )),
+        guidance,
+    )
+}
+
+object InspirePromptBuilder {
+    /**
+     * 互相激发：把**其他**成员上一轮的完整回答（不含自己的）按预设转给这一家，格式与观点讨论一致；
+     * 用户补充附在最后。引用只在超出该站上下文预算时才由调用方逐步压缩。
+     */
+    fun build(
+        target: ArenaService,
+        responses: Map<ArenaService, String>,
+        inspireIndex: Int = 1,
+        guidance: String = "",
+        quoteLimit: Int = ArenaLimits.MAX_CAPTURED_RESPONSE_CHARS,
+        presets: PresetSource = DefaultPresets,
+        /** 只用于用户自定义预设里写了 {原问题} 的情况；默认预设不带原问题。 */
+        originalQuestion: String = "",
+    ): String = ArenaPresets.withSupplement(
+        ArenaPresets.fill(presets.template(PresetKey.INSPIRE), buildMap {
+            put("轮次引导", ArenaPresets.inspireHint(inspireIndex))
+            put("队友回答", PromptSections.otherResponses(target, responses, quoteLimit))
+            if (originalQuestion.isNotBlank()) { put("原问题", originalQuestion); put("问题", originalQuestion) }
+        }),
         guidance,
     )
 }
